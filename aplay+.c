@@ -23,22 +23,20 @@ char *dev = "hw:0,0";	// BitPerfect
 
 void play_wav(char *name)
 {
-	unsigned int channels;
-	unsigned int sampleRate;
-	unsigned long totalSampleCount;
-
-	dr_int16 *pSampleData = drwav_open_and_read_file_s16(name, &channels, &sampleRate, &totalSampleCount);
-	if (pSampleData) {
-		printf("%dHz %dch\n", sampleRate, channels);
+	drwav wav;
+	if (drwav_init_file(&wav, name)) {
+		printf("%dHz %dch\n", wav.sampleRate, wav.channels);
 
 		AUDIO a;
-		AUDIO_init(&a, dev, sampleRate, channels, 2048, 1);
-		for (int n=0; n<totalSampleCount*channels*2; n+=a.size) {
-			memcpy(a.buffer, pSampleData+n, a.size);
+		AUDIO_init(&a, dev, wav.sampleRate, wav.channels, 2048, 1);
+
+		while (drwav_read_s16(&wav, a.frames * wav.channels, (dr_int16*)a.buffer) > 0) {
 			AUDIO_play(&a);
 			AUDIO_wait(&a, 100);
 		}
+
 		AUDIO_close(&a);
+		drwav_uninit(&wav);
 	}
 }
 

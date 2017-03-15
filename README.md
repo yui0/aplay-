@@ -1,3 +1,7 @@
 # aplay+
-simple BitPerfect player
+a simple BitPerfect player
+
+## Supported file formats
+- FLAC
+- WAV
 

@@ -9,29 +9,50 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 
-#define TINYFILES_IMPL
-#include "tinyfiles.h"
+#include <dirent.h>
+int selects(const struct dirent *dir)
+{
+	if(dir->d_name[0] == '.') {
+		return 0;
+	}
+	return 1;
+}
 
 //char *dev = "default";	// "plughw:0,0"
 char *dev = "hw:0,0";	// BitPerfect
 
+void play_wav(char *name)
+{
+	unsigned int channels;
+	unsigned int sampleRate;
+	unsigned long totalSampleCount;
+
+	dr_int16 *pSampleData = drwav_open_and_read_file_s16(name, &channels, &sampleRate, &totalSampleCount);
+	if (pSampleData) {
+		printf("%dHz %dch\n", sampleRate, channels);
+
+		AUDIO a;
+		AUDIO_init(&a, dev, sampleRate, channels, 2048, 1);
+		for (int n=0; n<totalSampleCount*channels*2; n+=a.size) {
+			memcpy(a.buffer, pSampleData+n, a.size);
+			AUDIO_play(&a);
+			AUDIO_wait(&a, 100);
+		}
+		AUDIO_close(&a);
+	}
+}
+
 void play_flac(char *name)
 {
-	//printf("-> %s\n", name);
 	drflac *flac = drflac_open_file(name);
-	printf("%s: %dHz %dch\n", name, flac->sampleRate, flac->channels);
+	printf("%dHz %dch\n", flac->sampleRate, flac->channels);
 
 	AUDIO a;
 	AUDIO_init(&a, dev, flac->sampleRate, flac->channels, /*16384*/2048, 1);
 
 	if (flac) {
-		//dr_int16 data[32];
 		while (drflac_read_s16(flac, a.frames * flac->channels, (dr_int16*)a.buffer) > 0) {
-			/*do {
-				snd_pcm_sframes_t avail = snd_pcm_avail_update(a.handle);
-				if (avail >= a.size) break;
-			} while (1);*/
-			/*frame =*/ AUDIO_play(&a);
+			AUDIO_play(&a);
 			AUDIO_wait(&a, 100);
 		}
 	}
@@ -41,18 +62,23 @@ void play_flac(char *name)
 
 void play_dir(char *name)
 {
-	tfDIR dir;
-	tfDirOpen(&dir, name);
+	char path[1024];
+	struct dirent **namelist;
 
-	while (dir.has_next) {
-		tfFILE file;
-		tfReadFile(&dir, &file);
-		printf("%s\n", file.name);
-		if (strstr(file.ext, "flac")) play_flac(file.path);
-		tfDirNext(&dir);
+	int r = scandir(name, &namelist, selects, alphasort);
+	if (r == -1) return;
+
+	for (int i=0; i<r; ++i) {
+		printf("%s\n", namelist[i]->d_name);
+		snprintf(path, 1024, "%s/%s", name, namelist[i]->d_name);
+
+		if (strstr(namelist[i]->d_name, ".flac")) play_flac(path);
+		else if (strstr(namelist[i]->d_name, ".wav")) play_wav(path);
+
+		free(namelist[i]);
 	}
 
-	tfDirClose(&dir);
+	free(namelist);
 }
 
 int main(int argc, char *argv[])

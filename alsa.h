@@ -86,20 +86,25 @@ int AUDIO_frame(AUDIO *thiz)
 	return rc;
 }
 
-int AUDIO_play(AUDIO *thiz)
+int AUDIO_play(AUDIO *thiz, char *data, int frames)
 {
-	int rc = snd_pcm_writei(thiz->handle, thiz->buffer, thiz->frames);
+	int rc = snd_pcm_writei(thiz->handle, data, frames);
 	if (rc == -EPIPE) {
 		// EPIPE means overrun
 		fprintf(stderr, "overrun occurred\n");
-		//snd_pcm_recover(thiz->handle, rc, 0);
-		snd_pcm_prepare(thiz->handle);
+		snd_pcm_recover(thiz->handle, rc, 0);
+		//snd_pcm_prepare(thiz->handle);
 	} else if (rc < 0) {
 		fprintf(stderr, "error from write: %s\n", snd_strerror(rc));
 	} else if (rc != (int)thiz->frames) {
 		fprintf(stderr, "short write, write %d frames\n", rc);
 	}
 	return rc;
+}
+
+int AUDIO_play0(AUDIO *thiz)
+{
+	return AUDIO_play(thiz, thiz->buffer, thiz->frames);
 }
 
 void AUDIO_wait(AUDIO *thiz, int msec)

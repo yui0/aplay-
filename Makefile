@@ -4,7 +4,7 @@ PROGRAM = $(patsubst %.c,%,$(wildcard *.c))
 
 CC = clang
 CFLAGS = -Os
-LDFLAGS = -lasound
+LDFLAGS = -lasound -lm
 
 .PHONY: all
 all: depend $(PROGRAM)

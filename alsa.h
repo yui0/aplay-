@@ -96,8 +96,8 @@ int AUDIO_play(AUDIO *thiz, char *data, int frames)
 		//snd_pcm_prepare(thiz->handle);
 	} else if (rc < 0) {
 		fprintf(stderr, "error from write: %s\n", snd_strerror(rc));
-	} else if (rc != (int)thiz->frames) {
-		fprintf(stderr, "short write, write %d frames\n", rc);
+	} else if (rc != frames) {
+		fprintf(stderr, "short write, write %d/%d frames\n", rc, (int)thiz->frames);
 	}
 	return rc;
 }

@@ -19,7 +19,7 @@ int key(AUDIO *a)
 
 	int c = readch();
 	cmd = c;
-	//printf("%x\n", c);
+	printf("%x\n", c);
 	if (c==0x20) {
 		snd_pcm_pause(a->handle, 1);
 		do {
@@ -104,14 +104,15 @@ int play_mp3(char *name)
 
 	printf("%dHz %dch\n", info.sample_rate, info.channels);
 	AUDIO a;
-	AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES, 1);
+	AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES/*MP3_MAX_SAMPLES_PER_FRAME*//*frame_size*/, 1);
 
 	while ((bytes_left >= 0) && (frame_size > 0)) {
 		stream_pos += frame_size;
 		bytes_left -= frame_size;
-		//write(pcm, (const void *) sample_buf, info.audio_bytes);
-		AUDIO_play(&a, sample_buf, /*info.audio_bytes/2*/frame_size);
+		AUDIO_play(&a, (char*)sample_buf, info.audio_bytes/2/info.channels);
 		AUDIO_wait(&a, 100);
+		if (key(&a)) break;
+
 		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
 	}
 
@@ -142,7 +143,7 @@ void play_dir(char *name)
 		else if (strstr(namelist[i]->d_name, ".mp3")) play_mp3(path);
 		else if (strstr(namelist[i]->d_name, ".wav")) play_wav(path);
 
-		if (cmd=='q') break;
+		if (cmd=='q' || cmd==0x1b) break;
 	}
 
 	for (int i=0; i<r; i++) {

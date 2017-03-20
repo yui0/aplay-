@@ -2,7 +2,6 @@
 // clang -Os -o aplay+ aplay+.c -lasound
 
 #include <stdio.h>
-#include <dirent.h>
 #include <sys/mman.h>
 #include "alsa.h"
 #define DR_FLAC_IMPLEMENTATION
@@ -10,6 +9,9 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #include "minimp3.h"
+
+//#include <dirent.h>
+#include "ls.h"
 
 #include "kbhit.h"
 int cmd;
@@ -26,6 +28,7 @@ int key(AUDIO *a)
 			usleep(1000);	// us
 		} while (!kbhit());
 		snd_pcm_pause(a->handle, 0);
+		snd_pcm_prepare(a->handle);
 		return 0;
 	}
 
@@ -48,6 +51,7 @@ void play_wav(char *name)
 		while (drwav_read_s16(&wav, a.frames * wav.channels, (dr_int16*)a.buffer) > 0) {
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
+			if (key(&a)) break;
 		}
 
 		AUDIO_close(&a);
@@ -119,17 +123,17 @@ int play_mp3(char *name)
 	AUDIO_close(&a);
 }
 
-int selects(const struct dirent *dir)
+/*int selects(const struct dirent *dir)
 {
 	if (dir->d_name[0] == '.') {
 		return 0;
 	}
 	return 1;
-}
+}*/
 
 void play_dir(char *name)
 {
-	char path[1024];
+/*	char path[1024];
 	struct dirent **namelist;
 
 	int r = scandir(name, &namelist, selects, alphasort);
@@ -149,7 +153,23 @@ void play_dir(char *name)
 	for (int i=0; i<r; i++) {
 		free(namelist[i]);
 	}
-	free(namelist);
+	free(namelist);*/
+
+	char path[1024];
+	int num;
+
+	LS_LIST *ls = ls_dir(name, 1, &num);
+	for (int i=0; i<num; i++) {
+		printf("%s\n", ls[i].d_name);
+		//snprintf(path, 1024, "%s/%s", name, ls[i].d_name);
+		snprintf(path, 1024, "%s", ls[i].d_name);
+
+		if (strstr(ls[i].d_name, ".flac")) play_flac(path);
+		else if (strstr(ls[i].d_name, ".mp3")) play_mp3(path);
+		else if (strstr(ls[i].d_name, ".wav")) play_wav(path);
+
+		if (cmd=='q' || cmd==0x1b) break;
+	}
 }
 
 int main(int argc, char *argv[])

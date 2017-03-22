@@ -9,10 +9,9 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #include "minimp3.h"
+#include "stb_vorbis.h"
 
-//#include <dirent.h>
 #include "ls.h"
-
 #include "kbhit.h"
 int cmd;
 int key(AUDIO *a)
@@ -83,7 +82,7 @@ int play_mp3(char *name)
 	mp3_info_t info;
 	void *file_data;
 	unsigned char *stream_pos;
-	signed short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
+	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
 	int bytes_left;
 	int frame_size;
 	int value;
@@ -121,40 +120,35 @@ int play_mp3(char *name)
 	}
 
 	AUDIO_close(&a);
+	return 0;
 }
 
-/*int selects(const struct dirent *dir)
+void play_ogg(char *name)
 {
-	if (dir->d_name[0] == '.') {
-		return 0;
+	int n, num_c, error;
+	//short *outputs;
+	short outputs[FRAMES*2*100];
+
+	stb_vorbis *v = stb_vorbis_open_filename(name, &error, NULL);
+	//if (!v) stb_fatal("Couldn't open {%s}", name);
+	printf("%dHz %dch\n", v->sample_rate, v->channels);
+
+	AUDIO a;
+	AUDIO_init(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1);
+
+	//while ((n = stb_vorbis_get_frame_short(v, 1, &outputs, FRAMES))) {
+	while ((n = stb_vorbis_get_frame_short_interleaved(v, v->channels, outputs, FRAMES*100))) {
+		AUDIO_play(&a, (char*)outputs, n);
+		AUDIO_wait(&a, 100);
+		if (key(&a)) break;
 	}
-	return 1;
-}*/
+
+	AUDIO_close(&a);
+	stb_vorbis_close(v);
+}
 
 void play_dir(char *name)
 {
-/*	char path[1024];
-	struct dirent **namelist;
-
-	int r = scandir(name, &namelist, selects, alphasort);
-	if (r == -1) return;
-
-	for (int i=0; i<r; i++) {
-		printf("%s\n", namelist[i]->d_name);
-		snprintf(path, 1024, "%s/%s", name, namelist[i]->d_name);
-
-		if (strstr(namelist[i]->d_name, ".flac")) play_flac(path);
-		else if (strstr(namelist[i]->d_name, ".mp3")) play_mp3(path);
-		else if (strstr(namelist[i]->d_name, ".wav")) play_wav(path);
-
-		if (cmd=='q' || cmd==0x1b) break;
-	}
-
-	for (int i=0; i<r; i++) {
-		free(namelist[i]);
-	}
-	free(namelist);*/
-
 	char path[1024];
 	int num;
 
@@ -166,6 +160,7 @@ void play_dir(char *name)
 
 		if (strstr(ls[i].d_name, ".flac")) play_flac(path);
 		else if (strstr(ls[i].d_name, ".mp3")) play_mp3(path);
+		else if (strstr(ls[i].d_name, ".ogg")) play_ogg(path);
 		else if (strstr(ls[i].d_name, ".wav")) play_wav(path);
 
 		if (cmd=='q' || cmd==0x1b) break;

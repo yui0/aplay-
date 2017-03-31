@@ -152,16 +152,17 @@ void play_dir(char *name)
 	char path[1024];
 	int num;
 
-	LS_LIST *ls = ls_dir(name, 1, &num);
+	LS_LIST *ls = ls_dir(name, LS_RECURSIVE|LS_RANDOM, &num);
 	for (int i=0; i<num; i++) {
 		printf("%s\n", ls[i].d_name);
 		//snprintf(path, 1024, "%s/%s", name, ls[i].d_name);
 		snprintf(path, 1024, "%s", ls[i].d_name);
 
-		if (strstr(ls[i].d_name, ".flac")) play_flac(path);
-		else if (strstr(ls[i].d_name, ".mp3")) play_mp3(path);
-		else if (strstr(ls[i].d_name, ".ogg")) play_ogg(path);
-		else if (strstr(ls[i].d_name, ".wav")) play_wav(path);
+		int len = strlen(ls[i].d_name) -5;
+		if (strstr(ls[i].d_name+len, ".flac")) play_flac(path);
+		else if (strstr(ls[i].d_name+len, ".mp3")) play_mp3(path);
+		else if (strstr(ls[i].d_name+len, ".ogg")) play_ogg(path);
+		else if (strstr(ls[i].d_name+len, ".wav")) play_wav(path);
 
 		if (cmd=='q' || cmd==0x1b) break;
 	}

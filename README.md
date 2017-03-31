@@ -10,7 +10,7 @@ a simple BitPerfect player
 ## How to use
 
 ```bash
-make
-./aplay+ .
+$ make
+$ ./aplay+ .
 ```
 

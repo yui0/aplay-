@@ -11,6 +11,6 @@ a simple BitPerfect player
 
 ```bash
 $ make
-$ ./aplay+ .
+$ ./aplay+ -rx .
 ```
 

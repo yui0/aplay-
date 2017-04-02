@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <sys/mman.h>
+
 #include "alsa.h"
 #define DR_FLAC_IMPLEMENTATION
 #include "dr_flac.h"
@@ -10,6 +11,9 @@
 #include "dr_wav.h"
 #include "minimp3.h"
 #include "stb_vorbis.h"
+
+#define PARG_IMPLEMENTATION
+#include "parg.h"
 
 #include "ls.h"
 #include "kbhit.h"
@@ -147,12 +151,12 @@ void play_ogg(char *name)
 	stb_vorbis_close(v);
 }
 
-void play_dir(char *name)
+void play_dir(char *name, int flag)
 {
 	char path[1024];
 	int num;
 
-	LS_LIST *ls = ls_dir(name, LS_RECURSIVE|LS_RANDOM, &num);
+	LS_LIST *ls = ls_dir(name, flag, &num);
 	for (int i=0; i<num; i++) {
 		printf("%s\n", ls[i].d_name);
 		//snprintf(path, 1024, "%s/%s", name, ls[i].d_name);
@@ -168,12 +172,52 @@ void play_dir(char *name)
 	}
 }
 
+void usage(FILE* fp, int argc, char** argv)
+{
+	fprintf(fp,
+		"Usage: %s [options] dir\n\n"
+		"Options:\n"
+		"-d <device name>   ALSA device name [default,plughw:0,0...]\n"
+		"-h                 Print this message\n"
+		"-r                 Recursively search for directory\n"
+		"-x                 Random play\n"
+		"\n",
+		argv[0]);
+}
+
 int main(int argc, char *argv[])
 {
-	if (argc>2) dev = argv[2];
+	int flag = 0;
+	char *dir = ".";
+	struct parg_state ps;
+	int c;
+
+	parg_init(&ps);
+	while ((c = parg_getopt(&ps, argc, argv, "hd:rx")) != -1) {
+		switch (c) {
+		case 1:
+			dir = (char*)ps.optarg;
+			break;
+		case 'd':
+			dev = (char*)ps.optarg;
+			break;
+		case 'r':
+			flag |= LS_RECURSIVE;
+			break;
+		case 'x':
+			flag |= LS_RANDOM;
+			break;
+		case 'h':
+		//default:
+			usage(stderr, argc, argv);
+			return 1;
+		}
+	}
 
 	init_keyboard();
-	play_dir(argv[1]);
+	play_dir(dir, flag);
 	close_keyboard();
+
+	return 0;
 }
 

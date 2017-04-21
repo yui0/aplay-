@@ -15,6 +15,7 @@
 #define PARG_IMPLEMENTATION
 #include "parg.h"
 
+#include "random.h"
 #include "ls.h"
 #include "kbhit.h"
 int cmd;

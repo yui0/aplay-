@@ -57,7 +57,7 @@ void AUDIO_init(AUDIO *thiz, char *dev, unsigned int val, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_channels(thiz->handle, params, ch);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set channel count (%s)\n", snd_strerror(rc));
-		exit(1);
+//		exit(1);
 	}
 
 	// 44100 bits/second sampling rate (CD quality)

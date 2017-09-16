@@ -21,16 +21,18 @@
 int cmd;
 int key(AUDIO *a)
 {
-	if (!kbhit()) return 0;
+//	if (!kbhit()) return 0;
 
 	int c = readch();
+if (!c) return 0;
 	cmd = c;
 	printf("%x\n", c);
 	if (c==0x20) {
 		snd_pcm_pause(a->handle, 1);
 		do {
 			usleep(1000);	// us
-		} while (!kbhit());
+		//} while (!kbhit());
+		} while (!readch());
 		snd_pcm_pause(a->handle, 0);
 		snd_pcm_prepare(a->handle);
 		return 0;
@@ -52,7 +54,7 @@ void play_wav(char *name)
 		AUDIO a;
 		AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1);
 
-		while (drwav_read_s16(&wav, a.frames * wav.channels, (dr_int16*)a.buffer) > 0) {
+		while (drwav_read_s16(&wav, a.frames * wav.channels, (drwav_int16*)a.buffer) > 0) {
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
@@ -72,11 +74,17 @@ void play_flac(char *name)
 	AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1);
 
 	if (flac) {
-		while (drflac_read_s16(flac, a.frames * flac->channels, (dr_int16*)a.buffer) > 0) {
+		int c = 0;
+		printf("\e[?25l");
+		while (drflac_read_s16(flac, a.frames * flac->channels, (drflac_int16*)a.buffer) > 0) {
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
+
+			printf("\r%d/%lu", c, flac->totalSampleCount / flac->channels);
+			c += a.frames;
 		}
+		printf("\e[?25h");
 	}
 
 	AUDIO_close(&a);
@@ -114,15 +122,22 @@ int play_mp3(char *name)
 	AUDIO a;
 	AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES/*MP3_MAX_SAMPLES_PER_FRAME*//*frame_size*/, 1);
 
+	int c = 0;
+	printf("\e[?25l");
 	while ((bytes_left >= 0) && (frame_size > 0)) {
 		stream_pos += frame_size;
 		bytes_left -= frame_size;
 		AUDIO_play(&a, (char*)sample_buf, info.audio_bytes/2/info.channels);
+		//AUDIO_play(&a, (char*)sample_buf, frame_size*2);
 		AUDIO_wait(&a, 100);
 		if (key(&a)) break;
 
+		printf("\r%d", c);
+		c += frame_size;
+
 		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
 	}
+	printf("\e[?25h");
 
 	AUDIO_close(&a);
 	return 0;

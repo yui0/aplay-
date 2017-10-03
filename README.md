@@ -11,6 +11,15 @@ a simple BitPerfect player
 
 ```bash
 $ make
+$ ./aplay+ -h
+Usage: ./aplay+ [options] dir
+
+Options:
+-d <device name>   ALSA device name [default hw:0,0 plughw:0,0...]
+-h                 Print this message
+-r                 Recursively search for directory
+-x                 Random play
+
 $ ./aplay+ -rx .
 ```
 

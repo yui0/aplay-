@@ -12,13 +12,17 @@ void init_keyboard()
 {
 	tcgetattr(0, &initial_settings);
 	new_settings = initial_settings;
-	new_settings.c_lflag &= ~(ICANON|ECHO);
-	/*new_settings.c_lflag &= ~ICANON;
-	new_settings.c_lflag &= ~ECHO;
-	new_settings.c_lflag &= ~ISIG;*/
-//	new_settings.c_cc[VMIN] = 1;
+	new_settings.c_lflag &= ~(ECHO | ECHONL | ICANON);
 	new_settings.c_cc[VMIN] = 0;
 	new_settings.c_cc[VTIME] = 0;
+
+//	new_settings.c_iflag &= ~ICRNL;	// ! \r -> \n
+//	new_settings.c_oflag &= ~ONLCR;	// ! \n -> \r
+	new_settings.c_lflag &= ~ISIG;	// ignore signal
+
+	new_settings.c_iflag &= ~IXOFF;	// control c-s, c-q [input]
+	new_settings.c_iflag &= ~IXON;	// control c-s, c-q [output]
+
 	tcsetattr(0, TCSANOW, &new_settings);
 }
 
@@ -31,9 +35,9 @@ void close_keyboard()
 int getch2_len;
 unsigned char getch2_buf[GETCH_BUF_LEN];
 
-int kbhit()
+/*int kbhit()
 {
-/*	unsigned char ch;
+	unsigned char ch;
 	int nread;
 
 	if (peek_character != -1) {
@@ -51,9 +55,8 @@ int kbhit()
 		return 1;
 	}
 
-	return 0;*/
-
-}
+	return 0;
+}*/
 
 int readch()
 {
@@ -68,10 +71,14 @@ int readch()
 
 	return ch;*/
 
-//https://raw.githubusercontent.com/larsmagne/mplayer/master/osdep/getch2.c
-	int retval = read(0, &getch2_buf[getch2_len], GETCH_BUF_LEN-getch2_len);
+	unsigned char ch;
+	read(0, &ch, 1);
+	return ch;
+
+	// https://raw.githubusercontent.com/larsmagne/mplayer/master/osdep/getch2.c
+/*	int retval = read(0, &getch2_buf[getch2_len], GETCH_BUF_LEN-getch2_len);
 	if (retval < 1) return 0;
-	return getch2_buf[0];
+	return getch2_buf[0];*/
 	/*getch2_len += retval;
 
 	while (getch2_len > 0 && (getch2_len > 1 || getch2_buf[0] != 27)) {

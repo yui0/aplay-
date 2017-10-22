@@ -24,7 +24,7 @@ int key(AUDIO *a)
 //	if (!kbhit()) return 0;
 
 	int c = readch();
-if (!c) return 0;
+	if (!c) return 0;
 	cmd = c;
 	printf("%x\n", c);
 	if (c==0x20) {
@@ -174,21 +174,21 @@ void play_ogg(char *name)
 	return s;
 }*/
 #include <ctype.h>
-char *findExt(char *path)
+char *findExt(char *path, char *ext)
 {
-	char ext[10];
+	//char ext[10];
 	char *e = &ext[9];
-	*e = 0;
-	int len = strlen(path);
+	*e-- = 0;
+	int len = strlen(path)-1;
 	for (int i=len; i>len-9; i--) {
 		if (path[i] == '.' ) break;
 		*e-- = tolower(path[i]);
 	}
-	return e;
+	return e+1;
 }
 void play_dir(char *name, int flag)
 {
-	char path[1024];
+	char path[1024], ext[10];
 	int num;
 
 	LS_LIST *ls = ls_dir(name, flag, &num);
@@ -203,7 +203,8 @@ void play_dir(char *name, int flag)
 		else if (strstr(ls[i].d_name+len, ".ogg")) play_ogg(path);
 		else if (strstr(ls[i].d_name+len, ".wav")) play_wav(path);*/
 
-		char *e = findExt(ls[i].d_name);
+		char *e = findExt(ls[i].d_name, ext);
+		//printf("ext:%s[%s]\n", e, strstr(e, "flac"));
 		if (strstr(e, "flac")) play_flac(path);
 		else if (strstr(e, "mp3")) play_mp3(path);
 		else if (strstr(e, "ogg")) play_ogg(path);

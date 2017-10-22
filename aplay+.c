@@ -52,7 +52,7 @@ void play_wav(char *name)
 		printf("%dHz %dch\n", wav.sampleRate, wav.channels);
 
 		AUDIO a;
-		AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1);
+		if (AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1)) return;
 
 		while (drwav_read_s16(&wav, a.frames * wav.channels, (drwav_int16*)a.buffer) > 0) {
 			AUDIO_play0(&a);
@@ -71,7 +71,7 @@ void play_flac(char *name)
 	printf("%dHz %dch\n", flac->sampleRate, flac->channels);
 
 	AUDIO a;
-	AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1);
+	if (AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1)) return;
 
 	if (flac) {
 		int c = 0;
@@ -120,7 +120,9 @@ int play_mp3(char *name)
 
 	printf("%dHz %dch\n", info.sample_rate, info.channels);
 	AUDIO a;
-	AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES/*MP3_MAX_SAMPLES_PER_FRAME*//*frame_size*/, 1);
+	if (AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES/*MP3_MAX_SAMPLES_PER_FRAME*//*frame_size*/, 1)) {
+		return 1;
+	}
 
 	int c = 0;
 	printf("\e[?25l");
@@ -154,7 +156,10 @@ void play_ogg(char *name)
 	printf("%dHz %dch\n", v->sample_rate, v->channels);
 
 	AUDIO a;
-	AUDIO_init(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1);
+	if (AUDIO_init(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1)) {
+		stb_vorbis_close(v);
+		return;
+	}
 
 	//while ((n = stb_vorbis_get_frame_short(v, 1, &outputs, FRAMES))) {
 	while ((n = stb_vorbis_get_frame_short_interleaved(v, v->channels, outputs, FRAMES*100))) {

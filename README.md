@@ -1,7 +1,9 @@
 # aplay+
+
 a simple BitPerfect player
 
 ## Supported file formats
+
 - FLAC (Free Lossless Audio Codec)
 - WAV (RIFF waveform Audio Format)
 - MP3 (MPEG-1 Audio Layer-3)
@@ -23,3 +25,7 @@ Options:
 $ ./aplay+ -rx .
 ```
 
+## References
+
+- https://github.com/mackron/dr_libs
+- https://github.com/dr-soft/mini_al

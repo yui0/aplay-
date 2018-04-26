@@ -1,9 +1,9 @@
-# ©2017 YUICHIRO NAKADA
+# ©2017-2018 YUICHIRO NAKADA
 
 PROGRAM = $(patsubst %.c,%,$(wildcard *.c))
 
 CC = clang
-CFLAGS = -Os
+CFLAGS = -Wl,-s -Os
 LDFLAGS = -lasound -lm
 
 .PHONY: all

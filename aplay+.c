@@ -10,6 +10,8 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #include "minimp3.h"
+#include "uaac.h"
+#include "uwma.h"
 #include "stb_vorbis.h"
 
 #define PARG_IMPLEMENTATION
@@ -171,6 +173,60 @@ void play_ogg(char *name)
 	AUDIO_close(&a);
 	stb_vorbis_close(v);
 }
+
+/*int play_wma(char *name)
+{
+	void *file_data;
+	unsigned char *stream_pos;
+	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
+	int bytes_left;
+	int frame_size;
+	int value;
+
+	int fd = open(name, O_RDONLY);
+	if (fd < 0) {
+		printf("Error: cannot open `%s`\n", name);
+		return 1;
+	}
+
+	bytes_left = lseek(fd, 0, SEEK_END);
+	file_data = mmap(0, bytes_left, PROT_READ, MAP_PRIVATE, fd, 0);
+	stream_pos = (unsigned char *) file_data;
+	bytes_left -= 100;
+
+	CodecContext cc;
+	wma_decode_init_fixed(&cc);
+	frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, &info);
+	if (!frame_size) {
+		printf("Error: not a valid MP3 audio file!\n");
+		return 1;
+	}
+
+	printf("%dHz %dch\n", info.sample_rate, info.channels);
+	AUDIO a;
+	if (AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES, 1)) {
+		return 1;
+	}
+
+	int c = 0;
+	printf("\e[?25l");
+	while ((bytes_left >= 0) && (frame_size > 0)) {
+		stream_pos += frame_size;
+		bytes_left -= frame_size;
+		AUDIO_play(&a, (char*)sample_buf, info.audio_bytes/2/info.channels);
+		AUDIO_wait(&a, 100);
+		if (key(&a)) break;
+
+		printf("\r%d", c);
+		c += frame_size;
+
+		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
+	}
+	printf("\e[?25h");
+
+	AUDIO_close(&a);
+	return 0;
+}*/
 
 void play_dir(char *name, int flag)
 {

@@ -144,6 +144,7 @@ int play_mp3(char *name)
 	printf("\e[?25h");
 
 	AUDIO_close(&a);
+	close(fd);
 	return 0;
 }
 
@@ -228,6 +229,186 @@ void play_ogg(char *name)
 	return 0;
 }*/
 
+#define AAC_BUF_SIZE		(AAC_MAX_NCHANS * AAC_MAX_NSAMPS)	// AAC output buffer
+#define DECODE_NUM_STATES	2
+// read big endian 16-Bit from fileposition
+uint16_t fread16(size_t pos, FILE *fp)
+{
+	uint16_t tmp16;
+	fseek(fp, pos, SEEK_SET);
+	fread((uint8_t*)&tmp16, sizeof(uint16_t), 1, fp);
+	return REV16(tmp16);
+}
+// read big endian 32-Bit from fileposition
+uint32_t fread32(size_t pos, FILE *fp)
+{
+	uint32_t tmp32;
+	fseek(fp, pos, SEEK_SET);
+	fread((uint8_t*)&tmp32, sizeof(uint32_t), 1, fp);
+	return REV32(tmp32);
+}
+typedef struct { unsigned int position; unsigned int size; } _ATOM;
+typedef struct { uint32_t size; char name[4]; } _ATOMINFO;
+_ATOM findMp4Atom(const char *atom, const uint32_t posi, const int loop, FILE *fp)
+{
+	int r;
+	_ATOM ret;
+	_ATOMINFO atomInfo;
+
+	ret.position = posi;
+	do {
+		r = fseek(fp, ret.position, SEEK_SET);
+		fread((uint8_t*)&atomInfo, sizeof(atomInfo), 1, fp);
+		ret.size = REV32(atomInfo.size);
+		if (!strncmp(atom, atomInfo.name, 4)) return ret;
+		ret.position += ret.size;
+	} while (loop && !r);
+
+	printf("[%s] is not found!\n", atom);
+	ret.position = 0;
+	ret.size = 0;
+	return ret;
+}
+int setupMp4(HAACDecoder aac, AACFrameInfo *aacFrameInfo, FILE *fp)
+{
+	_ATOM ftyp = findMp4Atom("ftyp", 0, 0, fp);
+	if (!ftyp.size) return 0; // no mp4/m4a file
+
+	// go through the boxes to find the interesting atoms:
+	uint32_t moov = findMp4Atom("moov", 0, 1, fp).position;
+	uint32_t trak = findMp4Atom("trak", moov + 8, 1, fp).position;
+	uint32_t mdia = findMp4Atom("mdia", trak + 8, 1, fp).position;
+
+	// determine duration:
+	uint32_t mdhd = findMp4Atom("mdhd", mdia + 8, 1, fp).position;
+	uint32_t timescale = fread32(mdhd + 8 + 0x0c, fp);
+	unsigned int duration = 1000.0 * ((float)fread32(mdhd + 8 + 0x10, fp) / (float)timescale);
+
+	// MP4-data has no aac-frames, so we have to set the parameters by hand.
+	uint32_t minf = findMp4Atom("minf", mdia + 8, 1, fp).position;
+	uint32_t stbl = findMp4Atom("stbl", minf + 8, 1, fp).position;
+	// stsd sample description box: - infos to parametrize the decoder
+	_ATOM stsd = findMp4Atom("stsd", stbl + 8, 1, fp);
+	if (!stsd.size) return 0; // something is not ok
+
+	uint16_t channels = fread16(stsd.position + 8 + 0x20, fp);
+	//uint16_t channels = 1;
+	//uint16_t bits = fread16(stsd.position + 8 + 0x22); //not used
+	uint16_t samplerate = fread32(stsd.position + 8 + 0x26, fp);
+
+//	setupDecoder(channels, samplerate, AAC_PROFILE_LC);
+	memset(aacFrameInfo, 0, sizeof(AACFrameInfo));
+	aacFrameInfo->nChans = channels;
+	//aacFrameInfo.bitsPerSample = bits; not used
+	aacFrameInfo->sampRateCore = samplerate;
+	aacFrameInfo->profile = AAC_PROFILE_LC;
+	AACSetRawBlockParams(aac, 0, aacFrameInfo);
+
+	// stco - chunk offset atom:
+	uint32_t stco = findMp4Atom("stco", stbl + 8, 1, fp).position;
+
+	// number of chunks:
+	uint32_t nChunks = fread32(stco + 8 + 0x04, fp);
+	// first entry from chunk table:
+	uint32_t firstChunk = fread32(stco + 8 + 0x08, fp);
+	// last entry from chunk table:
+	uint32_t lastChunk = fread32(stco + 8 + 0x04 + nChunks * 4, fp);
+
+	if (nChunks == 1) {
+		_ATOM mdat =  findMp4Atom("mdat", 0, 1, fp);
+		lastChunk = mdat.size;
+	}
+
+	fseek(fp, firstChunk, SEEK_SET);
+#if 0
+	Serial.print("mdhd duration=");
+	Serial.print(duration);
+	Serial.print(" ms, stsd: chan=");
+	Serial.print(channels);
+	Serial.print(" samplerate=");
+	Serial.print(samplerate);
+	Serial.print(" nChunks=");
+	Serial.print(nChunks);
+	Serial.print(" firstChunk=");
+	Serial.println(firstChunk, HEX);
+	Serial.print(" lastChunk=");
+	Serial.println(lastChunk, HEX);
+#endif
+	return 1;
+}
+int play_aac(char *name)
+{
+	void *file_data;
+	unsigned char *stream_pos;
+	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
+	int bytes_left;
+	int frame_size;
+	int value;
+
+	FILE *fp = fopen(name, "rb");
+	if (!fp) {
+		printf("Error: cannot open `%s`\n", name);
+		return 1;
+	}
+
+	short *left  = (short*)malloc(AAC_BUF_SIZE * sizeof(int16_t));
+	short *right = (short*)malloc(AAC_BUF_SIZE * sizeof(int16_t));
+	AACFrameInfo info;
+	HAACDecoder aac = AACInitDecoder();
+
+	// find start of next AAC frame - assume EOF if no sync found
+//	int offset = AACFindSyncWord(o->sd_p, o->sd_left);
+/*	int decode_res = AACDecode(o->hAACDecoder, &o->sd_p, (int*)&o->sd_left, o->buf[db]);
+	if (!decode_res) {
+		AACGetLastFrameInfo(o->hAACDecoder, &o->aacFrameInfo);
+		o->decoded_length[db] = o->aacFrameInfo.outputSamps;
+	} else {
+		eof = true;
+	}*/
+
+	if (!setupMp4(aac, &info, fp)) {
+/*		// NO MP4. Do we have an ID3TAG ?
+		fseek(0);
+		// Read-ahead 10 Bytes to detect ID3
+		sd_left = fread(sd_buf, 10);
+		// Skip ID3, if existent
+		uint32_t skip = skipID3(sd_buf);
+		if (skip) {
+			size_id3 = skip;
+			int b = skip & 0xfffffe00;
+			fseek(b);
+			sd_left = 0;
+			//Serial.print("ID3");
+		} else size_id3 = 0;*/
+	}
+
+	printf("%dHz %dch\n", info.sampRateCore, info.nChans);
+	AUDIO a;
+	if (AUDIO_init(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1)) {
+		return 1;
+	}
+
+	int c = 0;
+	printf("\e[?25l");
+/*	while ((bytes_left >= 0) && (frame_size > 0)) {
+		stream_pos += frame_size;
+		bytes_left -= frame_size;
+		AUDIO_play(&a, (char*)sample_buf, info.audio_bytes/2/info.channels);
+		AUDIO_wait(&a, 100);
+		if (key(&a)) break;
+
+		printf("\r%d", c);
+		c += frame_size;
+
+		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
+	}*/
+	printf("\e[?25h");
+
+	AUDIO_close(&a);
+	fclose(fp);
+	return 0;
+}
+
 void play_dir(char *name, int flag)
 {
 	char path[1024], ext[10];
@@ -242,8 +423,11 @@ void play_dir(char *name, int flag)
 		//printf("ext:%s[%s]\n", e, strstr(e, "flac"));
 		if (strstr(e, "flac")) play_flac(path);
 		else if (strstr(e, "mp3")) play_mp3(path);
+		else if (strstr(e, "mp4")) play_aac(path);
+		else if (strstr(e, "m4a")) play_aac(path);
 		else if (strstr(e, "ogg")) play_ogg(path);
 		else if (strstr(e, "wav")) play_wav(path);
+		//else if (strstr(e, "wma")) play_wma(path);
 
 		if (cmd=='q' || cmd==0x1b) break;
 	}

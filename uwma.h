@@ -1,8 +1,8 @@
-/* public domain Simple, Minimalistic, WMA encoder based on libwma
+/* public domain Simple, Minimalistic, WMA decoder based on libwma
  *	©2018 Yuichiro Nakada
  *
  * Basic usage:
- *	uflac_encode("music.flac", pcm, len, 44100, 16, 2, 9);
+ *	uwma_decode("music.flac", pcm, len, 44100, 16, 2, 9);
  *
  * */
 

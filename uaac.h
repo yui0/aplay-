@@ -1,4 +1,13 @@
-/* ***** BEGIN LICENSE BLOCK *****  
+/* public domain Simple, Minimalistic, AAC decoder
+ *	©2018 Yuichiro Nakada
+ *
+ * Basic usage:
+ *	uaac_decode("music.flac", pcm, len, 44100, 16, 2, 9);
+ *
+ * */
+
+
+/* ***** BEGIN LICENSE BLOCK *****
  * Source last modified: $Id: assembly.h,v 1.7 2005/11/10 00:04:40 margotm Exp $ 
  *   
  * Portions Copyright (c) 1995-2005 RealNetworks, Inc. All Rights Reserved.  

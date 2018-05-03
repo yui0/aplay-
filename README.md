@@ -8,6 +8,7 @@ a simple BitPerfect player
 - WAV (RIFF waveform Audio Format)
 - MP3 (MPEG-1 Audio Layer-3)
 - Ogg Vorbis
+- AAC (mp4/m4a)
 
 ## How to use
 

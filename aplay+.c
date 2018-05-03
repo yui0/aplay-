@@ -326,7 +326,7 @@ int setupMp4(HAACDecoder aac, AACFrameInfo *aacFrameInfo, int fd/*FILE *fp*/)
 		lastChunk = mdat.size;
 	}
 
-	lseek(fd, firstChunk, SEEK_SET);
+//	lseek(fd, firstChunk, SEEK_SET);
 	//fseek(fp, firstChunk, SEEK_SET);
 #if 0
 	Serial.print("mdhd duration=");
@@ -348,10 +348,8 @@ int play_aac(char *name)
 {
 	unsigned char *file_data;
 	unsigned char *stream_pos;
-	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
+	short sample_buf[AAC_BUF_SIZE*2];
 	int bytes_left;
-	int frame_size;
-	int value;
 
 	int fd = open(name, O_RDONLY);
 	if (fd < 0) {
@@ -361,8 +359,8 @@ int play_aac(char *name)
 
 	int len = lseek(fd, 0, SEEK_END);
 	file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
-	stream_pos = file_data;
-	bytes_left = len;// - 100;
+//	stream_pos = file_data;
+//	bytes_left = len;// - 100;
 
 	/*FILE *fp = fopen(name, "rb");
 	if (!fp) {
@@ -370,8 +368,8 @@ int play_aac(char *name)
 		return 1;
 	}*/
 
-	short *left  = (short*)malloc(AAC_BUF_SIZE * sizeof(int16_t));
-	short *right = (short*)malloc(AAC_BUF_SIZE * sizeof(int16_t));
+//	short *left  = (short*)malloc(AAC_BUF_SIZE * sizeof(int16_t));
+//	short *right = (short*)malloc(AAC_BUF_SIZE * sizeof(int16_t));
 	AACFrameInfo info;
 	HAACDecoder aac = AACInitDecoder();
 
@@ -391,7 +389,8 @@ int play_aac(char *name)
 			//Serial.print("ID3");
 		} else size_id3 = 0;*/
 	}
-	stream_pos += chunk;
+	stream_pos = file_data + chunk;
+	bytes_left = len - chunk;
 
 	printf("%dHz %dch\n", info.sampRateCore, info.nChans);
 	AUDIO a;
@@ -401,20 +400,26 @@ int play_aac(char *name)
 
 	int c = 0;
 	printf("\e[?25l");
-	while ((bytes_left >= 0)) {
+	while ((bytes_left >= 0) && !key(&a)) {
 //		int nextSync = AACFindSyncWord(stream_pos, bytes_left);
-		int r = AACDecode(aac, &stream_pos, &c, sample_buf);
+//		stream_pos += nextSync;
+		int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
+//		int r = AACDecode(aac, &stream_pos, &c, sample_buf);
 //		stream_pos += nextSync;
 //		bytes_left -= nextSync;
-		bytes_left = len - (stream_pos-file_data);
-		printf("\r%d %d", bytes_left, c++);
+//		bytes_left = len - (stream_pos-file_data);
+//		printf("\r%d %d", bytes_left, c++);
+		printf("\r%d %d", stream_pos, c++);
 //		printf("\r%d", c);
 		if (!r) {
 			AACGetLastFrameInfo(aac, &info);
-			AUDIO_play(&a, (char*)sample_buf, info.outputSamps/2/info.nChans);
+			AUDIO_play(&a, (char*)sample_buf, info.outputSamps/*/2*//info.nChans);
 			AUDIO_wait(&a, 100);
+		} else {
+			printf("\nAAC decode error %d\n", r);
+			int nextSync = AACFindSyncWord(stream_pos, bytes_left);
+			stream_pos += nextSync;
 		}
-		if (key(&a)) break;
 	}
 	printf("\e[?25h");
 

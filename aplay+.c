@@ -145,6 +145,7 @@ int play_mp3(char *name)
 
 	AUDIO_close(&a);
 	munmap(file_data, len);
+	mp3_done(mp3);
 	close(fd);
 	return 0;
 }
@@ -176,14 +177,12 @@ void play_ogg(char *name)
 	stb_vorbis_close(v);
 }
 
-/*int play_wma(char *name)
+int play_wma(char *name)
 {
 	void *file_data;
 	unsigned char *stream_pos;
-	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
+	short sample_buf[MAX_CODED_SUPERFRAME_SIZE];
 	int bytes_left;
-	int frame_size;
-	int value;
 
 	int fd = open(name, O_RDONLY);
 	if (fd < 0) {
@@ -198,37 +197,33 @@ void play_ogg(char *name)
 
 	CodecContext cc;
 	wma_decode_init_fixed(&cc);
-	frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, &info);
-	if (!frame_size) {
-		printf("Error: not a valid MP3 audio file!\n");
-		return 1;
-	}
-
-	printf("%dHz %dch\n", info.sample_rate, info.channels);
+	printf("%dHz %dch\n", cc.sample_rate, cc.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES, 1)) {
+	if (AUDIO_init(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1)) {
 		return 1;
 	}
 
 	int c = 0;
 	printf("\e[?25l");
-	while ((bytes_left >= 0) && (frame_size > 0)) {
+	while ((bytes_left >= 0) && !key(&a)) {
+		int size;
+		int frame_size = wma_decode_superframe(&cc, stream_pos, &size, (uint8_t*)sample_buf, MAX_CODED_SUPERFRAME_SIZE);
 		stream_pos += frame_size;
 		bytes_left -= frame_size;
-		AUDIO_play(&a, (char*)sample_buf, info.audio_bytes/2/info.channels);
+		AUDIO_play(&a, (char*)sample_buf, size/cc.channels);
 		AUDIO_wait(&a, 100);
-		if (key(&a)) break;
 
 		printf("\r%d", c);
 		c += frame_size;
-
-		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
 	}
 	printf("\e[?25h");
 
 	AUDIO_close(&a);
+	wma_decode_end(&cc);
+	munmap(file_data, len);
+	close(fd);
 	return 0;
-}*/
+}
 
 int play_aac(char *name)
 {
@@ -282,21 +277,23 @@ int play_aac(char *name)
 	printf("\e[?25l");
 	while ((bytes_left >= 0) && !key(&a)) {
 		int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
-		printf("\r%x %d", (void*)stream_pos, c++);
+		printf("\r%x %d", (int)stream_pos, c++);
 		if (!r) {
 			AACGetLastFrameInfo(aac, &info);
 			AUDIO_play(&a, (char*)sample_buf, info.outputSamps/info.nChans);
 			AUDIO_wait(&a, 100);
 		} else {
 			printf("\nAAC decode error %d\n", r);
-			break;
-//			int nextSync = AACFindSyncWord(stream_pos, bytes_left);
-//			stream_pos += nextSync;
+//			break;
+			int nextSync = AACFindSyncWord(stream_pos, bytes_left);
+			stream_pos += nextSync;
+			bytes_left -= nextSync;
 		}
 	}
 	printf("\e[?25h");
 
 	AUDIO_close(&a);
+	AACFreeDecoder(aac);
 	munmap(file_data, len);
 	close(fd);
 	return 0;
@@ -320,7 +317,7 @@ void play_dir(char *name, int flag)
 		else if (strstr(e, "m4a")) play_aac(path);
 		else if (strstr(e, "ogg")) play_ogg(path);
 		else if (strstr(e, "wav")) play_wav(path);
-		//else if (strstr(e, "wma")) play_wma(path);
+		else if (strstr(e, "wma")) play_wma(path);
 
 		if (cmd=='q' || cmd==0x1b) break;
 	}

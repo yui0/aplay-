@@ -193,7 +193,7 @@ int play_wma(char *name)
 	int len = lseek(fd, 0, SEEK_END);
 	file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
 	stream_pos = (unsigned char *) file_data;
-	bytes_left = len - 100;
+	bytes_left = len;// - 100;
 
 	CodecContext cc;
 	wma_decode_init_fixed(&cc);
@@ -299,25 +299,29 @@ int play_aac(char *name)
 	return 0;
 }
 
-void play_dir(char *name, int flag)
+void play_dir(char *name, char *type, int flag)
 {
 	char path[1024], ext[10];
 	int num;
 
 	LS_LIST *ls = ls_dir(name, flag, &num);
 	for (int i=0; i<num; i++) {
+		char *e = findExt(ls[i].d_name);
+		//printf("ext:%s[%s]\n", e, strstr(e, "flac"));
+		if (type) {
+			if (!strstr(e, type)) continue;
+		}
+
 		printf("%s\n", ls[i].d_name);
 		snprintf(path, 1024, "%s", ls[i].d_name);
 
-		char *e = findExt(ls[i].d_name);
-		//printf("ext:%s[%s]\n", e, strstr(e, "flac"));
 		if (strstr(e, "flac")) play_flac(path);
 		else if (strstr(e, "mp3")) play_mp3(path);
 		else if (strstr(e, "mp4")) play_aac(path);
 		else if (strstr(e, "m4a")) play_aac(path);
 		else if (strstr(e, "ogg")) play_ogg(path);
 		else if (strstr(e, "wav")) play_wav(path);
-		else if (strstr(e, "wma")) play_wma(path);
+//		else if (strstr(e, "wma")) play_wma(path);
 
 		if (cmd=='q' || cmd==0x1b) break;
 	}
@@ -332,6 +336,7 @@ void usage(FILE* fp, int argc, char** argv)
 		"-h                 Print this message\n"
 		"-r                 Recursively search for directory\n"
 		"-x                 Random play\n"
+		"-t                 File type [flac mp3 wma...]\n"
 		"\n",
 		argv[0]);
 }
@@ -340,11 +345,12 @@ int main(int argc, char *argv[])
 {
 	int flag = 0;
 	char *dir = ".";
+	char *type = 0;
 	struct parg_state ps;
 	int c;
 
 	parg_init(&ps);
-	while ((c = parg_getopt(&ps, argc, argv, "hd:rx")) != -1) {
+	while ((c = parg_getopt(&ps, argc, argv, "hd:rxt:")) != -1) {
 		switch (c) {
 		case 1:
 			dir = (char*)ps.optarg;
@@ -358,6 +364,9 @@ int main(int argc, char *argv[])
 		case 'x':
 			flag |= LS_RANDOM;
 			break;
+		case 't':
+			type = (char*)ps.optarg;
+			break;
 		case 'h':
 		//default:
 			usage(stderr, argc, argv);
@@ -366,7 +375,7 @@ int main(int argc, char *argv[])
 	}
 
 	init_keyboard();
-	play_dir(dir, flag);
+	play_dir(dir, type, flag);
 	close_keyboard();
 
 	return 0;

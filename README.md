@@ -22,6 +22,7 @@ Options:
 -h                 Print this message
 -r                 Recursively search for directory
 -x                 Random play
+-t                 File type [flac mp3 wma...]
 
 $ ./aplay+ -rx .
 ```

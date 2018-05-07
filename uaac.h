@@ -10924,7 +10924,7 @@ int QMFAnalysis(int *inbuf, int *delay, int *XBuf, int fBitsIn, int *delayIdx, i
 
 /* lose FBITS_LOST_DCT4_64 in DCT4, gain 6 for implicit scaling by 1/64, lose 1 for cTab multiply (Q31) */
 #define FBITS_OUT_QMFS	(FBITS_IN_QMFS - FBITS_LOST_DCT4_64 + 6 - 1)
-#define RND_VAL			(1 << (FBITS_OUT_QMFS-1))
+#define RND_VAL_Q			(1 << (FBITS_OUT_QMFS-1))
 
 /**************************************************************************************
  * Function:    QMFSynthesisConv
@@ -10976,7 +10976,7 @@ void QMFSynthesisConv(int *cPtr, int *delay, int dIdx, short *outbuf, int nChans
 
 		dOff0++;
 		dOff1--;
-		*outbuf = CLIPTOSHORT((sum64.r.hi32 + RND_VAL) >> FBITS_OUT_QMFS);
+		*outbuf = CLIPTOSHORT((sum64.r.hi32 + RND_VAL_Q) >> FBITS_OUT_QMFS);
 		outbuf += nChans;
 	}
 }
@@ -13211,6 +13211,16 @@ int AACDecode(HAACDecoder hAACDecoder, unsigned char **inbuf, int *bytesLeft, sh
 
 
 // decoder
+//#ifdef WORDS_BIGENDIAN
+#define VLC_FOURCC(a, b, c, d)	( ((uint32_t)d) | ( ((uint32_t)c)<<8 ) | ( ((uint32_t)b)<<16 ) | ( ((uint32_t)a)<<24 ) )
+#define VLC_TWOCC(a, b)		( (uint16_t)(b) | ( (uint16_t)(a)<<8 ) )
+
+/*#else
+#define VLC_FOURCC(a, b, c, d)	( ((uint32_t)a) | ( ((uint32_t)b)<<8 ) | ( ((uint32_t)c)<<16 ) | ( ((uint32_t)d)<<24 ) )
+#define VLC_TWOCC( a, b )	( (uint16_t)(a) | ( (uint16_t)(b)<<8 ) )
+
+#endif*/
+#define ATOM_soun		VLC_FOURCC( 's', 'o', 'u', 'n' )
 #define AAC_BUF_SIZE		(AAC_MAX_NCHANS * AAC_MAX_NSAMPS)	// AAC output buffer
 // read big endian 16-Bit from fileposition
 uint16_t uaac_read16(size_t pos, int fd)
@@ -13257,8 +13267,16 @@ int uaac_setupMp4(HAACDecoder aac, AACFrameInfo *aacFrameInfo, int fd)
 
 	// go through the boxes to find the interesting atoms:
 	uint32_t moov = uaac_findMp4Atom("moov", 0, 1, fd).position;
+//uint32_t mdia, type;
+//	do {
 	uint32_t trak = uaac_findMp4Atom("trak", moov + 8, 1, fd).position;
 	uint32_t mdia = uaac_findMp4Atom("mdia", trak + 8, 1, fd).position;
+
+	uint32_t hdlr = uaac_findMp4Atom("hdlr", mdia + 8, 1, fd).position;
+	uint32_t type = uaac_read32(hdlr + 8 + 0x08, fd);
+printf("type:%x/%x\n",type, ATOM_soun);
+//moov = hdlr;
+//	} while (type != ATOM_soun);
 
 	// determine duration:
 	uint32_t mdhd = uaac_findMp4Atom("mdhd", mdia + 8, 1, fd).position;
@@ -13273,13 +13291,12 @@ int uaac_setupMp4(HAACDecoder aac, AACFrameInfo *aacFrameInfo, int fd)
 	if (!stsd.size) return 0; // something is not ok
 
 	uint16_t channels = uaac_read16(stsd.position + 8 + 0x20, fd);
-	//uint16_t channels = 1;
-	//uint16_t bits = uaac_read16(stsd.position + 8 + 0x22); //not used
+	//uint16_t bits = uaac_read16(stsd.position + 8 + 0x22); // not used
 	uint16_t samplerate = uaac_read32(stsd.position + 8 + 0x26, fd);
 
 	memset(aacFrameInfo, 0, sizeof(AACFrameInfo));
 	aacFrameInfo->nChans = channels;
-	//aacFrameInfo.bitsPerSample = bits; not used
+	//aacFrameInfo.bitsPerSample = bits; // not used
 	aacFrameInfo->sampRateCore = samplerate;
 	aacFrameInfo->profile = AAC_PROFILE_LC;
 	AACSetRawBlockParams(aac, 0, aacFrameInfo);
@@ -13299,7 +13316,6 @@ int uaac_setupMp4(HAACDecoder aac, AACFrameInfo *aacFrameInfo, int fd)
 		lastChunk = mdat.size;
 	}
 
-//	lseek(fd, firstChunk, SEEK_SET);
 #if 0
 	printf("mdhd duration %dms, stsd: chan=%d samplerate=%d nChunks=%d", duration, channels, samplerate, nChunks);
 	printf(" firstChunk=%x lastChunk=%x\n", firstChunk, lastChunk);

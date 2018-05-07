@@ -1,4 +1,4 @@
-// ©2017 Yuichiro Nakada
+// ©2017-2018 Yuichiro Nakada
 // clang -Os -o aplay+ aplay+.c -lasound
 
 #include <stdio.h>
@@ -10,6 +10,8 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #include "minimp3.h"
+//#define HELIX_FEATURE_AUDIO_CODEC_AAC_SBR
+#define AAC_ENABLE_SBR
 #include "uaac.h"
 #include "uwma.h"
 #include "stb_vorbis.h"
@@ -128,17 +130,15 @@ int play_mp3(char *name)
 
 	int c = 0;
 	printf("\e[?25l");
-	while ((bytes_left >= 0) && (frame_size > 0)) {
+	while ((bytes_left >= 0) && (frame_size > 0) && !key(&a)) {
+		printf("\r%d", c);
+
 		stream_pos += frame_size;
 		bytes_left -= frame_size;
 		AUDIO_play(&a, (char*)sample_buf, info.audio_bytes/2/info.channels);
-		//AUDIO_play(&a, (char*)sample_buf, frame_size*2);
 		AUDIO_wait(&a, 100);
-		if (key(&a)) break;
 
-		printf("\r%d", c);
 		c += frame_size;
-
 		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
 	}
 	printf("\e[?25h");
@@ -266,6 +266,7 @@ int play_aac(char *name)
 	}
 	stream_pos = file_data + chunk;
 	bytes_left = len - chunk;
+	printf("%x %x %x %x\n", stream_pos[0], stream_pos[1], stream_pos[2], stream_pos[3]);
 
 	printf("%dHz %dch\n", info.sampRateCore, info.nChans);
 	AUDIO a;
@@ -273,21 +274,22 @@ int play_aac(char *name)
 		return 1;
 	}
 
-	int c = 0;
 	printf("\e[?25l");
 	while ((bytes_left >= 0) && !key(&a)) {
 		int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
-		printf("\r%x %d", (int)stream_pos, c++);
+		printf("\r%d %d", (int)(stream_pos-file_data), bytes_left);
 		if (!r) {
 			AACGetLastFrameInfo(aac, &info);
 			AUDIO_play(&a, (char*)sample_buf, info.outputSamps/info.nChans);
 			AUDIO_wait(&a, 100);
 		} else {
-			printf("\nAAC decode error %d\n", r);
-//			break;
 			int nextSync = AACFindSyncWord(stream_pos, bytes_left);
-			stream_pos += nextSync;
-			bytes_left -= nextSync;
+			if (nextSync==-1) break;
+			printf("\nAAC decode error %d\n", r);
+			break;
+//			printf("next %d\n", nextSync);
+//			stream_pos += nextSync;
+//			bytes_left -= nextSync;
 		}
 	}
 	printf("\e[?25h");
@@ -312,7 +314,7 @@ void play_dir(char *name, char *type, int flag)
 			if (!strstr(e, type)) continue;
 		}
 
-		printf("%s\n", ls[i].d_name);
+		printf("\n%s\n", ls[i].d_name);
 		snprintf(path, 1024, "%s", ls[i].d_name);
 
 		if (strstr(e, "flac")) play_flac(path);
@@ -323,6 +325,7 @@ void play_dir(char *name, char *type, int flag)
 		else if (strstr(e, "wav")) play_wav(path);
 //		else if (strstr(e, "wma")) play_wma(path);
 
+		if (cmd==0x08) i -= 2;
 		if (cmd=='q' || cmd==0x1b) break;
 	}
 }

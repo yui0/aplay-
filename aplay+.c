@@ -325,7 +325,7 @@ void play_dir(char *name, char *type, int flag)
 		else if (strstr(e, "wav")) play_wav(path);
 //		else if (strstr(e, "wma")) play_wma(path);
 
-		if (cmd==0x08) i -= 2;
+		if (cmd=='\\') i -= 2;
 		if (cmd=='q' || cmd==0x1b) break;
 	}
 }

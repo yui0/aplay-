@@ -13314,8 +13314,37 @@ printf("type:%x/%x\n",type, ATOM_soun);
 	if (nChunks == 1) {
 		_ATOM mdat =  uaac_findMp4Atom("mdat", 0, 1, fd);
 		lastChunk = mdat.size;
-	}
+	} else {
+		printf("stco[%d]:\n", nChunks);
+		for (int i=1; i<=nChunks; i++) {
+			printf(" %d", uaac_read32(stco +8+4 +i*4, fd));
+		}
 
+		uint32_t stsc = uaac_findMp4Atom("stsc", stbl + 8, 1, fd).position;
+		uint32_t n = uaac_read32(stsc + 8 + 0x04, fd);
+		printf("\nstsc[%d]:\n", n);
+		for (int i=1; i<=n; i++) {
+			// i_first_chunk i_samples_per_chunk i_sample_description_index
+			printf(" %d-%d-%d", uaac_read32(stsc +8+4 +i*4*3, fd), uaac_read32(stsc +8+4 +i*4*3+4, fd), uaac_read32(stsc +8+4 +i*4*3+8, fd));
+		}
+
+		uint32_t stsz = uaac_findMp4Atom("stsz", stbl + 8, 1, fd).position;
+		//uint32_t n = uaac_read32(stsz + 8 + 0x04, fd);//sample size
+		/*uint32_t*/ n = uaac_read32(stsz + 8 + 0x08, fd);
+		printf("\nstsz[%d]:\n", n);
+		/*for (int i=1; i<=n; i++) {
+			printf(" %d", uaac_read32(stsz +8+8 +i*4, fd));
+		}*/
+
+		int samplesPerChunk = uaac_read32(stsc +8+4 +1*4*3+8, fd);
+		for (int i=0; i<nChunks; i++) {
+			int c = 0;
+			for (int j=0; j<samplesPerChunk; j++) {
+				c += uaac_read32(stsz +8+12 +(i*samplesPerChunk+j)*4, fd);
+			}
+			printf(" %d/%d", uaac_read32(stco +8+8 +i*4, fd), c);
+		}
+	}
 #if 0
 	printf("mdhd duration %dms, stsd: chan=%d samplerate=%d nChunks=%d", duration, channels, samplerate, nChunks);
 	printf(" firstChunk=%x lastChunk=%x\n", firstChunk, lastChunk);

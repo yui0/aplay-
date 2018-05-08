@@ -4094,8 +4094,8 @@ static int wma_decode_block(WMADecodeContext *s)
                there is potentially less energy there */
             tindex = (ch == 1 && s->ms_stereo);
             coef_vlc = &s->coef_vlc[tindex];
-            run_table = s->run_table[tindex];
-            level_table = s->level_table[tindex];
+            run_table = (const int16_t*)s->run_table[tindex];
+            level_table = (const int16_t*)s->level_table[tindex];
             /* XXX: optimize */
             ptr = &s->coefs1[ch][0];
             eptr = ptr + nb_coefs[ch];
@@ -4993,3 +4993,5 @@ AVCodec wmav2i_decoder =
         wma_decode_superframe,
     };
 
+#undef UPDATE_CACHE
+#undef BF

@@ -238,6 +238,7 @@ int play_aac(char *name)
 		return 1;
 	}
 
+#if 0
 	int len = lseek(fd, 0, SEEK_END);
 	file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
 //	stream_pos = file_data;
@@ -267,6 +268,20 @@ int play_aac(char *name)
 	stream_pos = file_data + chunk;
 	bytes_left = len - chunk;
 	printf("%x %x %x %x\n", stream_pos[0], stream_pos[1], stream_pos[2], stream_pos[3]);
+#else
+	int samplerate, channels;
+	file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels);
+	stream_pos = file_data;
+
+	AACFrameInfo info;
+	memset(&info, 0, sizeof(AACFrameInfo));
+	info.nChans = channels;
+	//info.bitsPerSample = bits; // not used
+	info.sampRateCore = samplerate;
+	info.profile = AAC_PROFILE_LC;
+	HAACDecoder aac = AACInitDecoder();
+	AACSetRawBlockParams(aac, 0, &info);
+#endif
 
 	printf("%dHz %dch\n", info.sampRateCore, info.nChans);
 	AUDIO a;
@@ -296,7 +311,7 @@ int play_aac(char *name)
 
 	AUDIO_close(&a);
 	AACFreeDecoder(aac);
-	munmap(file_data, len);
+//	munmap(file_data, len);
 	close(fd);
 	return 0;
 }

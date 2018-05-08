@@ -1,9 +1,18 @@
-/* public domain Simple, Minimalistic, AAC decoder
+/* RPSL Simple, Minimalistic, AAC decoder
  *	©2018 Yuichiro Nakada
  *
  * Basic usage:
- *	uaac_decode("music.flac", pcm, len, 44100, 16, 2, 9);
+ *	file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels);
  *
+ *	AACFrameInfo info;
+ *	memset(&info, 0, sizeof(AACFrameInfo));
+ *	info.nChans = channels;
+ *	info.sampRateCore = samplerate;
+ *	info.profile = AAC_PROFILE_LC;
+ *	HAACDecoder aac = AACInitDecoder();
+ *	AACSetRawBlockParams(aac, 0, &info);
+ *
+ *	int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
  * */
 
 
@@ -13260,6 +13269,7 @@ _ATOM uaac_findMp4Atom(const char *atom, const uint32_t posi, const int loop, in
 	ret.size = 0;
 	return ret;
 }
+#if 0
 int uaac_setupMp4(HAACDecoder aac, AACFrameInfo *aacFrameInfo, int fd)
 {
 	_ATOM ftyp = uaac_findMp4Atom("ftyp", 0, 0, fd);
@@ -13355,6 +13365,7 @@ printf("type:%x/%x\n",type, ATOM_soun);
 #endif
 	return firstChunk;
 }
+#endif
 uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
 {
 	_ATOM ftyp = uaac_findMp4Atom("ftyp", 0, 0, fd);
@@ -13362,21 +13373,23 @@ uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
 
 	// go through the boxes to find the interesting atoms:
 	uint32_t moov = uaac_findMp4Atom("moov", 0, 1, fd).position;
-//uint32_t mdia, type;
-//	do {
-	uint32_t trak = uaac_findMp4Atom("trak", moov + 8, 1, fd).position;
-	uint32_t mdia = uaac_findMp4Atom("mdia", trak + 8, 1, fd).position;
+	uint32_t mdia;
+	for (int i=0; i<10; i++) {
+		uint32_t trak = uaac_findMp4Atom("trak", moov + 8, 1, fd).position;
+		/*uint32_t*/ mdia = uaac_findMp4Atom("mdia", trak + 8, 1, fd).position;
 
-	uint32_t hdlr = uaac_findMp4Atom("hdlr", mdia + 8, 1, fd).position;
-	uint32_t type = uaac_read32(hdlr + 8 + 0x08, fd);
-printf("type:%x/%x\n",type, ATOM_soun);
-//moov = hdlr;
-//	} while (type != ATOM_soun);
+		uint32_t hdlr = uaac_findMp4Atom("hdlr", mdia + 8, 1, fd).position;
+		uint32_t type = uaac_read32(hdlr + 8 + 0x08, fd);
+
+		if (type == ATOM_soun) break;
+		moov = hdlr;
+//		printf("type:%x/%x\n",type, ATOM_soun);
+	}
 
 	// determine duration:
-	uint32_t mdhd = uaac_findMp4Atom("mdhd", mdia + 8, 1, fd).position;
-	uint32_t timescale = uaac_read32(mdhd + 8 + 0x0c, fd);
-	unsigned int duration = 1000.0 * ((float)uaac_read32(mdhd + 8 + 0x10, fd) / (float)timescale);
+//	uint32_t mdhd = uaac_findMp4Atom("mdhd", mdia + 8, 1, fd).position;
+//	uint32_t timescale = uaac_read32(mdhd + 8 + 0x0c, fd);
+//	unsigned int duration = 1000.0 * ((float)uaac_read32(mdhd + 8 + 0x10, fd) / (float)timescale);
 
 	// MP4-data has no aac-frames, so we have to set the parameters by hand.
 	uint32_t minf = uaac_findMp4Atom("minf", mdia + 8, 1, fd).position;
@@ -13394,68 +13407,32 @@ printf("type:%x/%x\n",type, ATOM_soun);
 
 	// number of chunks:
 	uint32_t nChunks = uaac_read32(stco + 8 + 0x04, fd);
-	// first entry from chunk table:
-	uint32_t firstChunk = uaac_read32(stco + 8 + 0x08, fd);
-	// last entry from chunk table:
-	uint32_t lastChunk = uaac_read32(stco + 8 + 0x04 + nChunks * 4, fd);
 
-	uint8_t *data;
-/*	if (nChunks == 1) {
-		_ATOM mdat =  uaac_findMp4Atom("mdat", 0, 1, fd);
-		lastChunk = mdat.size;
-	} else {*/
-#if 0
-		printf("stco[%d]:\n", nChunks);
-		for (int i=1; i<=nChunks; i++) {
-			printf(" %d", uaac_read32(stco +8+4 +i*4, fd));
+	uint32_t pos[nChunks];
+	uint32_t size[nChunks];
+	uint32_t stsz = uaac_findMp4Atom("stsz", stbl + 8, 1, fd).position;
+	uint32_t stsc = uaac_findMp4Atom("stsc", stbl + 8, 1, fd).position;
+	int samplesPerChunk = uaac_read32(stsc +8+4 +8, fd);
+	int c = 0;
+	for (int i=0; i<nChunks-1; i++) {
+		size[i] = 0;
+		for (int j=0; j<samplesPerChunk; j++) {
+			size[i] += uaac_read32(stsz +8+12 +(i*samplesPerChunk+j)*4, fd);
 		}
+		c += size[i];
+		pos[i] = uaac_read32(stco +8+8 +i*4, fd);
+//		printf(" %d", c);
+	}
+//	printf("samplesPerChunk:%d dataSize:%d\n", samplesPerChunk, c);
 
-		uint32_t stsc = uaac_findMp4Atom("stsc", stbl + 8, 1, fd).position;
-		uint32_t n = uaac_read32(stsc + 8 + 0x04, fd);
-		printf("\nstsc[%d]:\n", n);
-		for (int i=0; i<n; i++) {
-			// i_first_chunk i_samples_per_chunk i_sample_description_index
-			printf(" %d-%d-%d", uaac_read32(stsc +8+8 +i*4*3, fd), uaac_read32(stsc +8+8 +i*4*3+4, fd), uaac_read32(stsc +8+8 +i*4*3+8, fd));
-		}
-
-		uint32_t stsz = uaac_findMp4Atom("stsz", stbl + 8, 1, fd).position;
-		//uint32_t n = uaac_read32(stsz + 8 + 0x04, fd);//sample size
-		/*uint32_t*/ n = uaac_read32(stsz + 8 + 0x08, fd);
-		printf("\nstsz[%d]:\n", n);
-		for (int i=1; i<=n; i++) {
-			printf(" %d", uaac_read32(stsz +8+8 +i*4, fd));
-		}
-#endif
-/*typedef struct {
-	uint32_t pos;
-	uint32_t size;
-} MP4_OFFSET;*/
-		uint32_t pos[nChunks];
-		uint32_t size[nChunks];
-		uint32_t stsz = uaac_findMp4Atom("stsz", stbl + 8, 1, fd).position;
-		uint32_t stsc = uaac_findMp4Atom("stsc", stbl + 8, 1, fd).position;
-		int samplesPerChunk = uaac_read32(stsc +8+4 +8, fd);
-		int c = 0;
-		for (int i=0; i<nChunks-1; i++) {
-			size[i] = 0;
-			for (int j=0; j<samplesPerChunk; j++) {
-				size[i] += uaac_read32(stsz +8+12 +(i*samplesPerChunk+j)*4, fd);
-			}
-			c += size[i];
-			pos[i] = uaac_read32(stco +8+8 +i*4, fd);
-		printf(" %d", c);
-		}
-		printf("samplesPerChunk:%d dataSize:%d\n", samplesPerChunk, c);
-
-		*len = c;
-		data = (uint8_t*)malloc(c);
-		uint8_t *p = data;
-		for (int i=0; i<nChunks-1; i++) {
-			lseek(fd, pos[i], SEEK_SET);
-			read(fd, p, size[i]);
-			p += size[i];
-		}
-//	}
+	*len = c;
+	uint8_t *data = (uint8_t*)malloc(c);
+	uint8_t *p = data;
+	for (int i=0; i<nChunks-1; i++) {
+		lseek(fd, pos[i], SEEK_SET);
+		read(fd, p, size[i]);
+		p += size[i];
+	}
 
 	return data;
 }

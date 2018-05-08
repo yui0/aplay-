@@ -238,37 +238,6 @@ int play_aac(char *name)
 		return 1;
 	}
 
-#if 0
-	int len = lseek(fd, 0, SEEK_END);
-	file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
-//	stream_pos = file_data;
-//	bytes_left = len;// - 100;
-
-	AACFrameInfo info;
-	HAACDecoder aac = AACInitDecoder();
-
-	int chunk = uaac_setupMp4(aac, &info, fd);
-	if (!chunk) {
-		printf("!!!! %dHz %dch\n", info.sampRateCore, info.nChans);
-/*		// NO MP4. Do we have an ID3TAG ?
-		lseek(fd, 0, SEEK_SET);
-//		fseek(0);
-		// Read-ahead 10 Bytes to detect ID3
-		sd_left = fread(sd_buf, 10);
-		// Skip ID3, if existent
-		uint32_t skip = skipID3(sd_buf);
-		if (skip) {
-			size_id3 = skip;
-			int b = skip & 0xfffffe00;
-			fseek(b);
-			sd_left = 0;
-			//Serial.print("ID3");
-		} else size_id3 = 0;*/
-	}
-	stream_pos = file_data + chunk;
-	bytes_left = len - chunk;
-	printf("%x %x %x %x\n", stream_pos[0], stream_pos[1], stream_pos[2], stream_pos[3]);
-#else
 	int samplerate, channels;
 	file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels);
 	stream_pos = file_data;
@@ -276,12 +245,10 @@ int play_aac(char *name)
 	AACFrameInfo info;
 	memset(&info, 0, sizeof(AACFrameInfo));
 	info.nChans = channels;
-	//info.bitsPerSample = bits; // not used
 	info.sampRateCore = samplerate;
 	info.profile = AAC_PROFILE_LC;
 	HAACDecoder aac = AACInitDecoder();
 	AACSetRawBlockParams(aac, 0, &info);
-#endif
 
 	printf("%dHz %dch\n", info.sampRateCore, info.nChans);
 	AUDIO a;
@@ -299,19 +266,15 @@ int play_aac(char *name)
 			AUDIO_wait(&a, 100);
 		} else {
 			int nextSync = AACFindSyncWord(stream_pos, bytes_left);
-			if (nextSync==-1) break;
 			printf("\nAAC decode error %d\n", r);
 			break;
-//			printf("next %d\n", nextSync);
-//			stream_pos += nextSync;
-//			bytes_left -= nextSync;
 		}
 	}
 	printf("\e[?25h");
 
 	AUDIO_close(&a);
 	AACFreeDecoder(aac);
-//	munmap(file_data, len);
+	free(file_data);
 	close(fd);
 	return 0;
 }

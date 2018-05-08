@@ -240,6 +240,10 @@ int play_aac(char *name)
 
 	int samplerate, channels;
 	file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels);
+	if (!file_data) {
+		printf("Error: cannot read AAC data\n");
+		return 1;
+	}
 	stream_pos = file_data;
 
 	AACFrameInfo info;

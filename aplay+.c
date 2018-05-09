@@ -92,6 +92,7 @@ void play_flac(char *name)
 	}
 
 	AUDIO_close(&a);
+	drflac_close(flac);
 }
 
 int play_mp3(char *name)

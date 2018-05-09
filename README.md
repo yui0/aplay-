@@ -29,5 +29,6 @@ $ ./aplay+ -rx .
 
 ## References
 
+- https://github.com/nothings/stb
 - https://github.com/mackron/dr_libs
 - https://github.com/dr-soft/mini_al

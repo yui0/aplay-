@@ -145,8 +145,8 @@ int play_mp3(char *name)
 	printf("\e[?25h");
 
 	AUDIO_close(&a);
-	munmap(file_data, len);
 	mp3_done(mp3);
+	munmap(file_data, len);
 	close(fd);
 	return 0;
 }

@@ -12,7 +12,7 @@
  *	HAACDecoder aac = AACInitDecoder();
  *	AACSetRawBlockParams(aac, 0, &info);
  *
- *	int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
+ *	int r = AACDecode(aac, &file_data, &bytes_left, sample_buf);
  * */
 
 
@@ -13382,9 +13382,10 @@ uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
 		uint32_t type = uaac_read32(hdlr + 8 + 0x08, fd);
 
 		if (type == ATOM_soun) break;
-		if (!trak.pos) return 0; // error
+//		if (!trak.pos) return 0; // error
 		moov = trak.pos + trak.size -8;
 		printf("type:%x/%x %x %x\n", type, ATOM_soun, trak.pos, moov);
+		if (!trak.pos) return 0; // error
 	}
 
 	// determine duration:

@@ -125,7 +125,7 @@ int play_mp3(char *name)
 
 	printf("%dHz %dch\n", info.sample_rate, info.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES/*MP3_MAX_SAMPLES_PER_FRAME*//*frame_size*/, 1)) {
+	if (AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES, 1)) {
 		return 1;
 	}
 

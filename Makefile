@@ -3,8 +3,8 @@
 PROGRAM = $(patsubst %.c,%,$(wildcard *.c))
 
 CC = clang
-CFLAGS = -Wl,-s -Os
-LDFLAGS = -lasound -lm
+CFLAGS = -Os -ffunction-sections -fdata-sections
+LDFLAGS = -lasound -lm -Wl,-s -dead_strip
 
 .PHONY: all
 all: depend $(PROGRAM)

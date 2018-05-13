@@ -25,11 +25,9 @@
 int cmd;
 int key(AUDIO *a)
 {
-//	if (!kbhit()) return 0;
-
 	int c = readch();
-	if (!c) return 0;
 	cmd = c;
+	if (!c) return 0;
 	printf("%x\n", c);
 	if (c==0x20) {
 		snd_pcm_pause(a->handle, 1);

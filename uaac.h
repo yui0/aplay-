@@ -13261,6 +13261,7 @@ _ATOM uaac_findMp4Atom(const char *atom, const uint32_t pos, const int loop, int
 		read(fd, &atomInfo, sizeof(atomInfo));
 		ret.size = REV32(atomInfo.size);
 		if (!strncmp(atom, atomInfo.name, 4)) return ret;
+		if (!ret.size) break;
 		ret.pos += ret.size;
 	} while (loop && r>=0);
 

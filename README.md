@@ -15,14 +15,15 @@ a simple BitPerfect player
 ```bash
 $ make
 $ ./aplay+ -h
-Usage: ./aplay+ [options] dir
+Usage: aplay+ [options] dir
 
 Options:
 -d <device name>   ALSA device name [default hw:0,0 plughw:0,0...]
 -h                 Print this message
 -r                 Recursively search for directory
 -x                 Random play
--t                 File type [flac mp3 wma...]
+-s <regexp>        Search files
+-t <ext type>      File type [flac mp3 wma...]
 
 $ ./aplay+ -rx .
 ```
@@ -32,3 +33,4 @@ $ ./aplay+ -rx .
 - https://github.com/nothings/stb
 - https://github.com/mackron/dr_libs
 - https://github.com/dr-soft/mini_al
+- https://github.com/ccxvii/minilibs

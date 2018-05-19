@@ -18,6 +18,7 @@
 
 #define PARG_IMPLEMENTATION
 #include "parg.h"
+#include "regexp.h"
 
 #include "random.h"
 #include "ls.h"
@@ -282,7 +283,7 @@ int play_aac(char *name)
 	return 0;
 }
 
-void play_dir(char *name, char *type, int flag)
+void play_dir(char *name, char *type, char *regexp, int flag)
 {
 	char path[1024], ext[10];
 	int num;
@@ -293,6 +294,16 @@ void play_dir(char *name, char *type, int flag)
 		//printf("ext:%s[%s]\n", e, strstr(e, "flac"));
 		if (type) {
 			if (!strstr(e, type)) continue;
+		}
+		if (regexp) {
+			const char *error;
+			Reprog *p = regcomp(regexp, 0, &error);
+			if (!p) {
+				fprintf(stderr, "regcomp: %s\n", error);
+				return;
+			}
+			Resub m;
+			if (regexec(p, ls[i].d_name, &m, 0)) continue;
 		}
 
 		printf("\n%s\n", ls[i].d_name);
@@ -320,7 +331,8 @@ void usage(FILE* fp, int argc, char** argv)
 		"-h                 Print this message\n"
 		"-r                 Recursively search for directory\n"
 		"-x                 Random play\n"
-		"-t                 File type [flac mp3 wma...]\n"
+		"-s <regexp>        Search files\n"
+		"-t <ext type>      File type [flac mp3 wma...]\n"
 		"\n",
 		argv[0]);
 }
@@ -330,11 +342,12 @@ int main(int argc, char *argv[])
 	int flag = 0;
 	char *dir = ".";
 	char *type = 0;
+	char *regexp = 0;
 	struct parg_state ps;
 	int c;
 
 	parg_init(&ps);
-	while ((c = parg_getopt(&ps, argc, argv, "hd:rxt:")) != -1) {
+	while ((c = parg_getopt(&ps, argc, argv, "hd:rxs:t:")) != -1) {
 		switch (c) {
 		case 1:
 			dir = (char*)ps.optarg;
@@ -348,6 +361,9 @@ int main(int argc, char *argv[])
 		case 'x':
 			flag |= LS_RANDOM;
 			break;
+		case 's':
+			regexp = (char*)ps.optarg;
+			break;
 		case 't':
 			type = (char*)ps.optarg;
 			break;
@@ -359,7 +375,7 @@ int main(int argc, char *argv[])
 	}
 
 	init_keyboard();
-	play_dir(dir, type, flag);
+	play_dir(dir, type, regexp, flag);
 	close_keyboard();
 
 	return 0;

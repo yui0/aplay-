@@ -26,6 +26,7 @@ Options:
 -t <ext type>      File type [flac mp3 wma...]
 
 $ ./aplay+ -rx .
+$ ./aplay+ -rx -d hw:7,0 /run/media/root/Samsung_T5/Music/ -s ZARD
 ```
 
 ## References

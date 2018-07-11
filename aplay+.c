@@ -94,27 +94,29 @@ void play_flac(char *name)
 	drflac_close(flac);
 }
 
-int play_mp3(char *name)
+void *preload(char *name, int *len)
 {
-	mp3_info_t info;
-	void *file_data;
-	unsigned char *stream_pos;
-	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
-	int bytes_left;
-	int frame_size;
-	int value;
-
 	int fd = open(name, O_RDONLY);
 	if (fd < 0) {
 		printf("Error: cannot open `%s`\n", name);
-		return 1;
+		return 0;
 	}
+	*len = lseek(fd, 0, SEEK_END);
+	void *p = mmap(0, *len, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	return p;
+}
+int play_mp3(char *name)
+{
+	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
+	int frame_size;
 
-	int len = lseek(fd, 0, SEEK_END);
-	file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
-	stream_pos = (unsigned char *) file_data;
-	bytes_left = len - 100;
+	int len;
+	void *file_data = preload(name, &len);
+	unsigned char *stream_pos = (unsigned char *)file_data;
+	int bytes_left = len - 100;
 
+	mp3_info_t info;
 	mp3_decoder_t mp3 = mp3_create();
 	frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, &info);
 	if (!frame_size) {
@@ -144,9 +146,8 @@ int play_mp3(char *name)
 	printf("\e[?25h");
 
 	AUDIO_close(&a);
-	mp3_done(mp3);
+	mp3_free(mp3);
 	munmap(file_data, len);
-	close(fd);
 	return 0;
 }
 

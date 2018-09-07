@@ -109,8 +109,6 @@ void *preload(char *name, int *len)
 int play_mp3(char *name)
 {
 	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
-	int frame_size;
-
 	int len;
 	void *file_data = preload(name, &len);
 	unsigned char *stream_pos = (unsigned char *)file_data;
@@ -118,7 +116,7 @@ int play_mp3(char *name)
 
 	mp3_info_t info;
 	mp3_decoder_t mp3 = mp3_create();
-	frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, &info);
+	int frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, &info);
 	if (!frame_size) {
 		printf("Error: not a valid MP3 audio file!\n");
 		return 1;

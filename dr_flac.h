@@ -1,5 +1,5 @@
 // FLAC audio decoder. Public domain. See "unlicense" statement at the end of this file.
-// dr_flac - v0.9.7 - 2018-07-05
+// dr_flac - v0.9.11 - 2018-08-29
 //
 // David Reid - mackron@gmail.com
 
@@ -157,14 +157,8 @@ extern "C" {
 #endif
 
 // Check if we can enable 64-bit optimizations.
-#if defined(_WIN64)
+#if defined(_WIN64) || defined(_LP64) || defined(__LP64__)
 #define DRFLAC_64BIT
-#endif
-
-#if defined(__GNUC__)
-#if defined(__x86_64__) || defined(__ppc64__)
-#define DRFLAC_64BIT
-#endif
 #endif
 
 #ifdef DRFLAC_64BIT
@@ -754,6 +748,16 @@ const char* drflac_next_vorbis_comment(drflac_vorbis_comment_iterator* pIter, dr
 //
 ///////////////////////////////////////////////////////////////////////////////
 #ifdef DR_FLAC_IMPLEMENTATION
+#ifdef __linux__
+    #ifndef _BSD_SOURCE
+    #define _BSD_SOURCE
+    #endif
+    #ifndef __USE_BSD
+    #define __USE_BSD
+    #endif
+    #include <endian.h>
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -776,18 +780,32 @@ const char* drflac_next_vorbis_comment(drflac_vorbis_comment_iterator* pIter, dr
                 __cpuid(info, fid);
             }
         #else
-        #define DRFLAC_NO_CPUID
+            #define DRFLAC_NO_CPUID
         #endif
     #else
         #if defined(__GNUC__) || defined(__clang__)
             static void drflac__cpuid(int info[4], int fid)
             {
-                __asm__ __volatile__ (
-                    "cpuid" : "=a"(info[0]), "=b"(info[1]), "=c"(info[2]), "=d"(info[3]) : "a"(fid), "c"(0)
-                );
+                // It looks like the -fPIC option uses the ebx register which GCC complains about. We can work around this by just using a different register, the
+                // specific register of which I'm letting the compiler decide on. The "k" prefix is used to specify a 32-bit register. The {...} syntax is for
+                // supporting different assembly dialects.
+                //
+                // What's basically happening is that we're saving and restoring the ebx register manually.
+                #if defined(DRFLAC_X86) && defined(__PIC__)
+                    __asm__ __volatile__ (
+                        "xchg{l} {%%}ebx, %k1;"
+                        "cpuid;"
+                        "xchg{l} {%%}ebx, %k1;"
+                        : "=a"(info[0]), "=&r"(info[1]), "=c"(info[2]), "=d"(info[3]) : "a"(fid), "c"(0)
+                    );
+                #else
+                    __asm__ __volatile__ (
+                        "cpuid" : "=a"(info[0]), "=b"(info[1]), "=c"(info[2]), "=d"(info[3]) : "a"(fid), "c"(0)
+                    );
+                #endif
             }
         #else
-        #define DRFLAC_NO_CPUID
+            #define DRFLAC_NO_CPUID
         #endif
     #endif
 #else
@@ -795,28 +813,37 @@ const char* drflac_next_vorbis_comment(drflac_vorbis_comment_iterator* pIter, dr
 #endif
 
 
-#ifdef __linux__
-#define _BSD_SOURCE
-#include <endian.h>
-#endif
-
 #if defined(_MSC_VER) && _MSC_VER >= 1500 && (defined(DRFLAC_X86) || defined(DRFLAC_X64))
-#define DRFLAC_HAS_LZCNT_INTRINSIC
+    #define DRFLAC_HAS_LZCNT_INTRINSIC
 #elif (defined(__GNUC__) && ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 7)))
-#define DRFLAC_HAS_LZCNT_INTRINSIC
+    #define DRFLAC_HAS_LZCNT_INTRINSIC
 #elif defined(__clang__)
     #if __has_builtin(__builtin_clzll) || __has_builtin(__builtin_clzl)
-    #define DRFLAC_HAS_LZCNT_INTRINSIC
+        #define DRFLAC_HAS_LZCNT_INTRINSIC
     #endif
 #endif
 
 #if defined(_MSC_VER) && _MSC_VER >= 1300
-#define DRFLAC_HAS_BYTESWAP_INTRINSIC
-#elif defined(__GNUC__) && ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))
-#define DRFLAC_HAS_BYTESWAP_INTRINSIC
+    #define DRFLAC_HAS_BYTESWAP16_INTRINSIC
+    #define DRFLAC_HAS_BYTESWAP32_INTRINSIC
+    #define DRFLAC_HAS_BYTESWAP64_INTRINSIC
 #elif defined(__clang__)
-    #if __has_builtin(__builtin_bswap16) && __has_builtin(__builtin_bswap32) && __has_builtin(__builtin_bswap64)
-    #define DRFLAC_HAS_BYTESWAP_INTRINSIC
+    #if __has_builtin(__builtin_bswap16)
+        #define DRFLAC_HAS_BYTESWAP16_INTRINSIC
+    #endif
+    #if __has_builtin(__builtin_bswap32)
+        #define DRFLAC_HAS_BYTESWAP32_INTRINSIC
+    #endif
+    #if __has_builtin(__builtin_bswap64)
+        #define DRFLAC_HAS_BYTESWAP64_INTRINSIC
+    #endif
+#elif defined(__GNUC__)
+    #if ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))
+        #define DRFLAC_HAS_BYTESWAP32_INTRINSIC
+        #define DRFLAC_HAS_BYTESWAP64_INTRINSIC
+    #endif
+    #if ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 8))
+        #define DRFLAC_HAS_BYTESWAP16_INTRINSIC
     #endif
 #endif
 
@@ -914,7 +941,7 @@ static DRFLAC_INLINE drflac_bool32 drflac__is_little_endian()
 
 static DRFLAC_INLINE drflac_uint16 drflac__swap_endian_uint16(drflac_uint16 n)
 {
-#ifdef DRFLAC_HAS_BYTESWAP_INTRINSIC
+#ifdef DRFLAC_HAS_BYTESWAP16_INTRINSIC
     #if defined(_MSC_VER)
         return _byteswap_ushort(n);
     #elif defined(__GNUC__) || defined(__clang__)
@@ -930,7 +957,7 @@ static DRFLAC_INLINE drflac_uint16 drflac__swap_endian_uint16(drflac_uint16 n)
 
 static DRFLAC_INLINE drflac_uint32 drflac__swap_endian_uint32(drflac_uint32 n)
 {
-#ifdef DRFLAC_HAS_BYTESWAP_INTRINSIC
+#ifdef DRFLAC_HAS_BYTESWAP32_INTRINSIC
     #if defined(_MSC_VER)
         return _byteswap_ulong(n);
     #elif defined(__GNUC__) || defined(__clang__)
@@ -948,7 +975,7 @@ static DRFLAC_INLINE drflac_uint32 drflac__swap_endian_uint32(drflac_uint32 n)
 
 static DRFLAC_INLINE drflac_uint64 drflac__swap_endian_uint64(drflac_uint64 n)
 {
-#ifdef DRFLAC_HAS_BYTESWAP_INTRINSIC
+#ifdef DRFLAC_HAS_BYTESWAP64_INTRINSIC
     #if defined(_MSC_VER)
         return _byteswap_uint64(n);
     #elif defined(__GNUC__) || defined(__clang__)
@@ -5119,10 +5146,10 @@ drflac_uint64 drflac__read_s32__misaligned(drflac* pFlac, drflac_uint64 samplesT
             case DRFLAC_CHANNEL_ASSIGNMENT_LEFT_SIDE:
             {
                 if (channelIndex == 0) {
-                    decodedSample = pFlac->currentFrame.subframes[channelIndex].pDecodedSamples[nextSampleInFrame];
+                    decodedSample = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 0].wastedBitsPerSample;
                 } else {
-                    int side = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame];
-                    int left = pFlac->currentFrame.subframes[channelIndex - 1].pDecodedSamples[nextSampleInFrame];
+                    int side = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 0].wastedBitsPerSample;
+                    int left = pFlac->currentFrame.subframes[channelIndex - 1].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex - 1].wastedBitsPerSample;
                     decodedSample = left - side;
                 }
             } break;
@@ -5130,11 +5157,11 @@ drflac_uint64 drflac__read_s32__misaligned(drflac* pFlac, drflac_uint64 samplesT
             case DRFLAC_CHANNEL_ASSIGNMENT_RIGHT_SIDE:
             {
                 if (channelIndex == 0) {
-                    int side  = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame];
-                    int right = pFlac->currentFrame.subframes[channelIndex + 1].pDecodedSamples[nextSampleInFrame];
+                    int side  = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 0].wastedBitsPerSample;
+                    int right = pFlac->currentFrame.subframes[channelIndex + 1].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 1].wastedBitsPerSample;
                     decodedSample = side + right;
                 } else {
-                    decodedSample = pFlac->currentFrame.subframes[channelIndex].pDecodedSamples[nextSampleInFrame];
+                    decodedSample = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 0].wastedBitsPerSample;
                 }
             } break;
 
@@ -5143,14 +5170,14 @@ drflac_uint64 drflac__read_s32__misaligned(drflac* pFlac, drflac_uint64 samplesT
                 int mid;
                 int side;
                 if (channelIndex == 0) {
-                    mid  = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame];
-                    side = pFlac->currentFrame.subframes[channelIndex + 1].pDecodedSamples[nextSampleInFrame];
+                    mid  = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 0].wastedBitsPerSample;
+                    side = pFlac->currentFrame.subframes[channelIndex + 1].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 1].wastedBitsPerSample;
 
                     mid = (((unsigned int)mid) << 1) | (side & 0x01);
                     decodedSample = (mid + side) >> 1;
                 } else {
-                    mid  = pFlac->currentFrame.subframes[channelIndex - 1].pDecodedSamples[nextSampleInFrame];
-                    side = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame];
+                    mid  = pFlac->currentFrame.subframes[channelIndex - 1].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex - 1].wastedBitsPerSample;
+                    side = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 0].wastedBitsPerSample;
 
                     mid = (((unsigned int)mid) << 1) | (side & 0x01);
                     decodedSample = (mid - side) >> 1;
@@ -5160,12 +5187,12 @@ drflac_uint64 drflac__read_s32__misaligned(drflac* pFlac, drflac_uint64 samplesT
             case DRFLAC_CHANNEL_ASSIGNMENT_INDEPENDENT:
             default:
             {
-                decodedSample = pFlac->currentFrame.subframes[channelIndex].pDecodedSamples[nextSampleInFrame];
+                decodedSample = pFlac->currentFrame.subframes[channelIndex + 0].pDecodedSamples[nextSampleInFrame] << pFlac->currentFrame.subframes[channelIndex + 0].wastedBitsPerSample;
             } break;
         }
 
 
-        decodedSample <<= ((32 - pFlac->bitsPerSample) + pFlac->currentFrame.subframes[channelIndex].wastedBitsPerSample);
+        decodedSample <<= (32 - pFlac->bitsPerSample);
 
         if (bufferOut) {
             *bufferOut++ = decodedSample;
@@ -5257,12 +5284,12 @@ drflac_uint64 drflac_read_s32(drflac* pFlac, drflac_uint64 samplesToRead, drflac
                     const drflac_int32* pDecodedSamples1 = pFlac->currentFrame.subframes[1].pDecodedSamples + firstAlignedSampleInFrame;
 
                     for (drflac_uint64 i = 0; i < alignedSampleCountPerChannel; ++i) {
-                        int left  = pDecodedSamples0[i];
-                        int side  = pDecodedSamples1[i];
+                        int left  = pDecodedSamples0[i] << (unusedBitsPerSample + pFlac->currentFrame.subframes[0].wastedBitsPerSample);
+                        int side  = pDecodedSamples1[i] << (unusedBitsPerSample + pFlac->currentFrame.subframes[1].wastedBitsPerSample);
                         int right = left - side;
 
-                        bufferOut[i*2+0] = left  << (unusedBitsPerSample + pFlac->currentFrame.subframes[0].wastedBitsPerSample);
-                        bufferOut[i*2+1] = right << (unusedBitsPerSample + pFlac->currentFrame.subframes[1].wastedBitsPerSample);
+                        bufferOut[i*2+0] = left;
+                        bufferOut[i*2+1] = right;
                     }
                 } break;
 
@@ -5272,12 +5299,12 @@ drflac_uint64 drflac_read_s32(drflac* pFlac, drflac_uint64 samplesToRead, drflac
                     const drflac_int32* pDecodedSamples1 = pFlac->currentFrame.subframes[1].pDecodedSamples + firstAlignedSampleInFrame;
 
                     for (drflac_uint64 i = 0; i < alignedSampleCountPerChannel; ++i) {
-                        int side  = pDecodedSamples0[i];
-                        int right = pDecodedSamples1[i];
+                        int side  = pDecodedSamples0[i] << (unusedBitsPerSample + pFlac->currentFrame.subframes[0].wastedBitsPerSample);
+                        int right = pDecodedSamples1[i] << (unusedBitsPerSample + pFlac->currentFrame.subframes[1].wastedBitsPerSample);
                         int left  = right + side;
 
-                        bufferOut[i*2+0] = left  << (unusedBitsPerSample + pFlac->currentFrame.subframes[0].wastedBitsPerSample);
-                        bufferOut[i*2+1] = right << (unusedBitsPerSample + pFlac->currentFrame.subframes[1].wastedBitsPerSample);
+                        bufferOut[i*2+0] = left;
+                        bufferOut[i*2+1] = right;
                     }
                 } break;
 
@@ -5287,11 +5314,13 @@ drflac_uint64 drflac_read_s32(drflac* pFlac, drflac_uint64 samplesToRead, drflac
                     const drflac_int32* pDecodedSamples1 = pFlac->currentFrame.subframes[1].pDecodedSamples + firstAlignedSampleInFrame;
 
                     for (drflac_uint64 i = 0; i < alignedSampleCountPerChannel; ++i) {
-                        int side = pDecodedSamples1[i];
-                        int mid  = (((drflac_uint32)pDecodedSamples0[i]) << 1) | (side & 0x01);
+                        int mid  = pDecodedSamples0[i] << pFlac->currentFrame.subframes[0].wastedBitsPerSample;
+                        int side = pDecodedSamples1[i] << pFlac->currentFrame.subframes[1].wastedBitsPerSample;
+                        
+                        mid = (((drflac_uint32)mid) << 1) | (side & 0x01);
 
-                        bufferOut[i*2+0] = ((mid + side) >> 1) << (unusedBitsPerSample + pFlac->currentFrame.subframes[0].wastedBitsPerSample);
-                        bufferOut[i*2+1] = ((mid - side) >> 1) << (unusedBitsPerSample + pFlac->currentFrame.subframes[1].wastedBitsPerSample);
+                        bufferOut[i*2+0] = ((mid + side) >> 1) << (unusedBitsPerSample);
+                        bufferOut[i*2+1] = ((mid - side) >> 1) << (unusedBitsPerSample);
                     }
                 } break;
 
@@ -5471,14 +5500,16 @@ drflac_bool32 drflac_seek_to_sample(drflac* pFlac, drflac_uint64 sampleIndex)
 
 //// High Level APIs ////
 
-// I couldn't figure out where SIZE_MAX was defined for VC6. If anybody knows, let me know.
-#if defined(_MSC_VER) && _MSC_VER <= 1200
-#ifdef DRFLAC_64BIT
-#define SIZE_MAX    ((drflac_uint64)0xFFFFFFFFFFFFFFFF)
+#if defined(SIZE_MAX)
+    #define DRFLAC_SIZE_MAX  SIZE_MAX
 #else
-#define SIZE_MAX    0xFFFFFFFF
+    #if defined(DRFLAC_64BIT)
+        #define DRFLAC_SIZE_MAX  ((drflac_uint64)0xFFFFFFFFFFFFFFFF)
+    #else
+        #define DRFLAC_SIZE_MAX  0xFFFFFFFF
+    #endif
 #endif
-#endif
+
 
 // Using a macro as the definition of the drflac__full_decode_and_close_*() API family. Sue me.
 #define DRFLAC_DEFINE_FULL_DECODE_AND_CLOSE(extension, type) \
@@ -5520,7 +5551,7 @@ static type* drflac__full_decode_and_close_ ## extension (drflac* pFlac, unsigne
         drflac_zero_memory(pSampleData + totalSampleCount, (size_t)(sampleDataBufferSize - totalSampleCount*sizeof(type)));                                         \
     } else {                                                                                                                                                        \
         drflac_uint64 dataSize = totalSampleCount * sizeof(type);                                                                                                   \
-        if (dataSize > SIZE_MAX) {                                                                                                                                  \
+        if (dataSize > DRFLAC_SIZE_MAX) {                                                                                                                           \
             goto on_error;  /* The decoded data is too big. */                                                                                                      \
         }                                                                                                                                                           \
                                                                                                                                                                     \
@@ -5720,6 +5751,18 @@ const char* drflac_next_vorbis_comment(drflac_vorbis_comment_iterator* pIter, dr
 
 
 // REVISION HISTORY
+//
+// v0.9.11 - 2018-08-29
+//   - Fix a bug with sample reconstruction.
+//
+// v0.9.10 - 2018-08-07
+//   - Improve 64-bit detection.
+//
+// v0.9.9 - 2018-08-05
+//   - Fix C++ build on older versions of GCC.
+//
+// v0.9.8 - 2018-07-24
+//   - Fix compilation errors.
 //
 // v0.9.7 - 2018-07-05
 //   - Fix a warning.

@@ -319,6 +319,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 		if (cmd=='\\') i -= 2;
 		if (cmd=='q' || cmd==0x1b) break;
 	}
+	free(ls);
 }
 
 void usage(FILE* fp, int argc, char** argv)

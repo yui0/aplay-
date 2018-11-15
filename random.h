@@ -1,5 +1,5 @@
 /* public domain Simple, Minimalistic, random function
- *	©2017 Yuichiro Nakada
+ *	©2017-2018 Yuichiro Nakada
  * */
 
 #ifndef RANDOM_H
@@ -28,6 +28,8 @@ uint64_t xor128()
 	return ( xor128_seed[1] = ( s1 ^ s0 ^ ( s1 >> 17 ) ^ ( s0 >> 26 ) ) ) + s0;
 }
 
-#define frand()		( xor128() * (1.0 / (XOR128_MAX + 1.0f)) )
+#define frand()			( xor128() / (XOR128_MAX +1.0) )
+//#define rand(max)		(int)( xor128() / (XOR128_MAX +1.0) * max)
+#define random(min, max)	( xor128() / (XOR128_MAX +1.0) * (max -min) +min )
 
 #endif

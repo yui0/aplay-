@@ -80,6 +80,7 @@ void play_flac(char *name)
 		int c = 0;
 		printf("\e[?25l");
 		while (drflac_read_s16(flac, a.frames * flac->channels, (drflac_int16*)a.buffer) > 0) {
+//		while (drflac_read_pcm_frames_s16(flac, a.frames * flac->channels, (drflac_int16*)a.buffer) > 0) {
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;

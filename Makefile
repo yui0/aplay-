@@ -1,9 +1,9 @@
-# ©2017-2018 YUICHIRO NAKADA
+# ©2017-2019 YUICHIRO NAKADA
 
 PROGRAM = $(patsubst %.c,%,$(wildcard *.c))
 
 CC = clang
-CFLAGS = -Os -ffunction-sections -fdata-sections
+CFLAGS = -Os -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize -march=native
 LDFLAGS = -lasound -lm -Wl,-s -Wl,--gc-sections
 #LDFLAGS = -lasound -lm -Wl,-s -Wl,-dead_strip
 

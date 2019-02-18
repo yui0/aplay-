@@ -1,4 +1,4 @@
-// ©2017-2018 Yuichiro Nakada
+// ©2017-201 Yuichiro Nakada
 // clang -Os -o aplay+ aplay+.c -lasound
 
 #include <stdio.h>
@@ -57,10 +57,15 @@ void play_wav(char *name)
 		AUDIO a;
 		if (AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1)) return;
 
+		int c = 0;
+		printf("\e[?25l");
 		while (drwav_read_s16(&wav, a.frames * wav.channels, (drwav_int16*)a.buffer) > 0) {
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
+
+			printf("\r%d/%lu", c, wav.totalSampleCount / wav.channels);
+			c += a.frames;
 		}
 
 		AUDIO_close(&a);
@@ -308,6 +313,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 
 		printf("\n%s\n", ls[i].d_name);
 		snprintf(path, 1024, "%s", ls[i].d_name);
+		if (access(ls[i].d_name, F_OK)<0) continue;
 
 		if (strstr(e, "flac")) play_flac(path);
 		else if (strstr(e, "mp3")) play_mp3(path);

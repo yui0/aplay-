@@ -10,6 +10,14 @@ a simple BitPerfect player
 - Ogg Vorbis
 - AAC (mp4/m4a)
 
+## How to build
+
+```bash
+# dnf install alsa-lib-devel
+$ make
+
+```
+
 ## How to use
 
 ```bash

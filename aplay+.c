@@ -59,13 +59,15 @@ void play_wav(char *name)
 
 		int c = 0;
 		printf("\e[?25l");
-		while (drwav_read_s16(&wav, a.frames * wav.channels, (drwav_int16*)a.buffer) > 0) {
+		size_t n; // numberOfSamplesActuallyDecoded
+		while ((n = drwav_read_pcm_frames_s16(&wav, a.frames, (drwav_int16*)a.buffer)) > 0) {
+			if (n!=a.frames) printf("!");
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
 
-			printf("\r%d/%lu", c, wav.totalSampleCount / wav.channels);
-			c += a.frames;
+			printf("\r%d/%lu", c, wav.totalPCMFrameCount /*/ wav.channels*/);
+			c += n;
 		}
 
 		AUDIO_close(&a);

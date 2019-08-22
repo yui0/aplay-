@@ -86,14 +86,16 @@ void play_flac(char *name)
 	if (flac) {
 		int c = 0;
 		printf("\e[?25l");
-		while (drflac_read_s16(flac, a.frames * flac->channels, (drflac_int16*)a.buffer) > 0) {
-//		while (drflac_read_pcm_frames_s16(flac, a.frames * flac->channels, (drflac_int16*)a.buffer) > 0) {
+		//while (drflac_read_s16(flac, a.frames * flac->channels, (drflac_int16*)a.buffer) > 0) {
+		size_t n; // numberOfSamplesActuallyDecoded
+		while ((n = drflac_read_pcm_frames_s16(flac, a.frames, (drflac_int16*)a.buffer)) > 0) {
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
 
 			printf("\r%d/%lu", c, flac->totalSampleCount / flac->channels);
-			c += a.frames;
+			//c += a.frames;
+			c += n;
 		}
 		printf("\e[?25h");
 	}
@@ -263,7 +265,8 @@ int play_aac(char *name)
 
 	printf("%dHz %dch\n", info.sampRateCore, info.nChans);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1)) {
+	if (AUDIO_init(&a, dev, /*info.sampRateCore*/44100, info.nChans, FRAMES, 1)) {
+//	if (AUDIO_init(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1)) {
 		return 1;
 	}
 
@@ -271,9 +274,12 @@ int play_aac(char *name)
 	while ((bytes_left >= 0) && !key(&a)) {
 		int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
 		printf("\r%d %d", (int)(stream_pos-file_data), bytes_left);
+//		int sbr = ((AACDecInfo*)aac)->sbrEnabled ? 2 : 1;
+//		printf(" %d", sbr);
 		if (!r) {
 			AACGetLastFrameInfo(aac, &info);
-			AUDIO_play(&a, (char*)sample_buf, info.outputSamps/info.nChans);
+			AUDIO_play(&a, (char*)sample_buf, AAC_MAX_NSAMPS);
+//			AUDIO_play(&a, (char*)sample_buf, info.outputSamps/info.nChans/sbr);
 			AUDIO_wait(&a, 100);
 		} else {
 			int nextSync = AACFindSyncWord(stream_pos, bytes_left);

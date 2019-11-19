@@ -1,4 +1,4 @@
-// ©2017-201 Yuichiro Nakada
+// ©2017-2019 Yuichiro Nakada
 // clang -Os -o aplay+ aplay+.c -lasound
 
 #include <stdio.h>
@@ -51,7 +51,7 @@ char *dev = "hw:0,0";	// BitPerfect
 void play_wav(char *name)
 {
 	drwav wav;
-	if (drwav_init_file(&wav, name)) {
+	if (drwav_init_file(&wav, name, NULL)) {
 		printf("%dHz %dch\n", wav.sampleRate, wav.channels);
 
 		AUDIO a;
@@ -77,7 +77,7 @@ void play_wav(char *name)
 
 void play_flac(char *name)
 {
-	drflac *flac = drflac_open_file(name);
+	drflac *flac = drflac_open_file(name, NULL);
 	printf("%dHz %dch\n", flac->sampleRate, flac->channels);
 
 	AUDIO a;
@@ -93,7 +93,8 @@ void play_flac(char *name)
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
 
-			printf("\r%d/%lu", c, flac->totalSampleCount / flac->channels);
+			//printf("\r%d/%lu", c, flac->totalSampleCount / flac->channels);
+			printf("\r%d/%lu", c, flac->totalPCMFrameCount);
 			//c += a.frames;
 			c += n;
 		}
@@ -190,7 +191,7 @@ int play_wma(char *name)
 {
 	void *file_data;
 	unsigned char *stream_pos;
-	short sample_buf[MAX_CODED_SUPERFRAME_SIZE];
+	short *sample_buf = malloc(MAX_CODED_SUPERFRAME_SIZE *sizeof(short));
 	int bytes_left;
 
 	int fd = open(name, O_RDONLY);
@@ -231,6 +232,7 @@ int play_wma(char *name)
 	wma_decode_end(&cc);
 	munmap(file_data, len);
 	close(fd);
+	free(sample_buf);
 	return 0;
 }
 
@@ -329,7 +331,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 		else if (strstr(e, "m4a")) play_aac(path);
 		else if (strstr(e, "ogg")) play_ogg(path);
 		else if (strstr(e, "wav")) play_wav(path);
-//		else if (strstr(e, "wma")) play_wma(path);
+		//else if (strstr(e, "wma")) play_wma(path);
 
 		if (cmd=='\\') i -= 2;
 		if (cmd=='q' || cmd==0x1b) break;

@@ -380,6 +380,7 @@ int main(int argc, char *argv[])
 			break;
 		case 's':
 			regexp = (char*)ps.optarg;
+			printf("Search with '%s'.\n", regexp);
 			break;
 		case 't':
 			type = (char*)ps.optarg;

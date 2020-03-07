@@ -34,7 +34,8 @@ Options:
 -t <ext type>      File type [flac mp3 wma...]
 
 $ ./aplay+ -rx .
-$ ./aplay+ -rx -d hw:7,0 /run/media/root/Samsung_T5/Music/ -s ZARD
+$ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD
+$ ./aplay+ -rx -d hw:7,0 /Music/ -s '(?!.nstrumental).*'
 ```
 
 ## References
@@ -43,3 +44,4 @@ $ ./aplay+ -rx -d hw:7,0 /run/media/root/Samsung_T5/Music/ -s ZARD
 - https://github.com/mackron/dr_libs
 - https://github.com/dr-soft/mini_al
 - https://github.com/ccxvii/minilibs
+- https://github.com/jibsen/parg

@@ -1,5 +1,5 @@
 %define name aplay+
-%define version 0.1
+%define version 0.2
 %define release b1
 
 Name:		%{name}
@@ -8,7 +8,7 @@ Version:	%{version}
 Release:	%{release}
 License:	GPL
 Group:		Applications/Multimedia
-Source:		%{name}-%{version}.tar.bz2
+Source:	%{name}-%{version}.tar.bz2
 Buildroot:	%{_tmppath}/%{name}-%{version}
 
 %description

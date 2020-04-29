@@ -78,7 +78,7 @@ void play_wav(char *name)
 void play_flac(char *name)
 {
 	drflac *flac = drflac_open_file(name, NULL);
-	printf("%dHz %dch\n", flac->sampleRate, flac->channels);
+	printf("%dHz %dbit %dch\n", flac->sampleRate, flac->bitsPerSample, flac->channels);
 
 	AUDIO a;
 	if (AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1)) return;

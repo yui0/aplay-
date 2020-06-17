@@ -9,7 +9,12 @@
 #include "dr_flac.h"
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
+#define DR_MP3_IMPLEMENTATION
+#ifdef DR_MP3_IMPLEMENTATION
+#include "dr_mp3.h"
+#else
 #include "minimp3.h"
+#endif
 //#define HELIX_FEATURE_AUDIO_CODEC_AAC_SBR
 #define AAC_ENABLE_SBR
 #include "uaac.h"
@@ -117,6 +122,39 @@ void *preload(char *name, int *len)
 	close(fd);
 	return p;
 }
+#ifdef DR_MP3_IMPLEMENTATION
+int play_mp3(char *name)
+{
+	drmp3 mp3;
+	if (!drmp3_init_file(&mp3, name, NULL)) {
+		printf("Error: not a valid MP3 audio file!\n");
+		return 1;
+	}
+
+	printf("%dHz %dch\n", mp3.sampleRate, mp3.channels);
+	AUDIO a;
+	if (AUDIO_init(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1)) {
+		return 1;
+	}
+
+	int c = 0;
+	printf("\e[?25l");
+	size_t n;
+	while ((n = drmp3_read_pcm_frames_s16(&mp3, a.frames, (drmp3_int16*)a.buffer)) > 0) {
+		AUDIO_play0(&a);
+		AUDIO_wait(&a, 100);
+		if (key(&a)) break;
+
+//		printf("\r%d/%lu", c, mp3.totalPCMFrameCount);
+		c += n;
+	}
+	printf("\e[?25h");
+
+	AUDIO_close(&a);
+	drmp3_uninit(&mp3);
+	return 0;
+}
+#else
 int play_mp3(char *name)
 {
 	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
@@ -159,6 +197,7 @@ int play_mp3(char *name)
 	munmap(file_data, len);
 	return 0;
 }
+#endif
 
 void play_ogg(char *name)
 {

@@ -9,7 +9,7 @@
 #include "dr_flac.h"
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
-#define DR_MP3_IMPLEMENTATION
+//#define DR_MP3_IMPLEMENTATION
 #ifdef DR_MP3_IMPLEMENTATION
 #include "dr_mp3.h"
 #else

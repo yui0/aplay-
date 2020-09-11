@@ -109,6 +109,64 @@ void play_flac(char *name)
 	AUDIO_close(&a);
 	drflac_close(flac);
 }
+#if 0
+void sr(double *a, int sa, double *b, int sb, int f, double *diff/*sb*2*/, double lambda/*1.0-2.0*/);
+void play_flac(char *name)
+{
+	drflac *flac = drflac_open_file(name, NULL);
+	printf("%dHz %dbit %dch (Upscaling to 192kHz)\n", flac->sampleRate, flac->bitsPerSample, flac->channels);
+
+	AUDIO a;
+//	if (AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1)) return;
+	if (AUDIO_init(&a, dev, /*flac->sampleRate*/192000, flac->channels, FRAMES, 1)) return;
+
+//	int size = a.frames;
+	int size = a.frames * flac->sampleRate / 192000.0;
+	double data[a.frames*2];
+	double diff[size*2];
+	double f64[size*2];
+	int32_t d32[size*2]; // in
+	int16_t *d16 = (int16_t*)a.buffer; // out
+
+	if (flac) {
+		int c = 0;
+		printf("\e[?25l");
+		size_t n; // numberOfSamplesActuallyDecoded
+		while ((n = drflac_read_pcm_frames_s32(flac, size, d32)) > 0) {
+			for (int i=0; i<size; i++) {
+//				a.buffer[i*2]   = d32[i*2]   / (2147483648.0 /32768);
+//				a.buffer[i*2+1] = d32[i*2+1] / (2147483648.0 /32768);
+//				d16[i*2]   = d32[i*2]  >>16;
+//				d16[i*2+1] = d32[i*2+1]>>16;
+//				f64[i*2]   = d32[i*2] / 2147483648.0;
+//				f64[i*2+1] = d32[i*2+1] / 2147483648.0;
+
+				f64[i*2]   = d32[i*2];
+				f64[i*2+1] = d32[i*2+1];
+			}
+			sr(data, a.frames, f64, size, 1, diff, 1.0);
+			for (int i=0; i<a.frames; i++) {
+//				d16[i*2]   = data[i*2]   *30000;//*32767;
+//				d16[i*2+1] = data[i*2+1] *30000;//*32767;
+
+				d16[i*2]   = data[i*2]   /65536;
+				d16[i*2+1] = data[i*2+1] /65536;
+			}
+
+			AUDIO_play0(&a);
+			AUDIO_wait(&a, 100);
+			if (key(&a)) break;
+
+			printf("\r%d/%lu", c, flac->totalPCMFrameCount);
+			c += n;
+		}
+		printf("\e[?25h");
+	}
+
+	AUDIO_close(&a);
+	drflac_close(flac);
+}
+#endif
 
 void *preload(char *name, int *len)
 {

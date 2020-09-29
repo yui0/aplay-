@@ -23,11 +23,12 @@ $ make
 ```bash
 $ make
 $ ./aplay+ -h
-Usage: aplay+ [options] dir
+Usage: ./aplay+ [options] dir
 
 Options:
--d <device name>   ALSA device name [default hw:0,0 plughw:0,0...]
 -h                 Print this message
+-d <device name>   ALSA device name [default hw:0,0 plughw:0,0...]
+-f                 Use 32bit floating
 -r                 Recursively search for directory
 -x                 Random play
 -s <regexp>        Search files
@@ -35,7 +36,7 @@ Options:
 
 $ ./aplay+ -rx .
 $ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD
-$ ./aplay+ -rx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
+$ ./aplay+ -rfx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
 ```
 
 ## References

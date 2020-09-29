@@ -52,20 +52,27 @@ int key(AUDIO *a)
 //char *dev = "default";	// "plughw:0,0"
 char *dev = "hw:0,0";	// BitPerfect
 
-#define FRAMES	32
-void play_wav(char *name)
+#define USE_FLOAT32	128
+#define FRAMES		32
+
+void play_wav(char *name, int format)
 {
 	drwav wav;
 	if (drwav_init_file(&wav, name, NULL)) {
 		printf("%dHz %dch\n", wav.sampleRate, wav.channels);
 
 		AUDIO a;
-		if (AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1)) return;
+		if (AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1, format)) return;
+
+		uint64_t (*func)(drwav* pWav, drflac_uint64 framesToRead, void* pBufferOut);
+		if (format) func = drwav_read_pcm_frames_f32;
+		else func = drwav_read_pcm_frames_s16;
 
 		int c = 0;
 		printf("\e[?25l");
 		size_t n; // numberOfSamplesActuallyDecoded
-		while ((n = drwav_read_pcm_frames_s16(&wav, a.frames, (drwav_int16*)a.buffer)) > 0) {
+//		while ((n = drwav_read_pcm_frames_s16(&wav, a.frames, (drwav_int16*)a.buffer)) > 0) {
+		while ((n = func(&wav, a.frames, (drwav_int16*)a.buffer)) > 0) {
 			if (n!=a.frames) printf("!");
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
@@ -80,25 +87,29 @@ void play_wav(char *name)
 	}
 }
 
-void play_flac(char *name)
+void play_flac(char *name, int format)
 {
 	drflac *flac = drflac_open_file(name, NULL);
 	printf("%dHz %dbit %dch\n", flac->sampleRate, flac->bitsPerSample, flac->channels);
 
 	AUDIO a;
-	if (AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1)) return;
+	if (AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1, format)) return;
 
 	if (flac) {
+		uint64_t (*func)(drflac* pFlac, drflac_uint64 framesToRead, void* pBufferOut);
+		if (format) func = drflac_read_pcm_frames_f32;
+		else func = drflac_read_pcm_frames_s16;
+
 		int c = 0;
 		printf("\e[?25l");
-		//while (drflac_read_s16(flac, a.frames * flac->channels, (drflac_int16*)a.buffer) > 0) {
 		size_t n; // numberOfSamplesActuallyDecoded
-		while ((n = drflac_read_pcm_frames_s16(flac, a.frames, (drflac_int16*)a.buffer)) > 0) {
+//		while ((n = drflac_read_pcm_frames_s16(flac, a.frames, (drflac_int16*)a.buffer)) > 0) {
+//		while ((n = drflac_read_pcm_frames_f32(flac, a.frames, (float*)a.buffer)) > 0) {
+		while ((n = func(flac, a.frames, (void*)a.buffer)) > 0) {
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
 
-			//printf("\r%d/%lu", c, flac->totalSampleCount / flac->channels);
 			printf("\r%d/%lu", c, flac->totalPCMFrameCount);
 			//c += a.frames;
 			c += n;
@@ -191,7 +202,7 @@ int play_mp3(char *name)
 
 	printf("%dHz %dch\n", mp3.sampleRate, mp3.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1)) {
+	if (AUDIO_init(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1, 0)) {
 		return 1;
 	}
 
@@ -231,7 +242,7 @@ int play_mp3(char *name)
 
 	printf("%dHz %dch\n", info.sample_rate, info.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES, 1)) {
+	if (AUDIO_init(&a, dev, info.sample_rate, info.channels, FRAMES, 1, 0)) {
 		return 1;
 	}
 
@@ -268,7 +279,7 @@ void play_ogg(char *name)
 	printf("%dHz %dch\n", v->sample_rate, v->channels);
 
 	AUDIO a;
-	if (AUDIO_init(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1)) {
+	if (AUDIO_init(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1, 0)) {
 		stb_vorbis_close(v);
 		return;
 	}
@@ -306,7 +317,7 @@ int play_wma(char *name)
 	wma_decode_init_fixed(&cc);
 	printf("%dHz %dch\n", cc.sample_rate, cc.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1)) {
+	if (AUDIO_init(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1, 0)) {
 		return 1;
 	}
 
@@ -364,7 +375,7 @@ int play_aac(char *name)
 
 	printf("%dHz %dch\n", info.sampRateCore, info.nChans);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, /*info.sampRateCore*/44100, info.nChans, FRAMES, 1)) {
+	if (AUDIO_init(&a, dev, /*info.sampRateCore*/44100, info.nChans, FRAMES, 1, 0)) {
 //	if (AUDIO_init(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1)) {
 		return 1;
 	}
@@ -399,6 +410,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 {
 	char path[1024], ext[10];
 	int num;
+	int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
 
 	LS_LIST *ls = ls_dir(name, flag, &num);
 	for (int i=0; i<num; i++) {
@@ -422,12 +434,12 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 		snprintf(path, 1024, "%s", ls[i].d_name);
 		if (access(ls[i].d_name, F_OK)<0) continue;
 
-		if (strstr(e, "flac")) play_flac(path);
+		if (strstr(e, "flac")) play_flac(path, format);
 		else if (strstr(e, "mp3")) play_mp3(path);
 		else if (strstr(e, "mp4")) play_aac(path);
 		else if (strstr(e, "m4a")) play_aac(path);
 		else if (strstr(e, "ogg")) play_ogg(path);
-		else if (strstr(e, "wav")) play_wav(path);
+		else if (strstr(e, "wav")) play_wav(path, format);
 		//else if (strstr(e, "wma")) play_wma(path);
 
 		if (cmd=='\\') i -= 2;
@@ -441,8 +453,9 @@ void usage(FILE* fp, int argc, char** argv)
 	fprintf(fp,
 		"Usage: %s [options] dir\n\n"
 		"Options:\n"
-		"-d <device name>   ALSA device name [default hw:0,0 plughw:0,0...]\n"
 		"-h                 Print this message\n"
+		"-d <device name>   ALSA device name [default hw:0,0 plughw:0,0...]\n"
+		"-f                 Use 32bit floating\n"
 		"-r                 Recursively search for directory\n"
 		"-x                 Random play\n"
 		"-s <regexp>        Search files\n"
@@ -461,13 +474,16 @@ int main(int argc, char *argv[])
 	int c;
 
 	parg_init(&ps);
-	while ((c = parg_getopt(&ps, argc, argv, "hd:rxs:t:")) != -1) {
+	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:")) != -1) {
 		switch (c) {
 		case 1:
 			dir = (char*)ps.optarg;
 			break;
 		case 'd':
 			dev = (char*)ps.optarg;
+			break;
+		case 'f':
+			flag |= USE_FLOAT32;
 			break;
 		case 'r':
 			flag |= LS_RECURSIVE;

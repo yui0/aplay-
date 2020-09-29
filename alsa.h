@@ -1,9 +1,9 @@
 /* public domain Simple, Minimalistic, Audio library for ALSA
- *	©2017 Yuichiro Nakada
+ *	©2017,2020 Yuichiro Nakada
  *
  * Basic usage:
  *	AUDIO a;
- *	AUDIO_init(&a, "plughw:PCH,0", 48000, 2, 32); // device, 48000 samplerate, 2 channels, 32 frame
+ *	AUDIO_init(&a, "plughw:PCH,0", 48000, 2, 32, 1, 0); // device, 48000 samplerate, 2 channels, 32 frame
  *	...
  *	int f = AUDIO_frame(&a); // audio data in a.buffer
  *	...
@@ -22,7 +22,7 @@ typedef struct {
 	int size;
 } AUDIO;
 
-int AUDIO_init(AUDIO *thiz, char *dev, unsigned int val, int ch, int frames, int flag)
+int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, int flag, int format)
 {
 	// Open PCM device.
 	int rc = snd_pcm_open(&thiz->handle, dev, flag ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE, 0);
@@ -49,7 +49,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int val, int ch, int frames, int
 	}
 
 	// Signed 16-bit little-endian format
-	rc = snd_pcm_hw_params_set_format(thiz->handle, params, SND_PCM_FORMAT_S16_LE);
+	rc = snd_pcm_hw_params_set_format(thiz->handle, params, format ? format : SND_PCM_FORMAT_S16_LE);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set sample format (%s)\n", snd_strerror(rc));
 		snd_pcm_drain(thiz->handle);
@@ -68,7 +68,7 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int val, int ch, int frames, int
 
 	// 44100 bits/second sampling rate (CD quality)
 	int dir;
-	rc = snd_pcm_hw_params_set_rate_near(thiz->handle, params, &val, &dir);
+	rc = snd_pcm_hw_params_set_rate_near(thiz->handle, params, &freq, &dir);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set sample rate (%s)\n", snd_strerror(rc));
 		snd_pcm_drain(thiz->handle);
@@ -91,10 +91,11 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int val, int ch, int frames, int
 
 	// Use a buffer large enough to hold one period
 	snd_pcm_hw_params_get_period_size(params, &thiz->frames, &dir);
-	thiz->size = thiz->frames * 2 * ch; /* 2 bytes/sample, 2 channels */
+//	thiz->size = thiz->frames * 2 * ch; /* 2 bytes/sample, 2 channels */
+	thiz->size = thiz->frames * 4 * ch; /* 4 bytes/sample, 2 channels */
 	thiz->buffer = (char*)malloc(thiz->size);
 
-	snd_pcm_hw_params_get_period_time(params, &val, &dir);
+	snd_pcm_hw_params_get_period_time(params, &freq, &dir);
 	return 0;
 }
 

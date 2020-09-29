@@ -1,5 +1,5 @@
 %define name aplay+
-%define version 0.2
+%define version 0.3
 %define release b1
 
 Name:		%{name}

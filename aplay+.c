@@ -71,7 +71,7 @@ void play_wav(char *name)
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
 
-			printf("\r%d/%lu", c, wav.totalPCMFrameCount /*/ wav.channels*/);
+			printf("\r%d/%llu", c, wav.totalPCMFrameCount /*/ wav.channels*/);
 			c += n;
 		}
 

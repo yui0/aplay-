@@ -35,7 +35,7 @@ Options:
 
 $ ./aplay+ -rx .
 $ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD
-$ ./aplay+ -rx -d hw:7,0 /Music/ -s '(?!.nstrumental)'
+$ ./aplay+ -rx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
 ```
 
 ## References

@@ -1,4 +1,4 @@
-// ©2017-2019 Yuichiro Nakada
+// ©2017-2020 Yuichiro Nakada
 // clang -Os -o aplay+ aplay+.c -lasound
 
 #include <stdio.h>
@@ -9,7 +9,7 @@
 #include "dr_flac.h"
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
-//#define DR_MP3_IMPLEMENTATION
+#define DR_MP3_IMPLEMENTATION
 #ifdef DR_MP3_IMPLEMENTATION
 #include "dr_mp3.h"
 #else
@@ -65,8 +65,12 @@ void play_wav(char *name, int format)
 		if (AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1, format)) return;
 
 		uint64_t (*func)(drwav* pWav, drflac_uint64 framesToRead, void* pBufferOut);
-		if (format) func = drwav_read_pcm_frames_f32;
-		else func = drwav_read_pcm_frames_s16;
+		if (format) {
+			func = drwav_read_pcm_frames_f32;
+			printf(" with FLOAT 32bit\n");
+		} else {
+			func = drwav_read_pcm_frames_s16;
+		}
 
 		int c = 0;
 		printf("\e[?25l");
@@ -97,8 +101,12 @@ void play_flac(char *name, int format)
 
 	if (flac) {
 		uint64_t (*func)(drflac* pFlac, drflac_uint64 framesToRead, void* pBufferOut);
-		if (format) func = drflac_read_pcm_frames_f32;
-		else func = drflac_read_pcm_frames_s16;
+		if (format) {
+			func = drflac_read_pcm_frames_f32;
+			printf(" with FLOAT 32bit\n");
+		} else {
+			func = drflac_read_pcm_frames_s16;
+		}
 
 		int c = 0;
 		printf("\e[?25l");
@@ -192,7 +200,7 @@ void *preload(char *name, int *len)
 	return p;
 }
 #ifdef DR_MP3_IMPLEMENTATION
-int play_mp3(char *name)
+int play_mp3(char *name, int format)
 {
 	drmp3 mp3;
 	if (!drmp3_init_file(&mp3, name, NULL)) {
@@ -202,14 +210,22 @@ int play_mp3(char *name)
 
 	printf("%dHz %dch\n", mp3.sampleRate, mp3.channels);
 	AUDIO a;
-	if (AUDIO_init(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1, 0)) {
+	if (AUDIO_init(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1, format)) {
 		return 1;
+	}
+
+	uint64_t (*func)(drmp3*, drflac_uint64, void*);
+	if (format) {
+		func = drmp3_read_pcm_frames_f32;
+		printf(" with FLOAT 32bit\n");
+	} else {
+		func = drmp3_read_pcm_frames_s16;
 	}
 
 	int c = 0;
 	printf("\e[?25l");
 	size_t n;
-	while ((n = drmp3_read_pcm_frames_s16(&mp3, a.frames, (drmp3_int16*)a.buffer)) > 0) {
+	while ((n = func(&mp3, a.frames, (drmp3_int16*)a.buffer)) > 0) {
 		AUDIO_play0(&a);
 		AUDIO_wait(&a, 100);
 		if (key(&a)) break;
@@ -224,7 +240,7 @@ int play_mp3(char *name)
 	return 0;
 }
 #else
-int play_mp3(char *name)
+int play_mp3(char *name, int format)
 {
 	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
 	int len;
@@ -435,7 +451,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 		if (access(ls[i].d_name, F_OK)<0) continue;
 
 		if (strstr(e, "flac")) play_flac(path, format);
-		else if (strstr(e, "mp3")) play_mp3(path);
+		else if (strstr(e, "mp3")) play_mp3(path, format);
 		else if (strstr(e, "mp4")) play_aac(path);
 		else if (strstr(e, "m4a")) play_aac(path);
 		else if (strstr(e, "ogg")) play_ogg(path);

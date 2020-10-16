@@ -222,6 +222,7 @@ int play_mp3(char *name, int format)
 		func = drmp3_read_pcm_frames_s16;
 	}
 
+	int totalPCMFrameCount = drmp3_get_pcm_frame_count(&mp3);
 	int c = 0;
 	printf("\e[?25l");
 	size_t n;
@@ -230,7 +231,7 @@ int play_mp3(char *name, int format)
 		AUDIO_wait(&a, 100);
 		if (key(&a)) break;
 
-//		printf("\r%d/%lu", c, mp3.totalPCMFrameCount);
+		printf("\r%d/%d", c, totalPCMFrameCount);
 		c += n;
 	}
 	printf("\e[?25h");
@@ -446,7 +447,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 			if (regexec(p, ls[i].d_name, &m, 0)) continue;
 		}
 
-		printf("\n%s\n", ls[i].d_name);
+		printf("\n\e[1m\e[35m%s\e[0m\n", ls[i].d_name);
 		snprintf(path, 1024, "%s", ls[i].d_name);
 		if (access(ls[i].d_name, F_OK)<0) continue;
 

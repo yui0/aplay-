@@ -11,10 +11,29 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+//#define RANDOM_DEVICE "/dev/random"
 #define RANDOM_DEVICE "/dev/urandom"
-// Returns a random number from 0 to MAX-1
-static FILE *urandom;
-void urandom_init()
+static int urandom;
+inline void urandom_init()
+{
+	urandom = open(RANDOM_DEVICE, O_RDONLY);
+	if (urandom<0) {
+		fprintf(stderr, "Failed to open %s\n", RANDOM_DEVICE);
+		exit(EXIT_FAILURE);
+	}
+}
+inline unsigned int urandom_number()
+{
+	unsigned int c;
+	read(urandom, &c, sizeof(c));
+	return c;
+}
+inline void urandom_end()
+{
+	close(urandom);
+}
+/*static FILE *urandom;
+inline void urandom_init()
 {
 	urandom = fopen(RANDOM_DEVICE, "rb");
 	if (urandom == NULL) {
@@ -22,23 +41,14 @@ void urandom_init()
 		exit(EXIT_FAILURE);
 	}
 }
-int urandom_number(int MAX)
+inline int urandom_number()
 {
-	int c;
-//	do {
-		c = fgetc(urandom);
-		if (c == EOF) {
-			fprintf(stderr, "Failed to read from %s\n", RANDOM_DEVICE);
-			exit(EXIT_FAILURE);
-		}
-//	} while (c >= (UCHAR_MAX + 1) / MAX * MAX);
-
-	return c % MAX;
+	return fgetc(urandom);
 }
-void urandom_end()
+inline void urandom_end()
 {
 	fclose(urandom);
-}
+}*/
 
 #define LS_RECURSIVE	1
 #define LS_RANDOM	2
@@ -161,7 +171,7 @@ LS_LIST *ls_dir(char *dir, int flag, int *num)
 		for (int i=0; i<n; i++) {
 #ifdef RANDOM_H
 //			int a = frand() * n;
-			int a = urandom_number(n);
+			int a = urandom_number()%n;
 #else
 			int a = rand()%n;
 #endif

@@ -13,7 +13,7 @@
 
 //#define RANDOM_DEVICE "/dev/random"
 #define RANDOM_DEVICE "/dev/urandom"
-static int urandom;
+int urandom;
 inline void urandom_init()
 {
 	urandom = open(RANDOM_DEVICE, O_RDONLY);

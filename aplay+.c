@@ -463,7 +463,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 //		if (cmd=='\\') i -= 2;
 		if (cmd=='\\' || cmd=='b') i = back;
 		if (cmd=='q' || cmd==0x1b) break;
-		back = i;
+		back = i-1;
 	}
 	free(ls);
 }

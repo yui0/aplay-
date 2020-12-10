@@ -426,7 +426,7 @@ int play_aac(char *name)
 void play_dir(char *name, char *type, char *regexp, int flag)
 {
 	char path[1024], ext[10];
-	int num;
+	int num, back=0;
 	int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
 
 	LS_LIST *ls = ls_dir(name, flag, &num);
@@ -458,9 +458,12 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 		else if (strstr(e, "ogg")) play_ogg(path);
 		else if (strstr(e, "wav")) play_wav(path, format);
 		//else if (strstr(e, "wma")) play_wma(path);
+		else continue;
 
-		if (cmd=='\\') i -= 2;
+//		if (cmd=='\\') i -= 2;
+		if (cmd=='\\' || cmd=='b') i = back;
 		if (cmd=='q' || cmd==0x1b) break;
+		back = i;
 	}
 	free(ls);
 }

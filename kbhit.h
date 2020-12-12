@@ -1,7 +1,50 @@
 /* public domain Simple, Minimalistic, kbhit function
- *	©2017 Yuichiro Nakada
+ *	©2017,2020 Yuichiro Nakada
  * */
 
+#if 0
+#include <termios.h>
+static struct termios t_old, t_new;
+void initTermios(int echo)
+{
+	tcgetattr(0, &t_old);
+	t_new = t_old;
+	t_new.c_lflag &= ~ICANON; // disable buffered i/o
+	if (echo) {
+		t_new.c_lflag |= ECHO; // set echo mode
+	} else {
+		t_new.c_lflag &= ~ECHO; // set no echo mode
+	}
+	tcsetattr(0, TCSANOW, &t_new);
+}
+void resetTermios()
+{
+	tcsetattr(0, TCSANOW, &t_old);
+}
+int getch_(int echo)
+{
+	char ch;
+	initTermios(echo);
+	ch = getchar();
+	resetTermios();
+	return ch;
+}
+// Read 1 character without echo
+int _getch()
+{
+	return getch_(0);
+}
+// Read 1 character with echo
+int _getche()
+{
+	return getch_(1);
+}
+
+#define readch	_getch
+#define init_keyboard()
+#define close_keyboard()
+
+#else
 #include <termios.h>
 #include <unistd.h>   // for read()
 
@@ -90,4 +133,5 @@ int readch()
 		for (i=0; i<getch2_len; i++) getch2_buf[i] = getch2_buf[len+i];
 	}*/
 }
+#endif
 

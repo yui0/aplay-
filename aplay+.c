@@ -66,10 +66,10 @@ void play_wav(char *name, int format)
 
 		uint64_t (*func)(drwav* pWav, drflac_uint64 framesToRead, void* pBufferOut);
 		if (format) {
-			func = drwav_read_pcm_frames_f32;
+			func = (uint64_t (*)(drwav *, drflac_uint64, void *))drwav_read_pcm_frames_f32;
 			printf(" with FLOAT 32bit\n");
 		} else {
-			func = drwav_read_pcm_frames_s16;
+			func = (uint64_t (*)(drwav *, drflac_uint64, void *))drwav_read_pcm_frames_s16;
 		}
 
 		int c = 0;
@@ -102,10 +102,10 @@ void play_flac(char *name, int format)
 	if (flac) {
 		uint64_t (*func)(drflac* pFlac, drflac_uint64 framesToRead, void* pBufferOut);
 		if (format) {
-			func = drflac_read_pcm_frames_f32;
+			func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_f32;
 			printf(" with FLOAT 32bit\n");
 		} else {
-			func = drflac_read_pcm_frames_s16;
+			func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_s16;
 		}
 
 		int c = 0;
@@ -118,7 +118,7 @@ void play_flac(char *name, int format)
 			AUDIO_wait(&a, 100);
 			if (key(&a)) break;
 
-			printf("\r%d/%lu", c, flac->totalPCMFrameCount);
+			printf("\r%d/%llu", c, flac->totalPCMFrameCount);
 			//c += a.frames;
 			c += n;
 		}
@@ -216,10 +216,10 @@ int play_mp3(char *name, int format)
 
 	uint64_t (*func)(drmp3*, drflac_uint64, void*);
 	if (format) {
-		func = drmp3_read_pcm_frames_f32;
+		func = (uint64_t (*)(drmp3 *, drflac_uint64, void *))drmp3_read_pcm_frames_f32;
 		printf(" with FLOAT 32bit\n");
 	} else {
-		func = drmp3_read_pcm_frames_s16;
+		func = (uint64_t (*)(drmp3 *, drflac_uint64, void *))drmp3_read_pcm_frames_s16;
 	}
 
 	int totalPCMFrameCount = drmp3_get_pcm_frame_count(&mp3);

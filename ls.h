@@ -168,7 +168,7 @@ LS_LIST *ls_dir(char *dir, int flag, int *num)
 #else
 		srand(time(NULL));
 #endif
-		for (int i=0; i<n; i++) {
+		for (int i=n-1; i>0; i--) { // Fisher-Yates shuffle
 #ifdef RANDOM_H
 //			int a = frand() * n;
 			int a = urandom_number()%n;

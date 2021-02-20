@@ -22,9 +22,9 @@ inline void urandom_init()
 		exit(EXIT_FAILURE);
 	}
 }
-inline unsigned int urandom_number()
+inline uint32_t urandom_number()
 {
-	unsigned int c;
+	uint32_t c;
 	read(urandom, &c, sizeof(c));
 	return c;
 }
@@ -171,9 +171,9 @@ LS_LIST *ls_dir(char *dir, int flag, int *num)
 		for (int i=n-1; i>0; i--) { // Fisher-Yates shuffle
 #ifdef RANDOM_H
 //			int a = frand() * n;
-			int a = urandom_number()%n;
+			int a = (urandom_number() / 4294967295.0)*n;
 #else
-			int a = rand()%n;
+			int a = (rand() / RAND_MAX)*n;
 #endif
 			LS_LIST b = ls[i];
 			ls[i] = ls[a];

@@ -10,6 +10,7 @@ License:	GPL
 Group:		Applications/Multimedia
 Source:	%{name}-%{version}.tar.bz2
 Buildroot:	%{_tmppath}/%{name}-%{version}
+#alsa-lib-devel
 
 %description
 a simple BitPerfect player

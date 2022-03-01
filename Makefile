@@ -8,7 +8,8 @@ endif
 ifneq (, $(shell which icc))
 CC = icc
 endif
-CFLAGS = -Os -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize -march=native
+CFLAGS = -Os -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize
+#CFLAGS = -Os -ffunction-sections -fdata-sections -funroll-loops -finline-functions -ftree-vectorize -march=native
 LDFLAGS = -lasound -lm -Wl,-s -Wl,--gc-sections
 #LDFLAGS = -lasound -lm -Wl,-s -Wl,-dead_strip
 

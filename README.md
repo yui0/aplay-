@@ -39,6 +39,63 @@ $ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD
 $ ./aplay+ -rfx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
 ```
 
+## Tune for Linux
+
+* Disk I/O
+
+```sysctl.conf
+vm.dirty_ratio = 40
+vm.dirty_background_ratio = 10
+vm.dirty_expire_centisecs = 3000
+vm.dirty_writeback_centisecs = 500
+
+#dev.hpet.max-user-freq = 3072
+
+vm.overcommit_memory = 1
+```
+
+sysctl -p
+
+```
+#!/bin/sh
+#cat /sys/block/sd*/queue/scheduler
+for FILE in /sys/block/sd*/queue/scheduler
+do
+	[ -f $FILE ] || continue
+	echo -n none > $FILE
+done
+```
+
+```60-ioschedulers.rules
+# scheduler for non rotational, SSD
+ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"
+# scheduler for rotational, HDD
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+```
+
+fstrim -v /
+
+* Setting CPU clock to performance
+
+```
+#!/bin/sh
+#cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+for CPUFREQ in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+do
+	[ -f $CPUFREQ ] || continue
+	echo -n performance > $CPUFREQ
+done
+```
+
+* Timer
+
+```
+#cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+echo tsc > /sys/devices/system/clocksource/clocksource0/current_clocksource
+```
+
+ulimit -a
+
 ## References
 
 - https://github.com/nothings/stb
@@ -46,3 +103,4 @@ $ ./aplay+ -rfx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
 - https://github.com/dr-soft/mini_al
 - https://github.com/ccxvii/minilibs
 - https://github.com/jibsen/parg
+- https://pulseaudio.blog.fc2.com/blog-entry-1.html

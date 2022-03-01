@@ -16,7 +16,8 @@
  * */
 
 #ifndef uint16_t
-typedef unsigned short int uint16_t;
+//typedef unsigned short int uint16_t;
+#include <stdint.h>
 #endif
 
 

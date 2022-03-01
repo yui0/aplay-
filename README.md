@@ -10,7 +10,7 @@ a simple BitPerfect player
 - Ogg Vorbis
 - AAC (mp4/m4a)
 
-## How to build
+## How to build [Colab](aplay+.ipynb) &nbsp;&nbsp; [![Open in Colab][colab badge]](https://github.com/yui0/aplay-/aplay+.ipynb)
 
 ```bash
 # dnf install alsa-lib-devel

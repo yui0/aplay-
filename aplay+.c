@@ -42,9 +42,10 @@ int key(AUDIO *a)
 		snd_pcm_pause(a->handle, 1);
 		do {
 			usleep(1000);	// us
+		//} while (!readch());
 		} while (!kbhit());
 		getchar(); // clear
-		//} while (!readch());
+		cmd = 0;
 		//fseek(stdin, 0, SEEK_END);
 		snd_pcm_pause(a->handle, 0);
 		snd_pcm_prepare(a->handle);

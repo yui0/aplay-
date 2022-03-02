@@ -1,6 +1,31 @@
 /* public domain Simple, Minimalistic, kbhit function
- *	©2017,2020 Yuichiro Nakada
+ *	©2022 Yuichiro Nakada
  * */
+
+#include <sys/ioctl.h>
+#include <termios.h>
+
+int kbhit()
+{
+	static const int STDIN = 0;
+	static int initialized = 0;
+
+	if (!initialized) {
+		// Use termios to turn off line buffering
+		struct termios term;
+		tcgetattr(STDIN, &term);
+		term.c_lflag &= ~ICANON;
+		tcsetattr(STDIN, TCSANOW, &term);
+		setbuf(stdin, NULL);
+		initialized = 1;
+	}
+
+	int bytesWaiting;
+	ioctl(STDIN, FIONREAD, &bytesWaiting);
+	return bytesWaiting;
+}
+
+#if 0
 
 #if 0
 #include <termios.h>
@@ -135,3 +160,4 @@ int readch()
 }
 #endif
 
+#endif

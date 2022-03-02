@@ -1,4 +1,4 @@
-// ©2017-2020 Yuichiro Nakada
+// ©2017-2022 Yuichiro Nakada
 // clang -Os -o aplay+ aplay+.c -lasound
 
 #include <stdio.h>
@@ -31,16 +31,19 @@
 int cmd;
 int key(AUDIO *a)
 {
-	int c = readch();
+/*	int c = readch();
 	cmd = c;
-	if (!c) return 0;
+	if (!c) return 0;*/
+	if (!kbhit()) return 0;
+	int c = cmd = getchar();
+
 	printf("%x\n", c);
 	if (c==0x20) {
 		snd_pcm_pause(a->handle, 1);
 		do {
 			usleep(1000);	// us
-		//} while (!kbhit());
-		} while (!readch());
+		} while (!kbhit());
+		//} while (!readch());
 		snd_pcm_pause(a->handle, 0);
 		snd_pcm_prepare(a->handle);
 		return 0;
@@ -525,9 +528,9 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	init_keyboard();
+//	init_keyboard();
 	play_dir(dir, type, regexp, flag);
-	close_keyboard();
+//	close_keyboard();
 
 	return 0;
 }

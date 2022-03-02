@@ -43,7 +43,9 @@ int key(AUDIO *a)
 		do {
 			usleep(1000);	// us
 		} while (!kbhit());
+		getchar(); // clear
 		//} while (!readch());
+		//fseek(stdin, 0, SEEK_END);
 		snd_pcm_pause(a->handle, 0);
 		snd_pcm_prepare(a->handle);
 		return 0;

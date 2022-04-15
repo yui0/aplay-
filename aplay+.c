@@ -474,6 +474,20 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 	free(ls);
 }
 
+void set_cpu(char *c)
+{
+	char buff[256];
+	for (int i=0; i<256; i++) {
+		snprintf(buff, 255, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", i);
+		FILE *fp = fopen(buff, "w");
+		if (!fp) continue;
+		//fprintf(fp, "ondemand");
+		//fprintf(fp, "performance");
+		fprintf(fp, "%s", c);
+		fclose(fp);
+	}
+}
+
 void usage(FILE* fp, int argc, char** argv)
 {
 	fprintf(fp,
@@ -486,6 +500,7 @@ void usage(FILE* fp, int argc, char** argv)
 		"-x                 Random play\n"
 		"-s <regexp>        Search files\n"
 		"-t <ext type>      File type [flac mp3 wma...]\n"
+		"-p                 Tuning for Linux platforms\n"
 		"\n",
 		argv[0]);
 }
@@ -498,9 +513,10 @@ int main(int argc, char *argv[])
 	char *regexp = 0;
 	struct parg_state ps;
 	int c;
+	int clock = 0;
 
 	parg_init(&ps);
-	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:")) != -1) {
+	while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:p")) != -1) {
 		switch (c) {
 		case 1:
 			dir = (char*)ps.optarg;
@@ -524,6 +540,19 @@ int main(int argc, char *argv[])
 		case 't':
 			type = (char*)ps.optarg;
 			break;
+		case 'p':
+			{
+				// use tsc timer
+				// cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+				FILE *fp = fopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", "w");
+				fprintf(fp, "tsc");
+				fclose(fp);
+
+				// Setting CPU clock to performance
+				set_cpu("performance");
+				clock = 1;
+			}
+			break;
 		case 'h':
 		//default:
 			usage(stderr, argc, argv);
@@ -534,6 +563,8 @@ int main(int argc, char *argv[])
 //	init_keyboard();
 	play_dir(dir, type, regexp, flag);
 //	close_keyboard();
+
+	if (clock) set_cpu("ondemand");
 
 	return 0;
 }

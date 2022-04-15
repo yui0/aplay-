@@ -41,7 +41,7 @@ $ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD
 $ ./aplay+ -rfx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
 ```
 
-## Tune for Linux
+## Tuning for Linux platforms
 
 * Disk I/O
 

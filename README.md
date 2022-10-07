@@ -35,6 +35,7 @@ Options:
 -x                 Random play
 -s <regexp>        Search files
 -t <ext type>      File type [flac mp3 wma...]
+-p                 Tuning for Linux platforms
 
 $ ./aplay+ -rx .
 $ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD

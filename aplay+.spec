@@ -1,6 +1,6 @@
 %define name aplay+
-%define version 0.7
-%define release b2
+%define version 0.8
+%define release b1
 
 Name:		%{name}
 Summary:	a simple BitPerfect player

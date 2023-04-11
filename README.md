@@ -1,5 +1,11 @@
 # aplay+
 
+![GitHub Repo stars](https://img.shields.io/github/stars/yui0/aplay-?style=social)
+![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/yui0/aplay-)
+![Lines of code](https://img.shields.io/tokei/lines/github/yui0/aplay-)
+[![GitHub release (latest by date)](https://img.shields.io/github/v/release/yui0/aplay-)](https://github.com/yui0/aplay-/releases)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](LICENSE)
+
 a simple BitPerfect player
 
 ## Supported file formats
@@ -107,3 +113,4 @@ ulimit -a
 - https://github.com/ccxvii/minilibs
 - https://github.com/jibsen/parg
 - https://pulseaudio.blog.fc2.com/blog-entry-1.html
+- https://kazuhira-r.hatenablog.com/entry/2021/05/22/210532

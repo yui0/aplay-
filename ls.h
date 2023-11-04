@@ -181,6 +181,7 @@ LS_LIST *ls_dir(char *_dir, int flag, int *num)
 #ifdef RANDOM_H
 //			int a = frand() * n;
 			int a = (urandom_number() / 4294967295.0)*n;
+//			int a = (prand32() / 4294967295.0)*n;
 #else
 			int a = (rand() / RAND_MAX)*n;
 #endif

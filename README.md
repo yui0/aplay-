@@ -8,6 +8,8 @@
 
 a simple BitPerfect player
 
+![Logo](logo.jpeg)
+
 ## Supported file formats
 
 - FLAC (Free Lossless Audio Codec)

@@ -67,6 +67,8 @@ vm.overcommit_memory = 1
 
 sysctl -p
 
+* scheduler
+
 ```
 #!/bin/sh
 #cat /sys/block/sd*/queue/scheduler

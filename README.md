@@ -1,4 +1,4 @@
-# aplay+
+# aplay+ 🎶
 
 ![GitHub Repo stars](https://img.shields.io/github/stars/yui0/aplay-?style=social)
 ![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/yui0/aplay-)
@@ -10,7 +10,7 @@ a simple BitPerfect player
 
 ![Logo](logo.jpeg)
 
-## Supported file formats
+## 💿 Supported file formats
 
 - FLAC (Free Lossless Audio Codec)
 - WAV (RIFF waveform Audio Format)
@@ -18,7 +18,7 @@ a simple BitPerfect player
 - Ogg Vorbis
 - AAC (mp4/m4a)
 
-## How to build
+## 🔧 How to build
 
 - [build with Colab](aplay%2B.ipynb) &nbsp;&nbsp; <a href="https://colab.research.google.com/github/yui0/aplay-/blob/master/aplay%2B.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
@@ -28,7 +28,7 @@ $ make
 
 ```
 
-## How to use
+## 🌸 How to use
 
 ```bash
 $ make
@@ -50,7 +50,7 @@ $ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD
 $ ./aplay+ -rfx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
 ```
 
-## Tuning for Linux platforms
+## 🌟 Tuning for Linux platforms
 
 * Disk I/O
 
@@ -109,7 +109,7 @@ echo tsc > /sys/devices/system/clocksource/clocksource0/current_clocksource
 
 ulimit -a
 
-## References
+## 📖 References
 
 - https://github.com/nothings/stb
 - https://github.com/mackron/dr_libs

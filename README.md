@@ -28,6 +28,13 @@ $ make
 
 ```
 
+```bash
+git clone https://github.com/yui0/aplay-.git
+cd aplay-
+make
+
+```
+
 ## 🌸 How to use
 
 ```bash

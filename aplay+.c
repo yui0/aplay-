@@ -493,14 +493,14 @@ void usage(FILE* fp, int argc, char** argv)
 	fprintf(fp,
 		"Usage: %s [options] dir\n\n"
 		"Options:\n"
-		"-h                 Print this message\n"
-		"-d <device name>   ALSA device name [default hw:0,0 plughw:0,0...]\n"
-		"-f                 Use 32bit floating\n"
-		"-r                 Recursively search for directory\n"
-		"-x                 Random play\n"
-		"-s <regexp>        Search files\n"
-		"-t <ext type>      File type [flac mp3 wma...]\n"
-		"-p                 Tuning for Linux platforms\n"
+		"-h                 Print this help message\n"
+		"-d <device name>   Specify ALSA device [e.g., default hw:0,0 plughw:0,0...]\n"
+		"-f                 Use 32-bit floating-point playback\n"
+		"-r                 Recursively search directories\n"
+		"-x                 Enable random playback\n"
+		"-s <regexp>        Search files with a regex\n"
+		"-t <ext type>      Specify file type (e.g., flac, mp3, wma...)\n"
+		"-p                 Optimize for Linux platforms\n"
 		"\n",
 		argv[0]);
 }

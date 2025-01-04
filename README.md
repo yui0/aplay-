@@ -1,4 +1,4 @@
-# aplay+ 🎶
+# 🎶 **aplay+**: A Simple and High-Quality Audio Player
 
 ![GitHub Repo stars](https://img.shields.io/github/stars/yui0/aplay-?style=social)
 ![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/yui0/aplay-)
@@ -6,77 +6,90 @@
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/yui0/aplay-)](https://github.com/yui0/aplay-/releases)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](LICENSE)
 
-a simple BitPerfect player
+🎧 **Enjoy BitPerfect audio playback with simplicity and precision!**
 
 ![Logo](logo.jpeg)
 
-## 💿 Supported file formats
-
-- FLAC (Free Lossless Audio Codec)
-- WAV (RIFF waveform Audio Format)
-- MP3 (MPEG-1 Audio Layer-3)
-- Ogg Vorbis
-- AAC (mp4/m4a)
+## 💿 Supported File Formats
+aplay+ supports a variety of popular audio formats:
+- 🌟 **FLAC**: High-quality lossless compression
+- 🌊 **WAV**: Uncompressed audio with crystal-clear quality
+- 🎶 **MP3**: The most commonly used compressed format
+- 🎵 **Ogg Vorbis**: Great compression with excellent sound
+- 📱 **AAC (mp4/m4a)**: Widely used in iPhones and YouTube
 
 ## 🔧 How to build
 
-- [build with Colab](aplay%2B.ipynb) &nbsp;&nbsp; <a href="https://colab.research.google.com/github/yui0/aplay-/blob/master/aplay%2B.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
+### Build Online
+- Build easily with Google Colab:
+- [Build with Colab](aplay%2B.ipynb) &nbsp;&nbsp; <a href="https://colab.research.google.com/github/yui0/aplay-/blob/master/aplay%2B.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
-```bash
-# dnf install alsa-lib-devel
-$ make
+### Build Locally
+1. Install required libraries:
+  ```bash
+  # dnf install alsa-lib-devel
+  $ make
+  ```
 
-```
-
-```bash
-git clone https://github.com/yui0/aplay-.git
-cd aplay-
-make
-
-```
+2. Clone the repository and build:
+  ```bash
+  git clone https://github.com/yui0/aplay-.git
+  cd aplay-
+  make
+  ```
 
 ## 🌸 How to use
 
+### Basic Commands
 ```bash
-$ make
 $ ./aplay+ -h
 Usage: ./aplay+ [options] dir
 
 Options:
--h                 Print this message
--d <device name>   ALSA device name [default hw:0,0 plughw:0,0...]
--f                 Use 32bit floating
--r                 Recursively search for directory
--x                 Random play
--s <regexp>        Search files
--t <ext type>      File type [flac mp3 wma...]
--p                 Tuning for Linux platforms
-
-$ ./aplay+ -rx .
-$ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD
-$ ./aplay+ -rfx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
+-h                 Print this help message
+-d <device name>   Specify ALSA device [e.g., default hw:0,0 plughw:0,0...]
+-f                 Use 32-bit floating-point playback
+-r                 Recursively search directories
+-x                 Enable random playback
+-s <regexp>        Search files with a regex
+-t <ext type>      Specify file type (e.g., flac, mp3, wma...)
+-p                 Optimize for Linux platforms
 ```
 
-## 🌟 Tuning for Linux platforms
+### Examples
+- 🔀 **Random playback**:
+  ```bash
+  $ ./aplay+ -rx .
+  ```
+- 🎤 **Search for a specific artist**:
+  ```bash
+  $ ./aplay+ -rx -d hw:7,0 /Music/ -s ZARD
+  ```
+- 🎹 **Exclude instrumentals from playback**:
+  ```bash
+  $ ./aplay+ -rfx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
+  ```
 
-* Disk I/O
+## 🌟 Linux Optimization Settings
 
-```sysctl.conf
+### 🚀 Optimize Disk I/O
+Add the following to your `sysctl.conf`:
+```conf
 vm.dirty_ratio = 40
 vm.dirty_background_ratio = 10
 vm.dirty_expire_centisecs = 3000
 vm.dirty_writeback_centisecs = 500
-
 #dev.hpet.max-user-freq = 3072
-
 vm.overcommit_memory = 1
 ```
-
+Apply changes:
+```bash
 sysctl -p
-
-* scheduler
-
 ```
+
+### ⚙️ Adjust Scheduler Settings
+Optimize SSDs and HDDs with the following script:
+```bash
 #!/bin/sh
 #cat /sys/block/sd*/queue/scheduler
 for FILE in /sys/block/sd*/queue/scheduler
@@ -86,18 +99,9 @@ do
 done
 ```
 
-```60-ioschedulers.rules
-# scheduler for non rotational, SSD
-ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"
-# scheduler for rotational, HDD
-ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
-```
-
-fstrim -v /
-
-* Setting CPU clock to performance
-
-```
+### 💨 Set CPU Performance Mode
+Use this script to switch CPU governor to "performance":
+```bash
 #!/bin/sh
 #cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
 for CPUFREQ in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
@@ -107,7 +111,17 @@ do
 done
 ```
 
-* Timer
+### I/O scheduler
+```60-ioschedulers.rules
+# scheduler for non rotational, SSD
+ACTION=="add|change", KERNEL=="sd[a-z]|mmcblk[0-9]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"
+# scheduler for rotational, HDD
+ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+```
+
+fstrim -v /
+
+### Timer
 
 ```
 #cat /sys/devices/system/clocksource/clocksource0/current_clocksource
@@ -118,10 +132,13 @@ ulimit -a
 
 ## 📖 References
 
-- https://github.com/nothings/stb
-- https://github.com/mackron/dr_libs
-- https://github.com/dr-soft/mini_al
-- https://github.com/ccxvii/minilibs
-- https://github.com/jibsen/parg
-- https://pulseaudio.blog.fc2.com/blog-entry-1.html
+- [stb](https://github.com/nothings/stb)
+- [dr_libs](https://github.com/mackron/dr_libs)
+- [mini_al](https://github.com/dr-soft/mini_al)
+- [minilibs/regex](https://github.com/ccxvii/minilibs)
+- [parg](https://github.com/jibsen/parg)
+- [Related Blog Posts](https://pulseaudio.blog.fc2.com/blog-entry-1.html)
 - https://kazuhira-r.hatenablog.com/entry/2021/05/22/210532
+- https://github.com/nothings/single_file_libs
+
+🎵 **Experience perfect audio playback with aplay+! Start your music journey today!**

@@ -1,6 +1,6 @@
 %define name aplay+
-%define version 0.8
-%define release b4
+%define version 0.9
+%define release b1
 
 Name:		%{name}
 Summary:	a simple BitPerfect player
@@ -10,7 +10,7 @@ License:	GPL
 Group:		Applications/Multimedia
 Source:	%{name}-%{version}.tar.bz2
 Buildroot:	%{_tmppath}/%{name}-%{version}
-#alsa-lib-devel
+BuildRequires:	alsa-lib-devel
 
 %description
 a simple BitPerfect player

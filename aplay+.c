@@ -307,12 +307,17 @@ void play_ogg(char *name)
 		return;
 	}
 
+	int c = 0;
+	printf("\e[?25l");
 	//while ((n = stb_vorbis_get_frame_short(v, 1, &outputs, FRAMES))) {
 	while ((n = stb_vorbis_get_frame_short_interleaved(v, v->channels, outputs, FRAMES*100))) {
+		printf("\r%d", c);
+		c += n;
 		AUDIO_play(&a, (char*)outputs, n);
 		AUDIO_wait(&a, 100);
 		if (key(&a)) break;
 	}
+	printf("\e[?25h");
 
 	AUDIO_close(&a);
 	stb_vorbis_close(v);
@@ -457,6 +462,16 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 		snprintf(path, 1024, "%s", ls[i].d_name);
 		if (access(ls[i].d_name, F_OK)<0) continue;
 
+		struct stat file_stat;
+		if (stat(ls[i].d_name, &file_stat) < 0) {
+			perror("stat");
+			continue;
+		}
+		if (file_stat.st_size == 0) {
+			printf("File size is 0: %s\n", ls[i].d_name);
+			continue;
+		}
+
 		if (strstr(e, "flac")) play_flac(path, format);
 		else if (strstr(e, "mp3")) play_mp3(path, format);
 		else if (strstr(e, "mp4")) play_aac(path);
@@ -568,4 +583,3 @@ int main(int argc, char *argv[])
 
 	return 0;
 }
-

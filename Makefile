@@ -1,4 +1,4 @@
-# ©2017-2022 YUICHIRO NAKADA
+# ©2017-2025 YUICHIRO NAKADA
 
 PROGRAM = $(patsubst %.c,%,$(wildcard *.c))
 
@@ -14,10 +14,13 @@ LDFLAGS = -lasound -lm -Wl,-s -Wl,--gc-sections
 #LDFLAGS = -lasound -lm -Wl,-s -Wl,-dead_strip
 
 .PHONY: all
-all: depend $(PROGRAM)
+all: $(PROGRAM)
+
+$(PROGRAM): % : %.o
+	$(CC) $< -o $@ $(LDFLAGS)
 
 %.o : %.c $(HEAD)
-	$(CC) $(LDFLAGS) $(CFLAGS) -c $(@F:.o=.c) -o $@
+	$(CC) $(CFLAGS) -c $(@F:.o=.c) -o $@
 
 .PHONY: clean
 clean:

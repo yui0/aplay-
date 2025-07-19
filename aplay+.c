@@ -74,7 +74,8 @@ typedef struct {
 void init_crosstalk_cancellation(CrosstalkCancel *xtc, int sample_rate, int channels) {
     if (channels != 2) return; // Only support stereo
     xtc->delay_samples = (int)(sample_rate * 0.000071); // 71µs delay
-    xtc->attenuation = 0.9f;
+    // xtc->attenuation = 0.9f; // 値が高すぎる
+    xtc->attenuation = 0.4f; // より自然な効果を得るための値
     xtc->delay_buffer_size = xtc->delay_samples * 2; // Stereo
     xtc->delay_buffer = (float*)calloc(xtc->delay_buffer_size, sizeof(float));
     xtc->delay_index = 0;
@@ -109,18 +110,29 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
             float delayed_left = xtc->delay_buffer[delay_idx];
             float delayed_right = xtc->delay_buffer[delay_idx + 1];
 
-            // Left ear: Left signal - attenuated delayed right signal
-            data[idx] = temp[idx] - xtc->attenuation * delayed_right;
-            // Right ear: Right signal - attenuated delayed left signal
-            data[idx + 1] = temp[idx + 1] - xtc->attenuation * delayed_left;
+            float new_left = temp[idx] - xtc->attenuation * delayed_right;
+            float new_right = temp[idx + 1] - xtc->attenuation * delayed_left;
+
+            // クリッピング防止処理
+            if (new_left > 1.0f) new_left = 1.0f;
+            if (new_left < -1.0f) new_left = -1.0f;
+            if (new_right > 1.0f) new_right = 1.0f;
+            if (new_right < -1.0f) new_right = -1.0f;
+
+            data[idx] = new_left;
+            data[idx + 1] = new_right;
         }
-    } else {
+    } else { // SND_PCM_FORMAT_S16_LE
         int16_t *data = (int16_t*)buffer;
         float temp[frames * 2];
+        float original_temp[frames * 2]; // オリジナル信号保持用
+
         // Convert int16 to float for processing
         for (int i = 0; i < frames * 2; i++) {
-            temp[i] = data[i] / 32768.0f;
+            original_temp[i] = data[i] / 32768.0f;
         }
+        memcpy(temp, original_temp, frames * 2 * sizeof(float));
+
 
         // Process crosstalk cancellation
         for (int i = 0; i < frames; i++) {
@@ -128,23 +140,23 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
             int delay_idx = (xtc->delay_index - xtc->delay_samples * 2 + xtc->delay_buffer_size) % xtc->delay_buffer_size;
 
             // Store current samples in delay buffer
-            xtc->delay_buffer[xtc->delay_index] = temp[idx];     // Left
-            xtc->delay_buffer[xtc->delay_index + 1] = temp[idx + 1]; // Right
+            xtc->delay_buffer[xtc->delay_index] = original_temp[idx];     // Left
+            xtc->delay_buffer[xtc->delay_index + 1] = original_temp[idx + 1]; // Right
             xtc->delay_index = (xtc->delay_index + 2) % xtc->delay_buffer_size;
 
             // Apply crosstalk cancellation
             float delayed_left = xtc->delay_buffer[delay_idx];
             float delayed_right = xtc->delay_buffer[delay_idx + 1];
 
-            // Left ear: Left signal - attenuated delayed right signal
-            temp[idx] = temp[idx] - xtc->attenuation * delayed_right;
-            // Right ear: Right signal - attenuated delayed left signal
-            temp[idx + 1] = temp[idx + 1] - xtc->attenuation * delayed_left;
+            temp[idx] = original_temp[idx] - xtc->attenuation * delayed_right;
+            temp[idx + 1] = original_temp[idx + 1] - xtc->attenuation * delayed_left;
         }
 
-        // Convert back to int16
         for (int i = 0; i < frames * 2; i++) {
-            data[i] = (int16_t)(temp[i] * 32768.0f);
+            float val = temp[i] * 32767.0f; // 32768.0fではなく32767.0fを使い、オーバーフローを避ける
+            if (val > 32767.0f) val = 32767.0f;
+            if (val < -32768.0f) val = -32768.0f;
+            data[i] = (int16_t)val;
         }
     }
 }

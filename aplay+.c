@@ -35,8 +35,8 @@ int cmd;
 int key(AUDIO *a)
 {
     if (!kbhit()) return 0;
-    int c = cmd = getchar();
 
+    int c = cmd = getchar();
     printf("%x\n", c);
     if (c==0x20) {
         snd_pcm_pause(a->handle, 1);
@@ -133,7 +133,6 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
         }
         memcpy(temp, original_temp, frames * 2 * sizeof(float));
 
-
         // Process crosstalk cancellation
         for (int i = 0; i < frames; i++) {
             int idx = i * 2;
@@ -177,7 +176,6 @@ void play_test_mode(int format, int flag) {
         return;
     }
 
-    // Verify stereo configuration
     printf("Test mode: %dHz, %d channels\n", sample_rate, channels);
     if (flag & USE_CROSSTALK) {
         printf(" with Crosstalk Cancellation\n");
@@ -250,7 +248,6 @@ void play_test_mode(int format, int flag) {
             sample_index = 0;
             phase = (phase + 1) % total_phases;
             
-            // 変更点4: コンソールへの表示をフェーズが切り替わるタイミングのみに修正
             if (phase == 0) {
                 printf("\rPlaying sine wave: Left channel          ");
             } else if (phase == 1) {
@@ -277,10 +274,10 @@ void play_wav(char *name, int format, int flag)
         if (AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1, format)) return;
 
         CrosstalkCancel xtc;
-        if (flag & USE_CROSSTALK) {
+        //if (flag & USE_CROSSTALK) {
             init_crosstalk_cancellation(&xtc, wav.sampleRate, wav.channels);
-            printf(" with Crosstalk Cancellation\n");
-        }
+            //printf(" with Crosstalk Cancellation\n");
+        //}
 
         uint64_t (*func)(drwav* pWav, drflac_uint64 framesToRead, void* pBufferOut);
         if (format) {
@@ -298,7 +295,9 @@ void play_wav(char *name, int format, int flag)
             if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, a.buffer, a.frames, wav.channels, format);
             AUDIO_play0(&a);
             AUDIO_wait(&a, 100);
-            if (key(&a)) break;
+            int k = key(&a);
+            if (k=='c') flag ^= USE_CROSSTALK;
+            else if (k) break;
 
             printf("\r%d/%llu", c, wav.totalPCMFrameCount);
             c += n;
@@ -306,7 +305,7 @@ void play_wav(char *name, int format, int flag)
 
         AUDIO_close(&a);
         drwav_uninit(&wav);
-        if (flag & USE_CROSSTALK) free_crosstalk_cancellation(&xtc);
+        /*if (flag & USE_CROSSTALK)*/ free_crosstalk_cancellation(&xtc);
     }
 }
 
@@ -323,10 +322,10 @@ void play_flac(char *name, int format, int flag)
     }
 
     CrosstalkCancel xtc;
-    if (flag & USE_CROSSTALK) {
+    //if (flag & USE_CROSSTALK) {
         init_crosstalk_cancellation(&xtc, flac->sampleRate, flac->channels);
-        printf(" with Crosstalk Cancellation\n");
-    }
+        //printf(" with Crosstalk Cancellation\n");
+    //}
 
     uint64_t (*func)(drflac* pFlac, drflac_uint64 framesToRead, void* pBufferOut);
     if (format) {
@@ -343,7 +342,9 @@ void play_flac(char *name, int format, int flag)
         if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, a.buffer, a.frames, flac->channels, format);
         AUDIO_play0(&a);
         AUDIO_wait(&a, 100);
-        if (key(&a)) break;
+        int k = key(&a);
+        if (k=='c') flag ^= USE_CROSSTALK;
+        else if (k) break;
 
         printf("\r%d/%llu", c, flac->totalPCMFrameCount);
         c += n;
@@ -352,7 +353,7 @@ void play_flac(char *name, int format, int flag)
 
     AUDIO_close(&a);
     drflac_close(flac);
-    if (flag & USE_CROSSTALK) free_crosstalk_cancellation(&xtc);
+    /*if (flag & USE_CROSSTALK)*/ free_crosstalk_cancellation(&xtc);
 }
 
 #if 0
@@ -441,10 +442,10 @@ int play_mp3(char *name, int format, int flag)
     }
 
     CrosstalkCancel xtc;
-    if (flag & USE_CROSSTALK) {
+    //if (flag & USE_CROSSTALK) {
         init_crosstalk_cancellation(&xtc, mp3.sampleRate, mp3.channels);
-        printf(" with Crosstalk Cancellation\n");
-    }
+        //printf(" with Crosstalk Cancellation\n");
+    //}
 
     uint64_t (*func)(drmp3*, drflac_uint64, void*);
     if (format) {
@@ -462,7 +463,9 @@ int play_mp3(char *name, int format, int flag)
         if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, a.buffer, a.frames, mp3.channels, format);
         AUDIO_play0(&a);
         AUDIO_wait(&a, 100);
-        if (key(&a)) break;
+        int k = key(&a);
+        if (k=='c') flag ^= USE_CROSSTALK;
+        else if (k) break;
 
         printf("\r%d/%d", c, totalPCMFrameCount);
         c += n;
@@ -471,7 +474,7 @@ int play_mp3(char *name, int format, int flag)
 
     AUDIO_close(&a);
     drmp3_uninit(&mp3);
-    if (flag & USE_CROSSTALK) free_crosstalk_cancellation(&xtc);
+    /*if (flag & USE_CROSSTALK)*/ free_crosstalk_cancellation(&xtc);
     return 0;
 }
 #else
@@ -548,10 +551,10 @@ void play_ogg(char *name, int flag)
     }
 
     CrosstalkCancel xtc;
-    if (flag & USE_CROSSTALK) {
+    //if (flag & USE_CROSSTALK) {
         init_crosstalk_cancellation(&xtc, v->sample_rate, v->channels);
-        printf(" with Crosstalk Cancellation\n");
-    }
+        //printf(" with Crosstalk Cancellation\n");
+    //}
 
     int c = 0;
     printf("\e[?25l");
@@ -560,14 +563,16 @@ void play_ogg(char *name, int flag)
         if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, outputs, n, v->channels, 0);
         AUDIO_play(&a, (char*)outputs, n);
         AUDIO_wait(&a, 100);
-        if (key(&a)) break;
+        int k = key(&a);
+        if (k=='c') flag ^= USE_CROSSTALK;
+        else if (k) break;
         c += n;
     }
     printf("\e[?25h");
 
     AUDIO_close(&a);
     stb_vorbis_close(v);
-    if (flag & USE_CROSSTALK) free_crosstalk_cancellation(&xtc);
+    /*if (flag & USE_CROSSTALK)*/ free_crosstalk_cancellation(&xtc);
 }
 
 int play_wma(char *name, int flag)
@@ -599,14 +604,14 @@ int play_wma(char *name, int flag)
     }
 
     CrosstalkCancel xtc;
-    if (flag & USE_CROSSTALK) {
+    //if (flag & USE_CROSSTALK) {
         init_crosstalk_cancellation(&xtc, cc.sample_rate, cc.channels);
-        printf(" with Crosstalk Cancellation\n");
-    }
+        //printf(" with Crosstalk Cancellation\n");
+    //}
 
     int c = 0;
     printf("\e[?25l");
-    while ((bytes_left >= 0) && !key(&a)) {
+    while ((bytes_left >= 0) /*&& !key(&a)*/) {
         int size;
         int frame_size = wma_decode_superframe(&cc, stream_pos, &size, (uint8_t*)sample_buf, MAX_CODED_SUPERFRAME_SIZE);
         if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, sample_buf, size/cc.channels, cc.channels, 0);
@@ -614,6 +619,10 @@ int play_wma(char *name, int flag)
         bytes_left -= frame_size;
         AUDIO_play(&a, (char*)sample_buf, size/cc.channels);
         AUDIO_wait(&a, 100);
+
+        int k = key(&a);
+        if (k=='c') flag ^= USE_CROSSTALK;
+        else if (k) break;
 
         printf("\r%d", c);
         c += frame_size;
@@ -625,7 +634,7 @@ int play_wma(char *name, int flag)
     munmap(file_data, len);
     close(fd);
     free(sample_buf);
-    if (flag & USE_CROSSTALK) free_crosstalk_cancellation(&xtc);
+    /*if (flag & USE_CROSSTALK)*/ free_crosstalk_cancellation(&xtc);
     return 0;
 }
 
@@ -661,20 +670,20 @@ int play_aac(char *name, int flag)
 
     printf("%dHz %dch\n", info.sampRateCore, info.nChans);
     AUDIO a;
-    if (AUDIO_init(&a, dev, /*info.sampRateCore*/44100, info.nChans, FRAMES, 1, 0)) {
+    if (AUDIO_init(&a, dev, info.sampRateCore/*44100*/, info.nChans, FRAMES, 1, 0)) {
         free(file_data);
         close(fd);
         return 1;
     }
 
     CrosstalkCancel xtc;
-    if (flag & USE_CROSSTALK) {
-        init_crosstalk_cancellation(&xtc, /*info.sampRateCore*/44100, info.nChans);
-        printf(" with Crosstalk Cancellation\n");
-    }
+    //if (flag & USE_CROSSTALK) {
+        init_crosstalk_cancellation(&xtc, info.sampRateCore/*44100*/, info.nChans);
+        //printf(" with Crosstalk Cancellation\n");
+    //}
 
     printf("\e[?25l");
-    while ((bytes_left >= 0) && !key(&a)) {
+    while ((bytes_left >= 0) /*&& !key(&a)*/) {
         int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
         printf("\r%d %d", (int)(stream_pos-file_data), bytes_left);
         if (!r) {
@@ -687,6 +696,10 @@ int play_aac(char *name, int flag)
             printf("\nAAC decode error %d\n", r);
             break;
         }
+
+        int k = key(&a);
+        if (k=='c') flag ^= USE_CROSSTALK;
+        else if (k) break;
     }
     printf("\e[?25h");
 
@@ -694,7 +707,7 @@ int play_aac(char *name, int flag)
     AACFreeDecoder(aac);
     free(file_data);
     close(fd);
-    if (flag & USE_CROSSTALK) free_crosstalk_cancellation(&xtc);
+    /*if (flag & USE_CROSSTALK)*/ free_crosstalk_cancellation(&xtc);
     return 0;
 }
 

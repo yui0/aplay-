@@ -1,0 +1,101 @@
+#ifndef DSD_DECODER_H
+#define DSD_DECODER_H
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define DSD_SAMPLES_PER_BYTE 8
+#define DSD_DEFAULT_SAMPLE_RATE 2822400 // DSD64: 2.8224 MHz
+#define PCM_DEFAULT_SAMPLE_RATE 44100   // 44.1 kHz PCM output
+
+typedef struct {
+    uint8_t* dsd_data;      // Input DSD data buffer
+    size_t dsd_data_size;   // Size of DSD data in bytes
+    int32_t* pcm_data;      // Output PCM data buffer
+    size_t pcm_data_size;   // Size of PCM data in samples
+    int sample_rate_dsd;    // DSD sample rate (e.g., 2822400 Hz for DSD64)
+    int sample_rate_pcm;    // PCM sample rate (e.g., 44100 Hz)
+} DSDDecoder;
+
+#ifdef DSD_DECODER_IMPLEMENTATION
+
+// Initialize DSDDecoder structure
+DSDDecoder* dsd_decoder_init(size_t dsd_data_size, int sample_rate_dsd, int sample_rate_pcm) {
+    DSDDecoder* decoder = (DSDDecoder*)malloc(sizeof(DSDDecoder));
+    if (!decoder) return NULL;
+
+    decoder->dsd_data = NULL;
+    decoder->dsd_data_size = dsd_data_size;
+    decoder->sample_rate_dsd = sample_rate_dsd;
+    decoder->sample_rate_pcm = sample_rate_pcm;
+
+    // Calculate PCM data size based on sample rate ratio
+    size_t pcm_samples = (size_t)((double)dsd_data_size * DSD_SAMPLES_PER_BYTE * sample_rate_pcm / sample_rate_dsd);
+    decoder->pcm_data = (int32_t*)calloc(pcm_samples, sizeof(int32_t));
+    if (!decoder->pcm_data) {
+        free(decoder);
+        return NULL;
+    }
+    decoder->pcm_data_size = pcm_samples;
+
+    return decoder;
+}
+
+// Free DSDDecoder structure
+void dsd_decoder_free(DSDDecoder* decoder) {
+    if (decoder) {
+        free(decoder->dsd_data);
+        free(decoder->pcm_data);
+        free(decoder);
+    }
+}
+
+// Load DSD data into decoder
+int dsd_decoder_load_data(DSDDecoder* decoder, const uint8_t* data, size_t size) {
+    if (!decoder || !data || size > decoder->dsd_data_size) return -1;
+
+    decoder->dsd_data = (uint8_t*)malloc(size);
+    if (!decoder->dsd_data) return -1;
+
+    memcpy(decoder->dsd_data, data, size);
+    decoder->dsd_data_size = size;
+    return 0;
+}
+
+// Simple DSD to PCM conversion with basic low-pass filtering
+int dsd_decoder_convert_to_pcm(DSDDecoder* decoder) {
+    if (!decoder || !decoder->dsd_data) return -1;
+
+    size_t pcm_idx = 0;
+    size_t samples_per_pcm = decoder->sample_rate_dsd / decoder->sample_rate_pcm;
+
+    for (size_t i = 0; i < decoder->dsd_data_size && pcm_idx < decoder->pcm_data_size; ++i) {
+        uint8_t dsd_byte = decoder->dsd_data[i];
+        int32_t sum = 0;
+
+        // Process 8 bits (samples) in one DSD byte
+        for (int bit = 0; bit < DSD_SAMPLES_PER_BYTE; ++bit) {
+            sum += (dsd_byte & (1 << (7 - bit))) ? 1 : -1;
+        }
+
+        // Simple averaging filter for decimation
+        if ((i % samples_per_pcm) == 0) {
+            decoder->pcm_data[pcm_idx] = sum * (INT32_MAX / DSD_SAMPLES_PER_BYTE);
+            pcm_idx++;
+        }
+    }
+
+    return 0;
+}
+
+// Get PCM data
+const int32_t* dsd_decoder_get_pcm_data(DSDDecoder* decoder, size_t* size) {
+    if (!decoder) return NULL;
+    *size = decoder->pcm_data_size;
+    return decoder->pcm_data;
+}
+
+#endif // DSD_DECODER_IMPLEMENTATION
+
+#endif // DSD_DECODER_H

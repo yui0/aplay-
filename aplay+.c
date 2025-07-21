@@ -378,36 +378,17 @@ void play_flac(char *name, int format, int flag)
 
 void play_dsf(char *name, int format, int flag)
 {
-    int fd = open(name, O_RDONLY);
-    if (fd < 0) {
+    FILE *f = fopen(name, "rb");
+    if (!f) {
         printf("Error: cannot open `%s`\n", name);
         return;
     }
 
-    off_t size = lseek(fd, 0, SEEK_END);
-    lseek(fd, 0, SEEK_SET);
-    uint8_t *data = (uint8_t*)mmap(0, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (data == MAP_FAILED) {
-        printf("Error: cannot mmap file `%s`\n", name);
-        close(fd);
-        return;
-    }
-
-    // Initialize DSD decoder
-    DSDDecoder *decoder = dsd_decoder_init(size, DSD_DEFAULT_SAMPLE_RATE, PCM_DEFAULT_SAMPLE_RATE, 2);
+    // Initialize DSD decoder from file stream
+    DSDDecoder *decoder = dsd_decoder_init_file(f);
     if (!decoder) {
-        printf("Error: failed to initialize DSD decoder\n");
-        munmap(data, size);
-        close(fd);
-        return;
-    }
-
-    // Load DSF data
-    if (dsd_decoder_load_dsf(decoder, data, size) != 0) {
-        printf("Error: failed to load DSF data\n");
-        dsd_decoder_free(decoder);
-        munmap(data, size);
-        close(fd);
+        printf("Error: failed to initialize DSD decoder for `%s`\n", name);
+        fclose(f);
         return;
     }
 
@@ -421,35 +402,39 @@ void play_dsf(char *name, int format, int flag)
     AUDIO a;
     if (AUDIO_init(&a, dev, decoder->sample_rate_pcm, decoder->channels, FRAMES, 1, format)) {
         dsd_decoder_free(decoder);
-        munmap(data, size);
-        close(fd);
+        fclose(f);
         return;
     }
 
     CrosstalkCancel xtc;
     init_crosstalk_cancellation(&xtc, decoder->sample_rate_pcm, decoder->channels);
 
-    int c = 0;
+    uint64_t frames_played = 0;
     printf("\e[?25l");
     size_t n;
     while ((n = dsd_decoder_read_pcm_frames(decoder, a.frames, a.buffer, format)) > 0) {
-        if (n != a.frames) printf("!");
-        if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, a.buffer, n, decoder->channels, format);
+        if (n != a.frames) printf("!"); // Can happen at the end of the file
+        
+        if (flag & USE_CROSSTALK) {
+            apply_crosstalk_cancellation(&xtc, a.buffer, n, decoder->channels, format);
+        }
+        
         AUDIO_play0(&a);
         AUDIO_wait(&a, 100);
+        
         int k = key(&a);
         if (k == 'c') flag ^= USE_CROSSTALK;
         else if (k) break;
 
-        printf("\r%d/%lu", c, decoder->totalPCMFrameCount);
-        c += n;
+        frames_played += n;
+        printf("\r%lu/%lu", frames_played, decoder->totalPCMFrameCount);
+        fflush(stdout);
     }
-    printf("\e[?25h");
+    printf("\n\e[?25h");
 
     AUDIO_close(&a);
     dsd_decoder_free(decoder);
-    munmap(data, size);
-    close(fd);
+    fclose(f);
     free_crosstalk_cancellation(&xtc);
 }
 

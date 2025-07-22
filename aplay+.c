@@ -754,6 +754,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
         else if (strstr(e, "m4a")) play_aac(path, flag);
         else if (strstr(e, "ogg")) play_ogg(path, flag);
         else if (strstr(e, "wav")) play_wav(path, format, flag);
+        else if (strstr(e, "wma")) play_wma(path, flag);
         else if (strstr(e, "dsf")) play_dsf(path, format, flag);
         else continue;
 

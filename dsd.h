@@ -60,8 +60,6 @@ int main() {
 }
 */
 
-// dsd.h
-
 #ifndef DSD_H
 #define DSD_H
 
@@ -76,7 +74,7 @@ int main() {
 #define SND_PCM_FORMAT_S16_LE 2
 #endif
 #ifndef SND_PCM_FORMAT_FLOAT_LE
-#define SND_PCM_FORMAT_FLOAT_LE 10
+#define SND_PCM_FORMAT_FLOAT_LE 14
 #endif
 
 #define DSD_SAMPLES_PER_BYTE 8

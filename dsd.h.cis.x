@@ -60,8 +60,6 @@ int main() {
 }
 */
 
-// dsd.h
-
 #ifndef DSD_H
 #define DSD_H
 
@@ -81,6 +79,7 @@ int main() {
 
 #define DSD_SAMPLES_PER_BYTE 8
 #define MAX_CHANNELS 2
+#define CIC_STAGES 5 // フィルターの次数を5次に設定
 
 typedef struct {
     FILE* file;
@@ -95,22 +94,18 @@ typedef struct {
 
     uint8_t* block_buffer;
     size_t block_buffer_size;
-    
-    // Indexing and filter state
     size_t current_dsd_bit_index;
 
-    // State for a 4-stage cascaded low-pass filter
-    double f1_state[MAX_CHANNELS];
-    double f2_state[MAX_CHANNELS];
-    double f3_state[MAX_CHANNELS];
-    double f4_state[MAX_CHANNELS];
-    double filter_alpha;
+    // State for a 5th-order CIC filter
+    double integrator_state[CIC_STAGES][MAX_CHANNELS];
+    double comb_state[CIC_STAGES][MAX_CHANNELS];
+    double gain_correction;
 
 } DSDDecoder;
 
 #ifdef DSD_DECODER_IMPLEMENTATION
 
-// Helper functions (no changes)
+// Helper functions
 static uint32_t read_le32(const uint8_t* buf) { return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24); }
 static uint64_t read_le64(const uint8_t* buf) { return (uint64_t)buf[0] | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) | ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) | ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56); }
 
@@ -127,7 +122,7 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
     if (!decoder) return NULL;
     decoder->file = file;
 
-    // --- Header Parsing ---
+    // Header Parsing
     uint8_t header_buf[80];
     if (fread(header_buf, 1, 28, file) != 28 || strncmp((char*)header_buf, "DSD ", 4) != 0) { free(decoder); return NULL; }
     uint64_t fmt_chunk_offset = 28;
@@ -159,12 +154,12 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
     if (fread(chunk_id, 1, 12, file) != 12 || strncmp(chunk_id, "data", 4) != 0) { free(decoder->block_buffer); free(decoder); return NULL; }
     fseek(file, ftell(file) - 12 + 12, SEEK_SET);
 
-    // --- Initialize filter ---
-    double cutoff_freq = 24000.0; // 24kHz cutoff frequency
-    decoder->filter_alpha = 1.0 - exp(-2.0 * M_PI * cutoff_freq / decoder->sample_rate_dsd);
-    
-    dsd_load_next_block(decoder);
+    // *** CRITICAL: Calculate the correct gain correction factor for the CIC filter ***
+    // The gain of a 5th-order CIC filter is decimation_factor^5.
+    // We must divide by this to normalize the output.
+    decoder->gain_correction = 1.0 / pow((double)decimation_factor, CIC_STAGES);
 
+    dsd_load_next_block(decoder);
     return decoder;
 }
 
@@ -188,33 +183,41 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
 
     for (size_t i = 0; i < frames_to_read; ++i) {
         for (int ch = 0; ch < decoder->channels; ++ch) {
-            const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
-            
+            // --- Stage 1: Integrator Section (runs at high DSD sample rate) ---
             for (size_t k = 0; k < decimation_factor; ++k) {
                 size_t current_bit = decoder->current_dsd_bit_index + k;
-                
-                // This logic assumes a single PCM sample does not span across block boundaries.
-                // This holds true if block_size is reasonably large (e.g., 4096 bytes).
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
                 int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
                 
+                const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
                 double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
 
-                // Apply the 4-stage cascaded low-pass filter
-                decoder->f1_state[ch] += decoder->filter_alpha * (dsd_val - decoder->f1_state[ch]);
-                decoder->f2_state[ch] += decoder->filter_alpha * (decoder->f1_state[ch] - decoder->f2_state[ch]);
-                decoder->f3_state[ch] += decoder->filter_alpha * (decoder->f2_state[ch] - decoder->f3_state[ch]);
-                decoder->f4_state[ch] += decoder->filter_alpha * (decoder->f3_state[ch] - decoder->f4_state[ch]);
+                // Pass the sample through the integrator stages
+                double current_val = dsd_val;
+                for(int stage = 0; stage < CIC_STAGES; ++stage) {
+                    decoder->integrator_state[stage][ch] += current_val;
+                    current_val = decoder->integrator_state[stage][ch];
+                }
             }
 
-            // The output is the state of the final filter stage
-            double pcm_val = decoder->f4_state[ch];
+            // --- Stage 2: Comb (Differentiator) Section (runs once per output PCM sample) ---
+            double comb_input = decoder->integrator_state[CIC_STAGES-1][ch];
+            double comb_output = comb_input;
+            for(int stage = 0; stage < CIC_STAGES; ++stage) {
+                double temp = comb_output;
+                comb_output -= decoder->comb_state[stage][ch];
+                decoder->comb_state[stage][ch] = temp;
+            }
+
+            // --- Stage 3: Gain Correction and Output ---
+            double pcm_val = comb_output * decoder->gain_correction;
             
-            // Write to output buffer with clipping
             if (format == SND_PCM_FORMAT_FLOAT_LE) {
                 if (pcm_val > 1.0) pcm_val = 1.0; if (pcm_val < -1.0) pcm_val = -1.0;
                 buffer_f32[i * decoder->channels + ch] = (float)pcm_val;
             } else { // SND_PCM_FORMAT_S16_LE
+                // Add a slight extra gain for 16-bit, as CIC output can be quiet
+                //pcm_val *= 4.0;
                 int32_t s16_val = (int32_t)(pcm_val * 32767.0);
                 if (s16_val > 32767) s16_val = 32767; if (s16_val < -32768) s16_val = -32768;
                 buffer_s16[i * decoder->channels + ch] = (int16_t)s16_val;

@@ -218,6 +218,7 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
         
         // Process one PCM frame
         for (int ch = 0; ch < decoder->channels; ++ch) {
+#if 1
             int32_t sum = 0;
             // Get pointer to the start of the current channel's data in the buffer
             const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
@@ -236,7 +237,21 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
             
             // Average and scale to get the final PCM sample
             double pcm_val = (double)sum / decimation_factor;
-
+#else
+            static const double fir_coeffs[8] = {0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125};
+            double sum = 0.0;
+            const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
+            for (size_t k = 0; k < decimation_factor; ++k) {
+                size_t current_bit = decoder->block_bit_index + k;
+                if (current_bit >= block_size_bits) break;
+                size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
+                int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
+                int bit = (dsd_channel_data[byte_idx] >> bit_pos) & 1;
+                double value = bit ? 1.0 : -1.0;
+                if (k < 8) sum += value * fir_coeffs[k];
+            }
+            double pcm_val = sum;
+#endif
             // Write to output buffer
             if (format == SND_PCM_FORMAT_FLOAT_LE) {
                 buffer_f32[i * decoder->channels + ch] = (float)pcm_val;

@@ -60,8 +60,6 @@ int main() {
 }
 */
 
-// dsd.h
-
 #ifndef DSD_H
 #define DSD_H
 
@@ -95,16 +93,7 @@ typedef struct {
 
     uint8_t* block_buffer;
     size_t block_buffer_size;
-    
-    // Indexing and filter state
     size_t current_dsd_bit_index;
-
-    // State for a 4-stage cascaded low-pass filter
-    double f1_state[MAX_CHANNELS];
-    double f2_state[MAX_CHANNELS];
-    double f3_state[MAX_CHANNELS];
-    double f4_state[MAX_CHANNELS];
-    double filter_alpha;
 
 } DSDDecoder;
 
@@ -158,10 +147,6 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
     char chunk_id[12];
     if (fread(chunk_id, 1, 12, file) != 12 || strncmp(chunk_id, "data", 4) != 0) { free(decoder->block_buffer); free(decoder); return NULL; }
     fseek(file, ftell(file) - 12 + 12, SEEK_SET);
-
-    // --- Initialize filter ---
-    double cutoff_freq = 24000.0; // 24kHz cutoff frequency
-    decoder->filter_alpha = 1.0 - exp(-2.0 * M_PI * cutoff_freq / decoder->sample_rate_dsd);
     
     dsd_load_next_block(decoder);
 
@@ -190,26 +175,33 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
         for (int ch = 0; ch < decoder->channels; ++ch) {
             const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
             
+            // --- Triangular Windowed FIR Filter ---
+            double weighted_sum = 0.0;
+            double total_weight = 0.0;
+            double half_R = (double)decimation_factor / 2.0;
+
             for (size_t k = 0; k < decimation_factor; ++k) {
                 size_t current_bit = decoder->current_dsd_bit_index + k;
                 
-                // This logic assumes a single PCM sample does not span across block boundaries.
-                // This holds true if block_size is reasonably large (e.g., 4096 bytes).
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
                 int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
                 
                 double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
 
-                // Apply the 4-stage cascaded low-pass filter
-                decoder->f1_state[ch] += decoder->filter_alpha * (dsd_val - decoder->f1_state[ch]);
-                decoder->f2_state[ch] += decoder->filter_alpha * (decoder->f1_state[ch] - decoder->f2_state[ch]);
-                decoder->f3_state[ch] += decoder->filter_alpha * (decoder->f2_state[ch] - decoder->f3_state[ch]);
-                decoder->f4_state[ch] += decoder->filter_alpha * (decoder->f3_state[ch] - decoder->f4_state[ch]);
+                // Apply a triangular window weight to the DSD sample
+                // This gives more importance to samples in the middle of the window
+                double weight = 1.0 - fabs(((double)k + 0.5) - half_R) / half_R;
+                
+                weighted_sum += dsd_val * weight;
+                total_weight += weight;
             }
-
-            // The output is the state of the final filter stage
-            double pcm_val = decoder->f4_state[ch];
             
+            // Normalize the weighted sum
+            double pcm_val = (total_weight > 0) ? (weighted_sum / total_weight) : 0.0;
+
+            // Apply some gain, as FIR filter output can have lower amplitude
+            pcm_val *= 2.0;
+
             // Write to output buffer with clipping
             if (format == SND_PCM_FORMAT_FLOAT_LE) {
                 if (pcm_val > 1.0) pcm_val = 1.0; if (pcm_val < -1.0) pcm_val = -1.0;

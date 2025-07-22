@@ -60,8 +60,6 @@ int main() {
 }
 */
 
-// dsd.h
-
 #ifndef DSD_H
 #define DSD_H
 
@@ -81,6 +79,7 @@ int main() {
 
 #define DSD_SAMPLES_PER_BYTE 8
 #define MAX_CHANNELS 2
+#define FILTER_STAGES 8 // フィルターの次数を8次に強化
 
 typedef struct {
     FILE* file;
@@ -99,11 +98,8 @@ typedef struct {
     // Indexing and filter state
     size_t current_dsd_bit_index;
 
-    // State for a 4-stage cascaded low-pass filter
-    double f1_state[MAX_CHANNELS];
-    double f2_state[MAX_CHANNELS];
-    double f3_state[MAX_CHANNELS];
-    double f4_state[MAX_CHANNELS];
+    // State for an 8-stage cascaded low-pass filter
+    double filter_state[FILTER_STAGES][MAX_CHANNELS];
     double filter_alpha;
 
 } DSDDecoder;
@@ -160,7 +156,7 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
     fseek(file, ftell(file) - 12 + 12, SEEK_SET);
 
     // --- Initialize filter ---
-    double cutoff_freq = 24000.0; // 24kHz cutoff frequency
+    double cutoff_freq = 22050.0; // Cutoff frequency set just at the Nyquist frequency of 44.1kHz PCM
     decoder->filter_alpha = 1.0 - exp(-2.0 * M_PI * cutoff_freq / decoder->sample_rate_dsd);
     
     dsd_load_next_block(decoder);
@@ -193,22 +189,21 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
             for (size_t k = 0; k < decimation_factor; ++k) {
                 size_t current_bit = decoder->current_dsd_bit_index + k;
                 
-                // This logic assumes a single PCM sample does not span across block boundaries.
-                // This holds true if block_size is reasonably large (e.g., 4096 bytes).
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
                 int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
                 
                 double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
 
-                // Apply the 4-stage cascaded low-pass filter
-                decoder->f1_state[ch] += decoder->filter_alpha * (dsd_val - decoder->f1_state[ch]);
-                decoder->f2_state[ch] += decoder->filter_alpha * (decoder->f1_state[ch] - decoder->f2_state[ch]);
-                decoder->f3_state[ch] += decoder->filter_alpha * (decoder->f2_state[ch] - decoder->f3_state[ch]);
-                decoder->f4_state[ch] += decoder->filter_alpha * (decoder->f3_state[ch] - decoder->f4_state[ch]);
+                // Apply the 8-stage cascaded low-pass filter
+                double current_input = dsd_val;
+                for(int stage = 0; stage < FILTER_STAGES; ++stage) {
+                    decoder->filter_state[stage][ch] += decoder->filter_alpha * (current_input - decoder->filter_state[stage][ch]);
+                    current_input = decoder->filter_state[stage][ch];
+                }
             }
 
             // The output is the state of the final filter stage
-            double pcm_val = decoder->f4_state[ch];
+            double pcm_val = decoder->filter_state[FILTER_STAGES-1][ch];
             
             // Write to output buffer with clipping
             if (format == SND_PCM_FORMAT_FLOAT_LE) {

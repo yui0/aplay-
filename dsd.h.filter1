@@ -60,8 +60,6 @@ int main() {
 }
 */
 
-// dsd.h
-
 #ifndef DSD_H
 #define DSD_H
 
@@ -97,14 +95,9 @@ typedef struct {
     size_t block_buffer_size;
     
     // Indexing and filter state
-    size_t current_dsd_bit_index;
-
-    // State for a 4-stage cascaded low-pass filter
-    double f1_state[MAX_CHANNELS];
-    double f2_state[MAX_CHANNELS];
-    double f3_state[MAX_CHANNELS];
-    double f4_state[MAX_CHANNELS];
-    double filter_alpha;
+    size_t current_dsd_bit_index; // Bit index within the current channel block
+    double filter_state[MAX_CHANNELS]; // State for the low-pass filter
+    double filter_alpha; // Coefficient for the filter
 
 } DSDDecoder;
 
@@ -127,7 +120,7 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
     if (!decoder) return NULL;
     decoder->file = file;
 
-    // --- Header Parsing ---
+    // --- Header Parsing (same as before) ---
     uint8_t header_buf[80];
     if (fread(header_buf, 1, 28, file) != 28 || strncmp((char*)header_buf, "DSD ", 4) != 0) { free(decoder); return NULL; }
     uint64_t fmt_chunk_offset = 28;
@@ -160,9 +153,12 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
     fseek(file, ftell(file) - 12 + 12, SEEK_SET);
 
     // --- Initialize filter ---
-    double cutoff_freq = 24000.0; // 24kHz cutoff frequency
+    // A simple way to set the filter coefficient (alpha) based on a desired cutoff frequency.
+    // This sets a cutoff around 25-30kHz, which is a common choice.
+    double cutoff_freq = 25000.0;
     decoder->filter_alpha = 1.0 - exp(-2.0 * M_PI * cutoff_freq / decoder->sample_rate_dsd);
     
+    // Load the first block of data to start.
     dsd_load_next_block(decoder);
 
     return decoder;
@@ -187,28 +183,32 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
     size_t block_size_bits = decoder->block_size_bytes * DSD_SAMPLES_PER_BYTE;
 
     for (size_t i = 0; i < frames_to_read; ++i) {
+        // Process one PCM frame for all channels
         for (int ch = 0; ch < decoder->channels; ++ch) {
             const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
             
+            // Apply the low-pass filter over 'decimation_factor' DSD samples
             for (size_t k = 0; k < decimation_factor; ++k) {
+                // Check if we've consumed the current block and need to load the next one
+                if (decoder->current_dsd_bit_index + k >= block_size_bits) {
+                    // This case is handled by the outer check, but as a safeguard.
+                    // A more robust implementation would handle reads that span blocks.
+                    // For now, we assume decimation_factor is smaller than block_size_bits.
+                }
+
                 size_t current_bit = decoder->current_dsd_bit_index + k;
-                
-                // This logic assumes a single PCM sample does not span across block boundaries.
-                // This holds true if block_size is reasonably large (e.g., 4096 bytes).
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
                 int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
                 
                 double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
 
-                // Apply the 4-stage cascaded low-pass filter
-                decoder->f1_state[ch] += decoder->filter_alpha * (dsd_val - decoder->f1_state[ch]);
-                decoder->f2_state[ch] += decoder->filter_alpha * (decoder->f1_state[ch] - decoder->f2_state[ch]);
-                decoder->f3_state[ch] += decoder->filter_alpha * (decoder->f2_state[ch] - decoder->f3_state[ch]);
-                decoder->f4_state[ch] += decoder->filter_alpha * (decoder->f3_state[ch] - decoder->f4_state[ch]);
+                // Apply the first-order IIR low-pass filter (leaky integrator)
+                // y[n] = y[n-1] + alpha * (x[n] - y[n-1])
+                decoder->filter_state[ch] += decoder->filter_alpha * (dsd_val - decoder->filter_state[ch]);
             }
 
-            // The output is the state of the final filter stage
-            double pcm_val = decoder->f4_state[ch];
+            // The final state of the filter after processing the bits is our PCM sample
+            double pcm_val = decoder->filter_state[ch];
             
             // Write to output buffer with clipping
             if (format == SND_PCM_FORMAT_FLOAT_LE) {
@@ -221,11 +221,13 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
             }
         }
         
+        // Advance the master bit index for the next PCM frame
         decoder->current_dsd_bit_index += decimation_factor;
 
+        // If we've passed the end of the block, load the next one
         if (decoder->current_dsd_bit_index >= block_size_bits) {
             if (!dsd_load_next_block(decoder)) {
-                frames_read++;
+                frames_read++; // count the last frame read
                 goto end_loop;
             }
         }

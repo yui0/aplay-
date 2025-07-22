@@ -600,12 +600,29 @@ int play_wma(char *name, int flag)
     bytes_left = len;
 
     CodecContext cc;
-    wma_decode_init_fixed(&cc);
+    // Potentially modify wma_decode_init_fixed or introduce a new function
+    // that takes file_data and bytes_left as arguments for proper initialization.
+    // For example:
+    // if (wma_decode_init_from_data(&cc, stream_pos, bytes_left) < 0) {
+    //     printf("Error: failed to initialize WMA decoder\n");
+    //     munmap(file_data, len);
+    //     close(fd);
+    //     free(sample_buf);
+    //     return 1;
+    // }
+
+    // If wma_decode_init_fixed assumes it can read from a global or previously set
+    // stream, then the issue is more fundamental in how uwma.h expects its input.
+    // Assuming wma_decode_init_fixed initializes basic structure, and actual header parsing
+    // happens on the first call to wma_decode_superframe or another function.
+    wma_decode_init_fixed(&cc); // This line is where the problem likely originates
+
     printf("%dHz %dch\n", cc.sample_rate, cc.channels);
     AUDIO a;
     if (AUDIO_init(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1, 0)) {
         munmap(file_data, len);
         close(fd);
+        free(sample_buf);
         return 1;
     }
 
@@ -617,6 +634,9 @@ int play_wma(char *name, int flag)
     while ((bytes_left >= 0)) {
         int size;
         int frame_size = wma_decode_superframe(&cc, stream_pos, &size, (uint8_t*)sample_buf, MAX_CODED_SUPERFRAME_SIZE);
+        if (frame_size <= 0) { // Handle end of file or error
+            break;
+        }
         if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, sample_buf, size/cc.channels, cc.channels, 0);
         stream_pos += frame_size;
         bytes_left -= frame_size;
@@ -725,7 +745,8 @@ void play_dir(char *name, char *type, char *regexp, int flag)
         }
         if (regexp) {
             const char *error;
-            Reprog *p = regcomp(regexp, 0, &error);
+            //Reprog *p = regcomp(regexp, 0, &error);
+            Reprog *p = regcomp(regexp, REG_ICASE, &error);
             if (!p) {
                 fprintf(stderr, "regcomp: %s\n", error);
                 return;

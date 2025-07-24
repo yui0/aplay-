@@ -920,12 +920,13 @@ Reprog *regcomp(const char *pattern, int cflags, const char **errorp)
 	g.prog->nsub = g.nsub;
 	g.prog->start = g.prog->end = malloc(n * sizeof (Reinst));
 
-	split = emit(g.prog, I_SPLIT);
+	/* remove "find anywhere" wrapper */
+	/*split = emit(g.prog, I_SPLIT);
 	split->x = split + 3;
 	split->y = split + 1;
 	emit(g.prog, I_ANYNL);
 	jump = emit(g.prog, I_JUMP);
-	jump->x = split;
+	jump->x = split;*/
 	emit(g.prog, I_LPAR);
 	compile(g.prog, node);
 	emit(g.prog, I_RPAR);

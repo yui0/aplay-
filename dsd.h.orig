@@ -67,117 +67,137 @@ int main() {
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
-// ALSA format definitions from aplay+.c, to avoid including alsa/asoundlib.h here
+// ALSA format definitions
 #ifndef SND_PCM_FORMAT_S16_LE
 #define SND_PCM_FORMAT_S16_LE 2
 #endif
 #ifndef SND_PCM_FORMAT_FLOAT_LE
-#define SND_PCM_FORMAT_FLOAT_LE 10
+#define SND_PCM_FORMAT_FLOAT_LE 14
 #endif
 
 #define DSD_SAMPLES_PER_BYTE 8
+#define MAX_CHANNELS 2
+
+// 2次フィルタの状態と係数を定義
+typedef struct {
+    double x1, x2; // 入力の過去値
+    double y1, y2; // 出力の過去値
+} FilterState2;
 
 typedef struct {
-    FILE* file;                  // File handle for streaming
-    uint64_t dsd_data_offset;    // Offset to the start of DSD data in the file
-    uint64_t total_dsd_samples;  // Total DSD samples per channel
-    uint64_t pcm_frames_processed; // Number of PCM frames already processed
+    double a0, a1, a2; // フィードフォワード係数
+    double b1, b2;     // フィードバック係数
+} FilterCoeff2;
 
-    uint64_t totalPCMFrameCount; // Total number of output PCM frames
-    int sample_rate_dsd;         // DSD sample rate
-    int sample_rate_pcm;         // PCM sample rate
-    int channels;                // Number of channels
-    uint32_t block_size_bytes;   // Block size per channel in bytes
+typedef struct {
+    FILE* file;
+    uint64_t dsd_data_offset;
+    uint64_t totalPCMFrameCount;
+    uint64_t pcm_frames_processed;
 
-    // Buffer for one interleaved block group (e.g., L block + R block)
+    int sample_rate_dsd;
+    int sample_rate_pcm;
+    int channels;
+    uint32_t block_size_bytes;
+
     uint8_t* block_buffer;
-    size_t block_buffer_size;    // Total size of the block buffer
-    size_t block_bit_index;      // Current bit index within a channel's block
-    int blocks_read;             // Flag to check if the first block is loaded
+    size_t block_buffer_size;
+    
+    // Indexing and filter state
+    size_t current_dsd_bit_index;
+
+    // 4段階の2次フィルタ
+    FilterState2 filter_state[MAX_CHANNELS][4];
+    FilterCoeff2 filter_coeff;
 
 } DSDDecoder;
 
 #ifdef DSD_DECODER_IMPLEMENTATION
 
-// Helper functions to read little-endian values
-static uint32_t read_le32(const uint8_t* buf) {
-    return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24);
-}
+// Helper functions (no changes)
+static uint32_t read_le32(const uint8_t* buf) { return (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) | ((uint32_t)buf[3] << 24); }
+static uint64_t read_le64(const uint8_t* buf) { return (uint64_t)buf[0] | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) | ((uint64_t)buf[3] << 24) | ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) | ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56); }
 
-static uint64_t read_le64(const uint8_t* buf) {
-    return (uint64_t)buf[0] | ((uint64_t)buf[1] << 8) | ((uint64_t)buf[2] << 16) | ((uint64_t)buf[3] << 24) |
-           ((uint64_t)buf[4] << 32) | ((uint64_t)buf[5] << 40) | ((uint64_t)buf[6] << 48) | ((uint64_t)buf[7] << 56);
-}
-
-// Reads the next interleaved block group from the file into the buffer
 static int dsd_load_next_block(DSDDecoder* decoder) {
     if (!decoder || !decoder->file) return 0;
     size_t bytes_read = fread(decoder->block_buffer, 1, decoder->block_buffer_size, decoder->file);
-    if (bytes_read < decoder->block_buffer_size) {
-        // Could be end of file, which is not necessarily an error
-        return 0;
-    }
-    decoder->block_bit_index = 0;
-    return 1;
+    decoder->current_dsd_bit_index = 0;
+    return bytes_read > 0;
 }
 
-// Initializes the decoder from a file stream
+// フィルタ係数の初期化（簡易バターワースフィルタ）
+static void init_filter_coeff(FilterCoeff2* coeff, double cutoff_freq, double sample_rate_dsd) {
+    double omega = tan(M_PI * cutoff_freq / sample_rate_dsd);
+    double denom = 1.0 + sqrt(2.0) * omega + omega * omega;
+    coeff->a0 = omega * omega / denom;
+    coeff->a1 = 2.0 * coeff->a0;
+    coeff->a2 = coeff->a0;
+    coeff->b1 = 2.0 * (omega * omega - 1.0) / denom;
+    coeff->b2 = (1.0 - sqrt(2.0) * omega + omega * omega) / denom;
+}
+
+// 2次フィルタの適用
+static double apply_filter2(FilterState2* state, FilterCoeff2* coeff, double input) {
+    double output = coeff->a0 * input + coeff->a1 * state->x1 + coeff->a2 * state->x2
+                    - coeff->b1 * state->y1 - coeff->b2 * state->y2;
+    state->x2 = state->x1;
+    state->x1 = input;
+    state->y2 = state->y1;
+    state->y1 = output;
+    return output;
+}
+
 DSDDecoder* dsd_decoder_init_file(FILE* file) {
     if (!file) return NULL;
-
     DSDDecoder* decoder = (DSDDecoder*)calloc(1, sizeof(DSDDecoder));
     if (!decoder) return NULL;
     decoder->file = file;
 
-    // Read and parse headers
+    // --- Header Parsing ---
     uint8_t header_buf[80];
-    if (fread(header_buf, 1, 28, file) != 28 || strncmp((char*)header_buf, "DSD ", 4) != 0) {
-        free(decoder); return NULL;
-    }
+    if (fread(header_buf, 1, 28, file) != 28 || strncmp((char*)header_buf, "DSD ", 4) != 0) { free(decoder); return NULL; }
     uint64_t fmt_chunk_offset = 28;
     fseek(file, fmt_chunk_offset, SEEK_SET);
-    if (fread(header_buf, 1, 52, file) != 52 || strncmp((char*)header_buf, "fmt ", 4) != 0) {
-        free(decoder); return NULL;
-    }
+    if (fread(header_buf, 1, 52, file) != 52 || strncmp((char*)header_buf, "fmt ", 4) != 0) { free(decoder); return NULL; }
 
     uint64_t fmt_chunk_size = read_le64(header_buf + 4);
     decoder->channels = read_le32(header_buf + 24);
     decoder->sample_rate_dsd = read_le32(header_buf + 28);
-    decoder->total_dsd_samples = read_le64(header_buf + 36);
+    uint64_t total_dsd_samples = read_le64(header_buf + 36);
     decoder->block_size_bytes = read_le32(header_buf + 44);
 
-    // Basic validation
-    if (read_le32(header_buf + 32) != 1 || (decoder->channels != 1 && decoder->channels != 2) || decoder->block_size_bytes == 0) {
-        printf("Error: Unsupported DSF format.\n");
-        free(decoder); return NULL;
-    }
+    if (read_le32(header_buf + 32) != 1 || (decoder->channels < 1 || decoder->channels > MAX_CHANNELS) || decoder->block_size_bytes == 0) { free(decoder); return NULL; }
     
-    // Set PCM sample rate
-    if (decoder->sample_rate_dsd == 2822400) decoder->sample_rate_pcm = 44100;
+    /*if (decoder->sample_rate_dsd == 2822400) decoder->sample_rate_pcm = 44100; // 2822400 ÷ 64 = 44100
     else if (decoder->sample_rate_dsd == 5644800) decoder->sample_rate_pcm = 88200;
     else if (decoder->sample_rate_dsd == 11289600) decoder->sample_rate_pcm = 176400;
-    else decoder->sample_rate_pcm = decoder->sample_rate_dsd / 64; // Fallback
+    else decoder->sample_rate_pcm = decoder->sample_rate_dsd / 64;*/
+    if (decoder->sample_rate_dsd == 2822400) decoder->sample_rate_pcm = 88200;
+    else if (decoder->sample_rate_dsd == 5644800) decoder->sample_rate_pcm = 176400;
+    else if (decoder->sample_rate_dsd == 11289600) decoder->sample_rate_pcm = 352800;
+    else decoder->sample_rate_pcm = decoder->sample_rate_dsd / 32;
 
     size_t decimation_factor = decoder->sample_rate_dsd / decoder->sample_rate_pcm;
-    decoder->totalPCMFrameCount = decoder->total_dsd_samples / decimation_factor;
+    decoder->totalPCMFrameCount = total_dsd_samples / decimation_factor;
 
-    // Set up block buffer
     decoder->block_buffer_size = decoder->block_size_bytes * decoder->channels;
     decoder->block_buffer = (uint8_t*)malloc(decoder->block_buffer_size);
-    if (!decoder->block_buffer) {
-        free(decoder); return NULL;
-    }
+    if (!decoder->block_buffer) { free(decoder); return NULL; }
 
-    // Find 'data' chunk and prepare for reading
     fseek(file, fmt_chunk_offset + fmt_chunk_size, SEEK_SET);
     char chunk_id[12];
-    if (fread(chunk_id, 1, 12, file) != 12 || strncmp(chunk_id, "data", 4) != 0) {
-        printf("Error: Could not find 'data' chunk.\n");
-        free(decoder->block_buffer); free(decoder); return NULL;
-    }
-    decoder->dsd_data_offset = ftell(file) - 12;
-    fseek(file, decoder->dsd_data_offset + 12, SEEK_SET); // Position at start of data
+    if (fread(chunk_id, 1, 12, file) != 12 || strncmp(chunk_id, "data", 4) != 0) { free(decoder->block_buffer); free(decoder); return NULL; }
+    fseek(file, ftell(file) - 12 + 12, SEEK_SET);
+
+    // --- Initialize filter ---
+    double cutoff_freq = decoder->sample_rate_pcm / 2.0; // PCMサンプリングレートの半分
+    init_filter_coeff(&decoder->filter_coeff, cutoff_freq, decoder->sample_rate_dsd);
+    // フィルタ状態の初期化
+    memset(decoder->filter_state, 0, sizeof(decoder->filter_state));
+    
+    dsd_load_next_block(decoder);
 
     return decoder;
 }
@@ -189,86 +209,76 @@ void dsd_decoder_free(DSDDecoder* decoder) {
     }
 }
 
-// Decodes DSD frames into PCM using block-based streaming
 size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, void* buffer, int format) {
-    if (!decoder || !buffer || frames_to_read == 0) return 0;
-    if (decoder->pcm_frames_processed >= decoder->totalPCMFrameCount) return 0;
+    if (!decoder || !buffer || frames_to_read == 0 || decoder->pcm_frames_processed >= decoder->totalPCMFrameCount) return 0;
 
     size_t decimation_factor = decoder->sample_rate_dsd / decoder->sample_rate_pcm;
     if (decimation_factor == 0) return 0;
-
-    // Load the first block if it hasn't been loaded yet
-    if (!decoder->blocks_read) {
-        if (!dsd_load_next_block(decoder)) return 0; // Couldn't read first block
-        decoder->blocks_read = 1;
-    }
 
     size_t frames_read = 0;
     int16_t* buffer_s16 = (int16_t*)buffer;
     float* buffer_f32 = (float*)buffer;
     size_t block_size_bits = decoder->block_size_bytes * DSD_SAMPLES_PER_BYTE;
 
+    double filtered[MAX_CHANNELS]; // 各チャンネルのフィルタ出力
     for (size_t i = 0; i < frames_to_read; ++i) {
-        // Check if we need to load the next block group
-        if (decoder->block_bit_index >= block_size_bits) {
-            if (!dsd_load_next_block(decoder)) {
-                goto end_loop; // End of file
-            }
-        }
-        
-        // Process one PCM frame
         for (int ch = 0; ch < decoder->channels; ++ch) {
-#if 1
-            int32_t sum = 0;
-            // Get pointer to the start of the current channel's data in the buffer
             const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
+            double accum = 0.0;
+            size_t start_bit = decoder->current_dsd_bit_index;
 
-            // Sum 'decimation_factor' DSD bits to create one PCM sample
+            // DSDサンプルをフィルタリング
             for (size_t k = 0; k < decimation_factor; ++k) {
-                size_t current_bit = decoder->block_bit_index + k;
-                if (current_bit >= block_size_bits) break; // Should not happen with outer check, but for safety
-
+                size_t current_bit = start_bit + k;
+                if (current_bit >= block_size_bits) {
+                    if (!dsd_load_next_block(decoder)) goto end_loop;
+                    dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
+                    start_bit = 0;
+                    current_bit = k;
+                }
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
                 int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
-                
-                int bit = (dsd_channel_data[byte_idx] >> bit_pos) & 1;
-                sum += bit ? 1 : -1;
+                double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
+
+                // 4段階の2次フィルタを適用
+                double temp = dsd_val;
+                for (int stage = 0; stage < 4; ++stage) {
+                    temp = apply_filter2(&decoder->filter_state[ch][stage], &decoder->filter_coeff, temp);
+                }
+                accum += temp;
             }
-            
-            // Average and scale to get the final PCM sample
-            double pcm_val = (double)sum / decimation_factor;
-#else
-            static const double fir_coeffs[8] = {0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125};
-            double sum = 0.0;
-            const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
-            for (size_t k = 0; k < decimation_factor; ++k) {
-                size_t current_bit = decoder->block_bit_index + k;
-                if (current_bit >= block_size_bits) break;
-                size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
-                int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
-                int bit = (dsd_channel_data[byte_idx] >> bit_pos) & 1;
-                double value = bit ? 1.0 : -1.0;
-                if (k < 8) sum += value * fir_coeffs[k];
-            }
-            double pcm_val = sum;
-#endif
-            // Write to output buffer
+
+            // 平均化してPCM値を取得
+            //filtered[ch] = accum / decimation_factor * 2.0; // スケーリング調整
+            filtered[ch] = accum / decimation_factor * 3.0; // スケーリング調整
+        }
+
+        // PCMバッファに書き込み
+        for (int ch = 0; ch < decoder->channels; ++ch) {
+            double pcm_val = filtered[ch];
             if (format == SND_PCM_FORMAT_FLOAT_LE) {
+                if (pcm_val > 1.0) pcm_val = 1.0;
+                if (pcm_val < -1.0) pcm_val = -1.0;
                 buffer_f32[i * decoder->channels + ch] = (float)pcm_val;
-            } else { // SND_PCM_FORMAT_S16_LE
+            } else {
                 int32_t s16_val = (int32_t)(pcm_val * 32767.0);
                 if (s16_val > 32767) s16_val = 32767;
                 if (s16_val < -32768) s16_val = -32768;
                 buffer_s16[i * decoder->channels + ch] = (int16_t)s16_val;
             }
         }
-        
-        decoder->block_bit_index += decimation_factor;
+
+        decoder->current_dsd_bit_index += decimation_factor;
+        if (decoder->current_dsd_bit_index >= block_size_bits) {
+            if (!dsd_load_next_block(decoder)) {
+                frames_read++;
+                goto end_loop;
+            }
+        }
+
         decoder->pcm_frames_processed++;
         frames_read++;
-        if (decoder->pcm_frames_processed >= decoder->totalPCMFrameCount) {
-             goto end_loop;
-        }
+        if (decoder->pcm_frames_processed >= decoder->totalPCMFrameCount) goto end_loop;
     }
 
 end_loop:

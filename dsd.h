@@ -177,9 +177,13 @@ DSDDecoder* dsd_decoder_init_file(FILE* file) {
     if (read_le32(header_buf + 32) != 1 || (decoder->channels < 1 || decoder->channels > MAX_CHANNELS) || decoder->block_size_bytes == 0) { free(decoder); return NULL; }
     
     // PCMサンプルレートの計算 (デシメーションファクターの調整を検討)
-    if (decoder->sample_rate_dsd == 2822400) decoder->sample_rate_pcm = 88200; // DSD64 -> PCM 88.2kHz (factor 32)
+    /*if (decoder->sample_rate_dsd == 2822400) decoder->sample_rate_pcm = 88200; // DSD64 -> PCM 88.2kHz (factor 32)
     else if (decoder->sample_rate_dsd == 5644800) decoder->sample_rate_pcm = 176400; // DSD128 -> PCM 176.4kHz (factor 32)
     else if (decoder->sample_rate_dsd == 11289600) decoder->sample_rate_pcm = 352800; // DSD256 -> PCM 352.8kHz (factor 32)
+    else decoder->sample_rate_pcm = decoder->sample_rate_dsd / 32; // Fallback, adjust if needed*/
+    if (decoder->sample_rate_dsd == 2822400) decoder->sample_rate_pcm = 176400;
+    else if (decoder->sample_rate_dsd == 5644800) decoder->sample_rate_pcm = 176400;
+    else if (decoder->sample_rate_dsd == 11289600) decoder->sample_rate_pcm = 176400;
     else decoder->sample_rate_pcm = decoder->sample_rate_dsd / 32; // Fallback, adjust if needed
 
     size_t decimation_factor = decoder->sample_rate_dsd / decoder->sample_rate_pcm;
@@ -343,6 +347,7 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
     float* buffer_f32 = (float*)buffer;
     size_t block_size_bits = decoder->block_size_bytes * DSD_SAMPLES_PER_BYTE;
 
+    double scale = decoder->current_scale_factor / decimation_factor;
     double filtered[MAX_CHANNELS]; // 各チャンネルのフィルタ出力
     for (size_t i = 0; i < frames_to_read; ++i) {
         for (int ch = 0; ch < decoder->channels; ++ch) {
@@ -351,6 +356,7 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
             size_t start_bit = decoder->current_dsd_bit_index;
 
             // DSDサンプルをフィルタリング
+            int sum = 0;
             for (size_t k = 0; k < decimation_factor; ++k) {
                 size_t current_bit = start_bit + k;
                 if (current_bit >= block_size_bits) {
@@ -361,31 +367,39 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
                 }
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
                 int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
-                double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
+                //double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
 
                 // 4段階の2次フィルタを適用
-                double temp = dsd_val;
+                /*double temp = dsd_val;
                 for (int stage = 0; stage < 4; ++stage) {
                     temp = apply_filter2(&decoder->filter_state[ch][stage], &decoder->filter_coeff, temp);
                 }
-                accum += temp;
+                accum += temp;*/
+                //accum += dsd_val;
+                //sum += ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1 : -1;
+                sum += ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1 : 0;
             }
 
             // 平均化し、推定されたスケーリング係数を適用
-            filtered[ch] = (accum / decimation_factor) * decoder->current_scale_factor; 
+            //filtered[ch] = (accum / decimation_factor) * decoder->current_scale_factor;
+            //filtered[ch] = sum * scale;
+            //filtered[ch] = ((double)sum / decimation_factor)*2.0-1.0;
+            filtered[ch] = ((double)sum / decimation_factor)*decoder->current_scale_factor-decoder->current_scale_factor/2;
         }
 
         // PCMバッファに書き込み
         for (int ch = 0; ch < decoder->channels; ++ch) {
+                /*double pcm_val = filtered[ch];
+                for (int stage = 0; stage < 4; ++stage) {
+                    pcm_val = apply_filter2(&decoder->filter_state[ch][stage], &decoder->filter_coeff, pcm_val);
+                }*/
             double pcm_val = filtered[ch];
             if (format == SND_PCM_FORMAT_FLOAT_LE) {
-                // クリップ
                 if (pcm_val > 1.0) pcm_val = 1.0;
                 if (pcm_val < -1.0) pcm_val = -1.0;
                 buffer_f32[i * decoder->channels + ch] = (float)pcm_val;
             } else {
                 int32_t s16_val = (int32_t)(pcm_val * 32767.0);
-                // クリップ
                 if (s16_val > 32767) s16_val = 32767;
                 if (s16_val < -32768) s16_val = -32768;
                 buffer_s16[i * decoder->channels + ch] = (int16_t)s16_val;

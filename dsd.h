@@ -289,33 +289,33 @@ static void dsd_decoder_estimate_rms(DSDDecoder* decoder, int format) {
     }
 
 end_estimation_loop:
-    // RMS値を計算し、スケーリング係数を決定
-    double average_rms_sq = 0.0;
-    if (actual_frames_processed > 0) {
-        for (int ch = 0; ch < decoder->channels; ++ch) {
-            average_rms_sq += sum_squares[ch];
+    {
+      // RMS値を計算し、スケーリング係数を決定
+      double average_rms_sq = 0.0;
+      if (actual_frames_processed > 0) {
+          for (int ch = 0; ch < decoder->channels; ++ch) {
+              average_rms_sq += sum_squares[ch];
+          }
+          average_rms_sq /= (actual_frames_processed * decoder->channels);
+      }
+      double estimated_rms = sqrt(average_rms_sq);
+
+      // 目標とするRMS値 (例: PCMフルスケールの-12dBFSに相当)
+      // 0dBFS = 1.0, -6dBFS = 0.5, -12dBFS = 0.25
+      const double TARGET_RMS = 0.25; // 経験的に良いとされる値
+
+      if (estimated_rms > 1e-9) {
+          decoder->current_scale_factor = TARGET_RMS / estimated_rms;
+
+        if (decoder->current_scale_factor < 2.0) {
+            decoder->current_scale_factor = 2.0;
         }
-        average_rms_sq /= (actual_frames_processed * decoder->channels);
-    }
-    double estimated_rms = sqrt(average_rms_sq);
-
-    // 目標とするRMS値 (例: PCMフルスケールの-12dBFSに相当)
-    // 0dBFS = 1.0, -6dBFS = 0.5, -12dBFS = 0.25
-    const double TARGET_RMS = 0.25; // 経験的に良いとされる値
-
-    if (estimated_rms > 1e-9) { // ゼロ割防止
-        decoder->current_scale_factor = TARGET_RMS / estimated_rms;
-    } else {
-        decoder->current_scale_factor = 1.0; // データがほぼ無音の場合
-    }
-
-    // スケーリング係数に下限を設定 (2.0より小さければ2.0に)
-    if (decoder->current_scale_factor < 2.0) {
-        decoder->current_scale_factor = 2.0;
-    }
-    // スケーリング係数に上限を設定する (過度な増幅を防ぐ)
-    if (decoder->current_scale_factor > 4.0) { // 例: 最大4倍まで
-        decoder->current_scale_factor = 4.0;
+        if (decoder->current_scale_factor > 4.0) {
+            decoder->current_scale_factor = 4.0;
+        }
+      } else {
+          decoder->current_scale_factor = 1.0;
+      }
     }
 
     free(temp_pcm_buffer);
@@ -352,10 +352,8 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
     for (size_t i = 0; i < frames_to_read; ++i) {
         for (int ch = 0; ch < decoder->channels; ++ch) {
             const uint8_t* dsd_channel_data = decoder->block_buffer + (ch * decoder->block_size_bytes);
-            double accum = 0.0;
             size_t start_bit = decoder->current_dsd_bit_index;
 
-            // DSDサンプルをフィルタリング
             int sum = 0;
             for (size_t k = 0; k < decimation_factor; ++k) {
                 size_t current_bit = start_bit + k;
@@ -367,22 +365,10 @@ size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, v
                 }
                 size_t byte_idx = current_bit / DSD_SAMPLES_PER_BYTE;
                 int bit_pos = 7 - (current_bit % DSD_SAMPLES_PER_BYTE);
-                //double dsd_val = ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1.0 : -1.0;
 
-                // 4段階の2次フィルタを適用
-                /*double temp = dsd_val;
-                for (int stage = 0; stage < 4; ++stage) {
-                    temp = apply_filter2(&decoder->filter_state[ch][stage], &decoder->filter_coeff, temp);
-                }
-                accum += temp;*/
-                //accum += dsd_val;
-                //sum += ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1 : -1;
                 sum += ((dsd_channel_data[byte_idx] >> bit_pos) & 1) ? 1 : 0;
             }
 
-            // 平均化し、推定されたスケーリング係数を適用
-            //filtered[ch] = (accum / decimation_factor) * decoder->current_scale_factor;
-            //filtered[ch] = sum * scale;
             //filtered[ch] = ((double)sum / decimation_factor)*2.0-1.0;
             filtered[ch] = ((double)sum / decimation_factor)*decoder->current_scale_factor-decoder->current_scale_factor/2;
         }

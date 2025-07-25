@@ -585,43 +585,50 @@ int play_wma(char *name, int flag)
 {
     void *file_data;
     unsigned char *stream_pos;
-    short *sample_buf = malloc(MAX_CODED_SUPERFRAME_SIZE *sizeof(short));
+    short *sample_buf = malloc(MAX_CODED_SUPERFRAME_SIZE * sizeof(short));
     int bytes_left;
 
     int fd = open(name, O_RDONLY);
     if (fd < 0) {
         printf("Error: cannot open `%s`\n", name);
+        free(sample_buf);
         return 1;
     }
 
     int len = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
     file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+
+    if (file_data == MAP_FAILED) {
+        perror("mmap");
+        free(sample_buf);
+        return 1;
+    }
+
     stream_pos = (unsigned char *) file_data;
     bytes_left = len;
 
-    CodecContext cc;
-    // Potentially modify wma_decode_init_fixed or introduce a new function
-    // that takes file_data and bytes_left as arguments for proper initialization.
-    // For example:
-    // if (wma_decode_init_from_data(&cc, stream_pos, bytes_left) < 0) {
-    //     printf("Error: failed to initialize WMA decoder\n");
-    //     munmap(file_data, len);
-    //     close(fd);
-    //     free(sample_buf);
-    //     return 1;
-    // }
+    CodecContext cc = {0};
+    if (parse_wma_header(stream_pos, bytes_left, &cc) != 0) {
+        printf("Error: failed to parse WMA header\n");
+        munmap(file_data, len);
+        free(sample_buf);
+        return 1;
+    }
 
-    // If wma_decode_init_fixed assumes it can read from a global or previously set
-    // stream, then the issue is more fundamental in how uwma.h expects its input.
-    // Assuming wma_decode_init_fixed initializes basic structure, and actual header parsing
-    // happens on the first call to wma_decode_superframe or another function.
-    wma_decode_init_fixed(&cc); // This line is where the problem likely originates
+    if (wma_decode_init_fixed(&cc) < 0) {
+        printf("Error: failed to initialize WMA decoder\n");
+        munmap(file_data, len);
+        free(sample_buf);
+        return 1;
+    }
 
     printf("%dHz %dch\n", cc.sample_rate, cc.channels);
     AUDIO a;
     if (AUDIO_init(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1, 0)) {
+        wma_decode_end(&cc);
         munmap(file_data, len);
-        close(fd);
         free(sample_buf);
         return 1;
     }
@@ -631,31 +638,34 @@ int play_wma(char *name, int flag)
 
     int c = 0;
     printf("\e[?25l");
-    while ((bytes_left >= 0)) {
-        int size;
-        int frame_size = wma_decode_superframe(&cc, stream_pos, &size, (uint8_t*)sample_buf, MAX_CODED_SUPERFRAME_SIZE);
-        if (frame_size <= 0) { // Handle end of file or error
-            break;
+    while (bytes_left > 0) {
+        int out_size;
+        int frame_size = wma_decode_superframe(&cc, stream_pos, &out_size, (uint8_t*)sample_buf, MAX_CODED_SUPERFRAME_SIZE);
+        if (frame_size <= 0) break;
+
+        if (out_size > 0) {
+            if (flag & USE_CROSSTALK) {
+                apply_crosstalk_cancellation(&xtc, sample_buf, out_size / (cc.channels * sizeof(short)), cc.channels, 0);
+            }
+            AUDIO_play(&a, (char*)sample_buf, out_size / (cc.channels * sizeof(short)));
+            AUDIO_wait(&a, 100);
         }
-        if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, sample_buf, size/cc.channels, cc.channels, 0);
+
         stream_pos += frame_size;
         bytes_left -= frame_size;
-        AUDIO_play(&a, (char*)sample_buf, size/cc.channels);
-        AUDIO_wait(&a, 100);
 
         int k = key(&a);
-        if (k=='c') flag ^= USE_CROSSTALK;
+        if (k == 'c') flag ^= USE_CROSSTALK;
         else if (k) break;
 
-        printf("\r%d", c);
-        c += frame_size;
+        printf("\r%d/%d", len - bytes_left, len);
+        fflush(stdout);
     }
-    printf("\e[?25h");
+    printf("\n\e[?25h");
 
     AUDIO_close(&a);
     wma_decode_end(&cc);
     munmap(file_data, len);
-    close(fd);
     free(sample_buf);
     free_crosstalk_cancellation(&xtc);
     return 0;

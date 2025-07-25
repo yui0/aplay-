@@ -4993,5 +4993,53 @@ AVCodec wmav2i_decoder =
         wma_decode_superframe,
     };
 
+#include <stdint.h> // for uint16_t, etc.
+// ASF/WMAヘッダからオーディオプロパティを抽出するヘルパー関数
+// 参考: https://en.wikipedia.org/wiki/Advanced_Systems_Format
+//       https://learn.microsoft.com/en-us/windows/win32/wmformat/audio-media-types
+static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
+    // WaveFormatEx Structure for WMA
+    // WORD  wFormatTag;
+    // WORD  nChannels;
+    // DWORD nSamplesPerSec;
+    // DWORD nAvgBytesPerSec;
+    // WORD  nBlockAlign;
+    // WORD  wBitsPerSample;
+    // WORD  cbSize;
+    
+    // ASFヘッダ内に "WAVEFORMATEX" に相当する構造体を探す。
+    // ここでは簡易的に、よく見られるオフセットにあると仮定して探索します。
+    // "f8 69 9e 53" (Audio Stream) -> "26 00" (size) -> ...
+    // -> "01 01" (WMAv1) or "61 01" (WMAv2)
+    
+    // 簡単な探索例 (堅牢な実装にはより詳細なASFパーサが必要です)
+    for (int i = 0; i < len - 24; ++i) {
+        // "WMA"のwFormatTag (0x0161 for WMAv2, 0x0160 for WMAv1) を探す
+        if ((data[i] == 0x61 || data[i] == 0x60) && data[i+1] == 0x01) {
+            cc->codec_id = data[i] | (data[i+1] << 8);
+            cc->channels = data[i+2] | (data[i+3] << 8);
+            cc->sample_rate = data[i+4] | (data[i+5] << 8) | (data[i+6] << 16) | (data[i+7] << 24);
+            cc->bit_rate = (data[i+8] | (data[i+9] << 8) | (data[i+10] << 16) | (data[i+11] << 24)) * 8;
+            cc->block_align = data[i+12] | (data[i+13] << 8);
+            
+            // Extradataも設定
+            if (cc->codec_id == CODEC_ID_WMAV2 && (i + 24 <= len)) {
+                 cc->extradata_size = data[i+18] | (data[i+19] << 8);
+                 if (cc->extradata_size == 6 && (i + 24 <= len)) {
+                    cc->extradata = &data[i+20];
+                 }
+            }
+            
+            // 妥当な値かチェック
+            if (cc->channels > 0 && cc->channels <= 2 && 
+                cc->sample_rate > 0 && cc->sample_rate < 200000 && 
+                cc->block_align > 0) {
+                return 0; // 成功
+            }
+        }
+    }
+    return -1; // 失敗
+}
+
 #undef UPDATE_CACHE
 #undef BF

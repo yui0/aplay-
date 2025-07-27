@@ -640,7 +640,8 @@ int play_wma(char *name, int flag)
     printf("\e[?25l");
     while (bytes_left > 0) {
         int out_size;
-        int frame_size = wma_decode_superframe(&cc, stream_pos, &out_size, (uint8_t*)sample_buf, MAX_CODED_SUPERFRAME_SIZE);
+        //int frame_size = wma_decode_superframe(&cc, stream_pos, &out_size, (uint8_t*)sample_buf, MAX_CODED_SUPERFRAME_SIZE);
+        int frame_size = wma_decode_superframe(&cc, sample_buf, &out_size, stream_pos, bytes_left);
         if (frame_size <= 0) break;
 
         if (out_size > 0) {

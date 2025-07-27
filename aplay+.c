@@ -701,6 +701,12 @@ int play_aac(char *name, int flag)
     HAACDecoder aac = AACInitDecoder();
     AACSetRawBlockParams(aac, 0, &info);
 
+    // Check if SBR might be active based on sample rate
+    int output_samplerate = info.sampRateCore;
+    if (output_samplerate <= 24000) { // Threshold for assuming HE-AAC/SBR
+        output_samplerate *= 2;
+    }
+
     printf("%dHz %dch\n", info.sampRateCore, info.nChans);
     AUDIO a;
     if (AUDIO_init(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1, 0)) {

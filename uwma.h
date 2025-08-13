@@ -5006,12 +5006,12 @@ static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
     // WORD  nBlockAlign;
     // WORD  wBitsPerSample;
     // WORD  cbSize;
-    
+
     // ASFヘッダ内に "WAVEFORMATEX" に相当する構造体を探す。
     // ここでは簡易的に、よく見られるオフセットにあると仮定して探索します。
     // "f8 69 9e 53" (Audio Stream) -> "26 00" (size) -> ...
     // -> "01 01" (WMAv1) or "61 01" (WMAv2)
-    
+
     // 簡単な探索例 (堅牢な実装にはより詳細なASFパーサが必要です)
     for (int i = 0; i < len - 24; ++i) {
         // "WMA"のwFormatTag (0x0161 for WMAv2, 0x0160 for WMAv1) を探す
@@ -5021,9 +5021,18 @@ static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
             cc->sample_rate = data[i+4] | (data[i+5] << 8) | (data[i+6] << 16) | (data[i+7] << 24);
             cc->bit_rate = (data[i+8] | (data[i+9] << 8) | (data[i+10] << 16) | (data[i+11] << 24)) * 8;
             cc->block_align = data[i+12] | (data[i+13] << 8);
-            
-            // Extradataも設定
-            if (cc->codec_id == CODEC_ID_WMAV2) {
+            uint16_t wBitsPerSample = data[i+14] | (data[i+15] << 8);
+            uint16_t cbSize = data[i+16] | (data[i+17] << 8);
+
+            // extradata を設定（存在すれば）
+            if (cbSize > 0 && i + 18 + cbSize <= len) {
+                cc->extradata = &data[i + 18];
+                cc->extradata_size = cbSize;
+            } else {
+                cc->extradata = NULL;
+                cc->extradata_size = 0;
+            }
+            /*if (cc->codec_id == CODEC_ID_WMAV2) {
                 // Check if there are enough bytes to read the size field (cbSize)
                 if (i + 20 <= len) {
                     uint16_t cbSize = data[i+18] | (data[i+19] << 8);
@@ -5033,17 +5042,17 @@ static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
                         cc->extradata_size = cbSize;
                     }
                 }
-            }
-            
+            }*/
+
             // 妥当な値かチェック
             if (cc->channels > 0 && cc->channels <= 2 && 
                 cc->sample_rate > 0 && cc->sample_rate < 200000 && 
                 cc->block_align > 0) {
-                return 0; // 成功
+                return 0;
             }
         }
     }
-    return -1; // 失敗
+    return -1;
 }
 
 #undef UPDATE_CACHE

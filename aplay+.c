@@ -27,6 +27,12 @@
 #define DSD_DECODER_IMPLEMENTATION
 #include "dsd.h"
 
+// --- Added by ChatGPT: Set cutoff frequency dynamically based on DSD sample rate ---
+extern float dsd_get_cutoff(uint32_t dsd_samplerate);
+static float dsd_cutoff_freq = 0;
+// This variable should be set after reading the DSF file header's sample rate
+
+
 #define PARG_IMPLEMENTATION
 #include "parg.h"
 #include "regexp.h"
@@ -64,6 +70,7 @@ char *dev = "hw:0,0";  // BitPerfect
 #define USE_CROSSTALK 256 // Flag for crosstalk cancellation
 #define USE_TEST_MODE 512 // Flag for test mode
 #define FRAMES        32
+//#define FRAMES        128
 #define MAX_DELAY_SAMPLES 16 // Maximum delay samples for crosstalk (e.g., 71µs at 44.1kHz is ~3 samples)
 
 // Crosstalk cancellation parameters
@@ -588,14 +595,26 @@ int play_wma(char *name, int flag)
     short *sample_buf = malloc(MAX_CODED_SUPERFRAME_SIZE * sizeof(short));
     int bytes_left;
 
+    if (!sample_buf) {
+        fprintf(stderr, "Error: failed to allocate memory for sample buffer\n");
+        return 1;
+    }
+
     int fd = open(name, O_RDONLY);
     if (fd < 0) {
-        printf("Error: cannot open `%s`\n", name);
+        perror("open");
         free(sample_buf);
         return 1;
     }
 
     int len = lseek(fd, 0, SEEK_END);
+    if (len <= 0) {
+        fprintf(stderr, "Error: invalid file size\n");
+        close(fd);
+        free(sample_buf);
+        return 1;
+    }
+
     lseek(fd, 0, SEEK_SET);
     file_data = mmap(0, len, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
@@ -611,14 +630,14 @@ int play_wma(char *name, int flag)
 
     CodecContext cc = {0};
     if (parse_wma_header(stream_pos, bytes_left, &cc) != 0) {
-        printf("Error: failed to parse WMA header\n");
+        fprintf(stderr, "Error: failed to parse WMA header\n");
         munmap(file_data, len);
         free(sample_buf);
         return 1;
     }
 
     if (wma_decode_init_fixed(&cc) < 0) {
-        printf("Error: failed to initialize WMA decoder\n");
+        fprintf(stderr, "Error: failed to initialize WMA decoder\n");
         munmap(file_data, len);
         free(sample_buf);
         return 1;
@@ -627,6 +646,7 @@ int play_wma(char *name, int flag)
     printf("%dHz %dch\n", cc.sample_rate, cc.channels);
     AUDIO a;
     if (AUDIO_init(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1, 0)) {
+        fprintf(stderr, "Error: failed to initialize audio\n");
         wma_decode_end(&cc);
         munmap(file_data, len);
         free(sample_buf);
@@ -636,21 +656,21 @@ int play_wma(char *name, int flag)
     CrosstalkCancel xtc;
     init_crosstalk_cancellation(&xtc, cc.sample_rate, cc.channels);
 
-    int c = 0;
     printf("\e[?25l");
     while (bytes_left > 0) {
-        int out_size;
-        //int frame_size = wma_decode_superframe(&cc, stream_pos, &out_size, (uint8_t*)sample_buf, MAX_CODED_SUPERFRAME_SIZE);
-        int frame_size = wma_decode_superframe(&cc, sample_buf, &out_size, stream_pos, bytes_left);
-        if (frame_size <= 0) break;
+        int out_size = 0;
 
-        if (out_size > 0) {
-            if (flag & USE_CROSSTALK) {
-                apply_crosstalk_cancellation(&xtc, sample_buf, out_size / (cc.channels * sizeof(short)), cc.channels, 0);
-            }
-            AUDIO_play(&a, (char*)sample_buf, out_size / (cc.channels * sizeof(short)));
-            AUDIO_wait(&a, 100);
+        int frame_size = wma_decode_superframe(&cc, sample_buf, &out_size, stream_pos, bytes_left);
+        if (frame_size <= 0 || out_size <= 0) {
+            break;
         }
+
+        if (flag & USE_CROSSTALK) {
+            apply_crosstalk_cancellation(&xtc, sample_buf, out_size / (cc.channels * sizeof(short)), cc.channels, 0);
+        }
+
+        AUDIO_play(&a, (char*)sample_buf, out_size);
+        AUDIO_wait(&a, 100);
 
         stream_pos += frame_size;
         bytes_left -= frame_size;
@@ -698,26 +718,30 @@ int play_aac(char *name, int flag)
     memset(&info, 0, sizeof(AACFrameInfo));
     info.nChans = channels;
     info.sampRateCore = samplerate;
-    info.profile = AAC_PROFILE_LC;
+    info.profile = AAC_PROFILE_LC;  // Consider detecting HE-AAC profile from MP4 'esds' atom if possible
+
     HAACDecoder aac = AACInitDecoder();
     AACSetRawBlockParams(aac, 0, &info);
 
     // Check if SBR might be active based on sample rate
     int output_samplerate = info.sampRateCore;
+    int sbr_enabled = 0;  // NEW: Track if SBR is assumed
     if (output_samplerate <= 24000) { // Threshold for assuming HE-AAC/SBR
         output_samplerate *= 2;
+        sbr_enabled = 1;  // NEW: Explicitly flag SBR (may need to set in decoder if not auto-detected)
     }
 
-    printf("%dHz %dch\n", info.sampRateCore, info.nChans);
+    printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);  // UPDATED: Show both for debugging
+
     AUDIO a;
-    if (AUDIO_init(&a, dev, info.sampRateCore, info.nChans, FRAMES, 1, 0)) {
+    if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {  // FIX: Use output_samplerate here
         free(file_data);
         close(fd);
         return 1;
     }
 
     CrosstalkCancel xtc;
-    init_crosstalk_cancellation(&xtc, info.sampRateCore, info.nChans);
+    init_crosstalk_cancellation(&xtc, output_samplerate, info.nChans);  // UPDATED: Use output_samplerate for crosstalk init
 
     printf("\e[?25l");
     while ((bytes_left >= 0)) {
@@ -726,7 +750,7 @@ int play_aac(char *name, int flag)
         if (!r) {
             AACGetLastFrameInfo(aac, &info);
             if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, sample_buf, AAC_MAX_NSAMPS, info.nChans, 0);
-            AUDIO_play(&a, (char*)sample_buf, AAC_MAX_NSAMPS);
+            AUDIO_play(&a, (char*)sample_buf, AAC_MAX_NSAMPS);  // Note: If SBR active, this is 2048 samples/channel
             AUDIO_wait(&a, 100);
         } else {
             int nextSync = AACFindSyncWord(stream_pos, bytes_left);

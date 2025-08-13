@@ -1,12 +1,9 @@
 /*
 #include <stdio.h>
+#define DSD_DECODER_IMPLEMENTATION
 #include "dsd_decoder.h"
 
 int main() {
-    #define DSD_DECODER_IMPLEMENTATION
-    #include "dsd_decoder.h"
-
-    // DSFファイルの読み込み（例: ファイルから）
     FILE* file = fopen("sample.dsf", "rb");
     if (!file) {
         printf("Failed to open file\n");
@@ -28,7 +25,6 @@ int main() {
         return -1;
     }
 
-    // DSFデータロード
     if (dsd_decoder_load_dsf(decoder, data, size) != 0) {
         printf("Failed to load DSF data\n");
         dsd_decoder_free(decoder);
@@ -48,12 +44,10 @@ int main() {
     size_t pcm_size;
     const int32_t* pcm_data = dsd_decoder_get_pcm_data(decoder, &pcm_size);
 
-    // PCMデータ処理（例: ファイルに保存）
     FILE* out = fopen("output.pcm", "wb");
     fwrite(pcm_data, sizeof(int32_t), pcm_size, out);
     fclose(out);
 
-    // 解放
     dsd_decoder_free(decoder);
     free(data);
     return 0;
@@ -223,7 +217,7 @@ void dsd_decoder_free(DSDDecoder* decoder) {
     }
 }
 
-// RMS推定を実行する新しいヘルパー関数
+// RMS推定
 static void dsd_decoder_estimate_rms(DSDDecoder* decoder, int format) {
     if (decoder->initial_rms_estimation_done) return;
 
@@ -329,7 +323,6 @@ end_estimation_loop:
     decoder->pcm_frames_processed = 0;
     dsd_load_next_block(decoder); // 最初のブロックを再ロード
 }
-
 
 size_t dsd_decoder_read_pcm_frames(DSDDecoder* decoder, size_t frames_to_read, void* buffer, int format) {
     if (!decoder || !buffer || frames_to_read == 0 || decoder->pcm_frames_processed >= decoder->totalPCMFrameCount) return 0;

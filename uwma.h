@@ -4997,6 +4997,7 @@ AVCodec wmav2i_decoder =
 // ASF/WMAヘッダからオーディオプロパティを抽出するヘルパー関数
 // 参考: https://en.wikipedia.org/wiki/Advanced_Systems_Format
 //       https://learn.microsoft.com/en-us/windows/win32/wmformat/audio-media-types
+#if 0
 static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
     // WaveFormatEx Structure for WMA
     // WORD  wFormatTag;
@@ -5054,6 +5055,49 @@ static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
     }
     return -1;
 }
+#else
+static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
+    // ASFヘッダの探索を強化
+    for (int i = 0; i < len - 24; ++i) {
+        // WMAのwFormatTag (0x0160 for WMAv1, 0x0161 for WMAv2)
+        if ((data[i] == 0x60 || data[i] == 0x61) && data[i+1] == 0x01) {
+            cc->codec_id = data[i] | (data[i+1] << 8);
+            cc->channels = data[i+2] | (data[i+3] << 8);
+            cc->sample_rate = data[i+4] | (data[i+5] << 8) | (data[i+6] << 16) | (data[i+7] << 24);
+            cc->bit_rate = (data[i+8] | (data[i+9] << 8) | (data[i+10] << 16) | (data[i+11] << 24)) * 8;
+            cc->block_align = data[i+12] | (data[i+13] << 8);
+            uint16_t wBitsPerSample = data[i+14] | (data[i+15] << 8);
+            uint16_t cbSize = data[i+16] | (data[i+17] << 8);
+
+            // 追加のバリデーション
+            if (cc->channels == 0 || cc->channels > 2) {
+                fprintf(stderr, "Invalid channels: %d\n", cc->channels);
+                return -1;
+            }
+            if (cc->sample_rate < 8000 || cc->sample_rate > 192000) {
+                fprintf(stderr, "Invalid sample rate: %d\n", cc->sample_rate);
+                return -1;
+            }
+            if (cc->block_align == 0) {
+                fprintf(stderr, "Invalid block align\n");
+                return -1;
+            }
+
+            // extradataの設定
+            if (cbSize > 0 && i + 18 + cbSize <= len) {
+                cc->extradata = &data[i + 18];
+                cc->extradata_size = cbSize;
+            } else {
+                cc->extradata = NULL;
+                cc->extradata_size = 0;
+            }
+            return 0;
+        }
+    }
+    fprintf(stderr, "No valid WMA header found\n");
+    return -1;
+}
+#endif
 
 #undef UPDATE_CACHE
 #undef BF

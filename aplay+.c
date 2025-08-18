@@ -19,19 +19,13 @@
 #else
 #include "minimp3.h"
 #endif
-//#define HELIX_FEATURE_AUDIO_CODEC_AAC_SBR
-#define AAC_ENABLE_SBR
+#define HELIX_FEATURE_AUDIO_CODEC_AAC_SBR
+//#define AAC_ENABLE_SBR
 #include "uaac.h"
 #include "uwma.h"
 #include "stb_vorbis.h"
 #define DSD_DECODER_IMPLEMENTATION
 #include "dsd.h"
-
-// --- Added by ChatGPT: Set cutoff frequency dynamically based on DSD sample rate ---
-extern float dsd_get_cutoff(uint32_t dsd_samplerate);
-static float dsd_cutoff_freq = 0;
-// This variable should be set after reading the DSF file header's sample rate
-
 
 #define PARG_IMPLEMENTATION
 #include "parg.h"
@@ -41,13 +35,16 @@ static float dsd_cutoff_freq = 0;
 #include "ls.h"
 #include "kbhit.h"
 
+int verbose = 0;
+float volume = 1.0f;
+int loop_mode = 0;
 int cmd;
 int key(AUDIO *a)
 {
     if (!kbhit()) return 0;
 
     int c = cmd = getchar();
-    printf("%x\n", c);
+    if (verbose) printf("%x\n", c);
     if (c==0x20) {
         snd_pcm_pause(a->handle, 1);
         do {
@@ -128,16 +125,17 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
             float new_right = temp[idx + 1] - xtc->attenuation * delayed_left;
 
             // Clipping prevention
-            if (new_left > 1.0f) new_left = 1.0f;
+            /*if (new_left > 1.0f) new_left = 1.0f;
             if (new_left < -1.0f) new_left = -1.0f;
             if (new_right > 1.0f) new_right = 1.0f;
             if (new_right < -1.0f) new_right = -1.0f;
-
             data[idx] = new_left;
-            data[idx + 1] = new_right;
+            data[idx + 1] = new_right;*/
+            data[idx] = fmaxf(fminf(new_left, 1.0f), -1.0f) * volume;  // Apply volume
+            data[idx + 1] = fmaxf(fminf(new_right, 1.0f), -1.0f) * volume;
         }
     } else { // SND_PCM_FORMAT_S16_LE
-        int16_t *data = (int16_t*)buffer;
+        /*int16_t *data = (int16_t*)buffer;
         float temp[frames * 2];
         float original_temp[frames * 2]; // Store original signal
 
@@ -170,6 +168,31 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
             if (val > 32767.0f) val = 32767.0f;
             if (val < -32768.0f) val = -32768.0f;
             data[i] = (int16_t)val;
+        }*/
+        int16_t *data = (int16_t*)buffer;
+        float temp[frames * 2];
+        for (int i = 0; i < frames * 2; i++) {
+            temp[i] = data[i] / 32768.0f;
+        }
+
+        for (int i = 0; i < frames; i++) {
+            int idx = i * 2;
+            int delay_idx = (xtc->delay_index - xtc->delay_samples * 2 + xtc->delay_buffer_size) % xtc->delay_buffer_size;
+
+            xtc->delay_buffer[xtc->delay_index] = temp[idx];
+            xtc->delay_buffer[xtc->delay_index + 1] = temp[idx + 1];
+            xtc->delay_index = (xtc->delay_index + 2) % xtc->delay_buffer_size;
+
+            float delayed_left = xtc->delay_buffer[delay_idx];
+            float delayed_right = xtc->delay_buffer[delay_idx + 1];
+
+            temp[idx] = (temp[idx] - xtc->attenuation * delayed_right) * volume;
+            temp[idx + 1] = (temp[idx + 1] - xtc->attenuation * delayed_left) * volume;
+        }
+
+        for (int i = 0; i < frames * 2; i++) {
+            float val = temp[i] * 32767.0f;
+            data[i] = (int16_t)fmaxf(fminf(val, 32767.0f), -32768.0f);
         }
     }
 }
@@ -297,6 +320,21 @@ void play_test_mode(int format, int flag)
     free_crosstalk_cancellation(&xtc);
 }
 
+void display_progress(uint64_t current, uint64_t total, int is_time, const char *label)
+{
+    if (total == 0) return;  // Skip if unknown
+    if (is_time) {
+        int cur_sec = (int)(current % 60);
+        int cur_min = (int)(current / 60);
+        int tot_sec = (int)(total % 60);
+        int tot_min = (int)(total / 60);
+        printf("\r%s %02d:%02d / %02d:%02d", label, cur_min, cur_sec, tot_min, tot_sec);
+    } else {
+        printf("\r%s %llu / %llu bytes", label, (unsigned long long)current, (unsigned long long)total);
+    }
+    fflush(stdout);
+}
+
 void play_wav(char *name, int format, int flag)
 {
     drwav wav;
@@ -342,7 +380,10 @@ void play_wav(char *name, int format, int flag)
 void play_flac(char *name, int format, int flag)
 {
     drflac *flac = drflac_open_file(name, NULL);
-    if (!flac) return;
+    if (!flac) {
+        fprintf(stderr, "Failed to open FLAC: %s\n", name);
+        return;
+    }
     printf("%dHz %dbit %dch\n", flac->sampleRate, flac->bitsPerSample, flac->channels);
 
     AUDIO a;
@@ -692,7 +733,7 @@ int play_wma(char *name, int flag)
     return 0;
 }
 
-int play_aac(char *name, int flag)
+/*int play_aac(char *name, int flag)
 {
     unsigned char *file_data;
     unsigned char *stream_pos;
@@ -770,6 +811,103 @@ int play_aac(char *name, int flag)
     close(fd);
     free_crosstalk_cancellation(&xtc);
     return 0;
+}*/
+int play_aac(char *name, int flag)
+{
+    unsigned char *file_data;
+    unsigned char *stream_pos;
+    short sample_buf[AAC_BUF_SIZE*2];
+    int bytes_left;
+
+    int fd = open(name, O_RDONLY);
+    if (fd < 0) {
+        printf("Error: cannot open `%s`\n", name);
+        return 1;
+    }
+
+    int samplerate, channels;
+    file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels);
+    if (!file_data) {
+        printf("Error: cannot read AAC data\n");
+        close(fd);
+        return 1;
+    }
+    stream_pos = file_data;
+
+    AACFrameInfo info;
+    memset(&info, 0, sizeof(AACFrameInfo));
+    info.nChans = channels;
+    info.sampRateCore = samplerate;
+    info.profile = AAC_PROFILE_LC;
+
+    HAACDecoder aac = AACInitDecoder();
+    AACSetRawBlockParams(aac, 0, &info);
+
+    int output_samplerate = info.sampRateCore;
+    int sbr_enabled = 0;
+    if (output_samplerate <= 24000) {
+        output_samplerate *= 2;
+        sbr_enabled = 1;
+    }
+
+    printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
+
+    AUDIO a;
+    if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
+        free(file_data);
+        close(fd);
+        AACFreeDecoder(aac);
+        return 1;
+    }
+
+    CrosstalkCancel xtc;
+    init_crosstalk_cancellation(&xtc, output_samplerate, info.nChans);
+
+    printf("\e[?25l");
+    while (bytes_left > 0) {
+        int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
+        printf("\r%d %d", (int)(stream_pos - file_data), bytes_left);
+        if (!r) {
+            AACGetLastFrameInfo(aac, &info);
+            if (flag & USE_CROSSTALK) apply_crosstalk_cancellation(&xtc, sample_buf, AAC_MAX_NSAMPS, info.nChans, 0);
+            AUDIO_play(&a, (char*)sample_buf, AAC_MAX_NSAMPS);
+            AUDIO_wait(&a, 100);
+        } else {
+            printf("\nAAC decode error %d, attempting resync\n", r);
+            if (!sbr_enabled && info.sampRateCore <= 24000) {
+                printf("Trying HE-AAC with SBR\n");
+                info.sampRateCore *= 2;
+                info.profile = 5; // HE-AAC
+                AACFreeDecoder(aac);
+                aac = AACInitDecoder();
+                AACSetRawBlockParams(aac, 0, &info);
+                stream_pos = file_data;
+                bytes_left = *(&bytes_left);
+                continue;
+            }
+            int nextSync = AACFindSyncWord(stream_pos, bytes_left);
+            if (nextSync >= 0) {
+                stream_pos += nextSync;
+                bytes_left -= nextSync;
+                continue;
+            } else {
+                printf("Failed to resync, stopping\n");
+                break;
+            }
+        }
+
+        int k = key(&a);
+        if (k=='c') flag ^= USE_CROSSTALK;
+        else if (k) break;
+    }
+    printf("\e[?25h");
+
+    AUDIO_close(&a);
+    AACFreeDecoder(aac);
+    free(file_data);
+    close(fd);
+    free_crosstalk_cancellation(&xtc);
+    return 0;
 }
 
 void play_dir(char *name, char *type, char *regexp, int flag)
@@ -778,6 +916,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
     int num, back=0;
     int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
 
+    do {
     LS_LIST *ls = ls_dir(name, flag, &num);
     for (int i=0; i<num; i++) {
         char *e = findExt(ls[i].d_name);
@@ -820,11 +959,12 @@ void play_dir(char *name, char *type, char *regexp, int flag)
         else if (strstr(e, "dsf")) play_dsf(path, format, flag);
         else continue;
 
-        if (cmd=='\\' || cmd=='b') i = back;
+        if (cmd=='\\' || cmd=='p' || cmd=='b') i = back;
         if (cmd=='q' || cmd==0x1b) break;
         back = i-1;
     }
     free(ls);
+    } while (loop_mode);
 }
 
 void set_cpu(char *c)
@@ -852,6 +992,9 @@ void usage(FILE* fp, int argc, char** argv)
         "-s <regexp>        Search files with a regex\n"
         "-t <ext type>      Specify file type (e.g., flac, mp3, wma, dsf...)\n"
         "-p                 Optimize for Linux platforms\n"
+        "-l                 Loop the directory playlist\n"
+        "-v                 Verbose mode\n"
+        "-V <volume>        Set software volume (0.0-1.0, default 1.0)\n"
         "-c                 Enable crosstalk cancellation\n"
         "-T                 Enable test mode (sine wave: left, right, pan)\n"
         "\n",
@@ -869,7 +1012,7 @@ int main(int argc, char *argv[])
     int clock = 0;
 
     parg_init(&ps);
-    while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pcT")) != -1) {
+    while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvTV")) != -1) {
         switch (c) {
         case 1:
             dir = (char*)ps.optarg;
@@ -909,6 +1052,16 @@ int main(int argc, char *argv[])
         case 'T':
             flag |= USE_TEST_MODE;
             printf("Test mode enabled.\n");
+            break;
+        case 'l':
+            loop_mode = 1;
+            break;
+        case 'v':
+            verbose = 1;
+            break;
+        case 'V':
+            volume = atof(ps.optarg);
+            if (volume < 0.0f || volume > 1.0f) volume = 1.0f;
             break;
         case 'h':
             usage(stderr, argc, argv);

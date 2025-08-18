@@ -38,6 +38,7 @@
 int verbose = 0;
 float volume = 1.0f;
 int loop_mode = 0;
+float speaker_distance_m = 0.5;
 int cmd;
 int key(AUDIO *a)
 {
@@ -79,13 +80,24 @@ typedef struct {
     int delay_index;      // Current index in delay buffer
 } CrosstalkCancel;
 
-void init_crosstalk_cancellation(CrosstalkCancel *xtc, int sample_rate, int channels)
+/*void init_crosstalk_cancellation(CrosstalkCancel *xtc, int sample_rate, int channels)
 {
     if (channels != 2) return; // Only support stereo
     xtc->delay_samples = (int)(sample_rate * 0.000071); // 71µs delay
     xtc->attenuation = 0.4f; // Natural effect
     xtc->delay_buffer_size = xtc->delay_samples * 2; // Stereo
     if (xtc->delay_buffer_size < 2) xtc->delay_buffer_size = 2; // Ensure at least 2 samples for stereo
+    xtc->delay_buffer = (float*)calloc(xtc->delay_buffer_size, sizeof(float));
+    xtc->delay_index = 0;
+}*/
+void init_crosstalk_cancellation(CrosstalkCancel *xtc, int sample_rate, int channels)
+{
+    if (channels != 2) return;
+    // 音速343m/sを基準に、スピーカー間距離から遅延を計算
+    xtc->delay_samples = (int)(sample_rate * (speaker_distance_m / 343.0));
+    xtc->attenuation = 0.4f; // デフォルト値
+    xtc->delay_buffer_size = xtc->delay_samples * 2;
+    if (xtc->delay_buffer_size < 2) xtc->delay_buffer_size = 2;
     xtc->delay_buffer = (float*)calloc(xtc->delay_buffer_size, sizeof(float));
     xtc->delay_index = 0;
 }
@@ -967,6 +979,15 @@ void play_dir(char *name, char *type, char *regexp, int flag)
     } while (loop_mode);
 }
 
+#include <sched.h>
+void set_realtime_priority()
+{
+    struct sched_param param;
+    param.sched_priority = sched_get_priority_max(SCHED_FIFO);
+    if (sched_setscheduler(0, SCHED_FIFO, &param) != 0) {
+        perror("Failed to set real-time priority");
+    }
+}
 void set_cpu(char *c)
 {
     char buff[256];
@@ -976,6 +997,24 @@ void set_cpu(char *c)
         if (!fp) continue;
         fprintf(fp, "%s", c);
         fclose(fp);
+    }
+}
+
+void list_alsa_devices()
+{
+    snd_ctl_t *ctl;
+    snd_ctl_card_info_t *info;
+    snd_ctl_card_info_alloca(&info);
+    int card = -1;
+    printf("Available ALSA devices:\n");
+    while (snd_card_next(&card) >= 0 && card >= 0) {
+        char name[32];
+        snprintf(name, sizeof(name), "hw:%d", card);
+        if (snd_ctl_open(&ctl, name, 0) >= 0) {
+            snd_ctl_card_info(ctl, info);
+            printf("Card %d: %s\n", card, snd_ctl_card_info_get_name(info));
+            snd_ctl_close(ctl);
+        }
     }
 }
 
@@ -1012,7 +1051,7 @@ int main(int argc, char *argv[])
     int clock = 0;
 
     parg_init(&ps);
-    while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvTV")) != -1) {
+    while ((c = parg_getopt(&ps, argc, argv, "hd:frxs:t:pclvDTV")) != -1) {
         switch (c) {
         case 1:
             dir = (char*)ps.optarg;
@@ -1041,6 +1080,7 @@ int main(int argc, char *argv[])
                 FILE *fp = fopen("/sys/devices/system/clocksource/clocksource0/current_clocksource", "w");
                 fprintf(fp, "tsc");
                 fclose(fp);
+                set_realtime_priority();
                 set_cpu("performance");
                 clock = 1;
             }
@@ -1063,8 +1103,12 @@ int main(int argc, char *argv[])
             volume = atof(ps.optarg);
             if (volume < 0.0f || volume > 1.0f) volume = 1.0f;
             break;
+        case 'D':
+            speaker_distance_m = atof(ps.optarg);
+            break;
         case 'h':
             usage(stderr, argc, argv);
+            list_alsa_devices();
             return 1;
         }
     }

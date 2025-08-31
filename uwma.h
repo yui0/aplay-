@@ -5057,40 +5057,68 @@ static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
 }
 #else
 static int parse_wma_header(unsigned char* data, int len, CodecContext *cc) {
-    // ASFヘッダの探索を強化
-    for (int i = 0; i < len - 24; ++i) {
-        // WMAのwFormatTag (0x0160 for WMAv1, 0x0161 for WMAv2)
-        if ((data[i] == 0x60 || data[i] == 0x61) && data[i+1] == 0x01) {
-            cc->codec_id = data[i] | (data[i+1] << 8);
-            cc->channels = data[i+2] | (data[i+3] << 8);
-            cc->sample_rate = data[i+4] | (data[i+5] << 8) | (data[i+6] << 16) | (data[i+7] << 24);
-            cc->bit_rate = (data[i+8] | (data[i+9] << 8) | (data[i+10] << 16) | (data[i+11] << 24)) * 8;
-            cc->block_align = data[i+12] | (data[i+13] << 8);
+    // ASF GUIDs for Audio Stream and WaveFormatEx
+    const unsigned char asf_audio_guid[] = {
+        0xF8, 0x69, 0x9E, 0x53, 0x26, 0x5C, 0xCF, 0x11,
+        0xA8, 0xD9, 0x00, 0xAA, 0x00, 0x6C, 0x2A, 0x65
+    };
+
+    for (int i = 0; i < len - 50; ++i) {
+        // Look for ASF Audio Stream GUID
+        if (memcmp(data + i, asf_audio_guid, 16) == 0) {
+            i += 16; // Skip GUID
+            uint64_t data_size = *(uint64_t*)(data + i); // Data size after GUID
+            i += 8; // Skip size field
+            if (i + 18 > len) continue;
+
+            uint16_t wFormatTag = data[i] | (data[i+1] << 8);
+            if (wFormatTag != 0x0160 && wFormatTag != 0x0161) continue; // WMAv1 or WMAv2
+
+            uint16_t nChannels = data[i+2] | (data[i+3] << 8);
+            uint32_t nSamplesPerSec = data[i+4] | (data[i+5] << 8) | (data[i+6] << 16) | (data[i+7] << 24);
+            uint32_t nAvgBytesPerSec = data[i+8] | (data[i+9] << 8) | (data[i+10] << 16) | (data[i+11] << 24);
+            uint16_t nBlockAlign = data[i+12] | (data[i+13] << 8);
             uint16_t wBitsPerSample = data[i+14] | (data[i+15] << 8);
             uint16_t cbSize = data[i+16] | (data[i+17] << 8);
 
-            // 追加のバリデーション
-            if (cc->channels == 0 || cc->channels > 2) {
-                fprintf(stderr, "Invalid channels: %d\n", cc->channels);
-                return -1;
+            // Enhanced validation
+            if (nChannels == 0 || nChannels > 8) {
+                fprintf(stderr, "Invalid channels: %d at offset %d\n", nChannels, i);
+                continue;
             }
-            if (cc->sample_rate < 8000 || cc->sample_rate > 192000) {
-                fprintf(stderr, "Invalid sample rate: %d\n", cc->sample_rate);
-                return -1;
+            if (nSamplesPerSec < 8000 || nSamplesPerSec > 192000) {
+                fprintf(stderr, "Invalid sample rate: %d at offset %d\n", nSamplesPerSec, i);
+                continue;
             }
-            if (cc->block_align == 0) {
-                fprintf(stderr, "Invalid block align\n");
-                return -1;
+            if (nBlockAlign == 0 || nBlockAlign > len) {
+                fprintf(stderr, "Invalid block align: %d at offset %d\n", nBlockAlign, i);
+                continue;
+            }
+            if (nAvgBytesPerSec == 0 || nAvgBytesPerSec > len) {
+                fprintf(stderr, "Invalid avg bytes per sec: %d at offset %d\n", nAvgBytesPerSec, i);
+                continue;
+            }
+            if (wFormatTag == 0x0161 && cbSize < 6) {
+                fprintf(stderr, "Invalid cbSize for WMAv2: %d at offset %d\n", cbSize, i);
+                continue;
             }
 
-            // extradataの設定
+            cc->codec_id = wFormatTag;
+            cc->channels = nChannels;
+            cc->sample_rate = nSamplesPerSec;
+            cc->bit_rate = nAvgBytesPerSec * 8;
+            cc->block_align = nBlockAlign;
+
             if (cbSize > 0 && i + 18 + cbSize <= len) {
-                cc->extradata = &data[i + 18];
+                cc->extradata = data + i + 18;
                 cc->extradata_size = cbSize;
             } else {
                 cc->extradata = NULL;
                 cc->extradata_size = 0;
             }
+
+            fprintf(stderr, "WMA Header: codec_id=0x%04x, channels=%d, sample_rate=%d, bit_rate=%d, block_align=%d, extradata_size=%d\n",
+                    cc->codec_id, cc->channels, cc->sample_rate, cc->bit_rate, cc->block_align, cc->extradata_size);
             return 0;
         }
     }

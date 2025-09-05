@@ -13373,85 +13373,7 @@ printf("type:%x/%x\n",type, ATOM_soun);
 	return firstChunk;
 }
 #endif
-/*uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
-{
-	_ATOM ftyp = uaac_findMp4Atom("ftyp", 0, 0, fd);
-	if (!ftyp.size) return 0; // no mp4/m4a file
-
-	// go through the boxes to find the interesting atoms:
-	uint32_t moov = uaac_findMp4Atom("moov", 0, 1, fd).pos;
-	uint32_t mdia;
-	for (int i=0; i<10; i++) {
-		_ATOM trak = uaac_findMp4Atom("trak", moov + 8, 1, fd);
-		mdia = uaac_findMp4Atom("mdia", trak.pos + 8, 1, fd).pos;
-
-		uint32_t hdlr = uaac_findMp4Atom("hdlr", mdia + 8, 1, fd).pos;
-		uint32_t type = uaac_read32(hdlr + 8 + 0x08, fd);
-
-		if (type == ATOM_soun) break;
-//		if (!trak.pos) return 0; // error
-		moov = trak.pos + trak.size -8;
-		printf("type:%x/%x %x %x\n", type, ATOM_soun, trak.pos, moov);
-		if (!trak.pos) return 0; // error
-	}
-
-	// determine duration:
-//	uint32_t mdhd = uaac_findMp4Atom("mdhd", mdia + 8, 1, fd).pos;
-//	uint32_t timescale = uaac_read32(mdhd + 8 + 0x0c, fd);
-//	unsigned int duration = 1000.0 * ((float)uaac_read32(mdhd + 8 + 0x10, fd) / (float)timescale);
-
-	// MP4-data has no aac-frames, so we have to set the parameters by hand.
-	uint32_t minf = uaac_findMp4Atom("minf", mdia + 8, 1, fd).pos;
-	uint32_t stbl = uaac_findMp4Atom("stbl", minf + 8, 1, fd).pos;
-	// stsd sample description box: - infos to parametrize the decoder
-	_ATOM stsd = uaac_findMp4Atom("stsd", stbl + 8, 1, fd);
-	if (!stsd.size) return 0; // something is not ok
-
-	*channels = uaac_read16(stsd.pos + 8 + 0x20, fd);
-	//uint16_t bits = uaac_read16(stsd.pos + 8 + 0x22); // not used
-	*samplerate = uaac_read32(stsd.pos + 8 + 0x26, fd);
-
-	// stco - chunk offset atom:
-	uint32_t stco = uaac_findMp4Atom("stco", stbl + 8, 1, fd).pos;
-
-	// number of chunks:
-	uint32_t nChunks = uaac_read32(stco + 8 + 0x04, fd);
-
-	uint32_t pos[nChunks];
-	uint32_t size[nChunks];
-	uint32_t stsz = uaac_findMp4Atom("stsz", stbl + 8, 1, fd).pos;
-	uint32_t stsc = uaac_findMp4Atom("stsc", stbl + 8, 1, fd).pos;
-	int samplesPerChunk = uaac_read32(stsc +8+4 +8, fd);
-	if (samplesPerChunk>65535) {
-		printf("error at samplesPerChunk:%d\n", samplesPerChunk);
-		return 0; // something is bad
-	}
-	int c = 0;
-	for (int i=0; i<nChunks-1; i++) {
-		size[i] = 0;
-		for (int j=0; j<samplesPerChunk; j++) {
-			size[i] += uaac_read32(stsz +8+12 +(i*samplesPerChunk+j)*4, fd);
-		}
-		c += size[i];
-		pos[i] = uaac_read32(stco +8+8 +i*4, fd);
-//		printf(" %d", c);
-	}
-//	printf("samplesPerChunk:%d dataSize:%d\n", samplesPerChunk, c);
-	if (uaac_findMp4Atom("mdat", 0, 1, fd).size < c) return 0; // size is not ok
-
-	*len = c;
-	uint8_t *data = (uint8_t*)malloc(c);
-	if (!data) return 0; // memory error!
-	uint8_t *p = data;
-	for (int i=0; i<nChunks-1; i++) {
-		lseek(fd, pos[i], SEEK_SET);
-		read(fd, p, size[i]);
-		p += size[i];
-	}
-
-	return data;
-}*/
-uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
+uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels, int *profile_out)
 {
     _ATOM ftyp = uaac_findMp4Atom("ftyp", 0, 0, fd);
     if (!ftyp.size) {
@@ -13521,6 +13443,7 @@ uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
 
     int sbr_enabled = 0;
     int output_samplerate = *samplerate;
+    int audioObjectType = 0;
     _ATOM esds = uaac_findMp4Atom("esds", stsd.pos + 8 + 0x2C, 1, fd);
     if (esds.size > 0) {
         unsigned char esdsData[esds.size - 8];
@@ -13546,7 +13469,7 @@ uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
 
                 // Parse ASC
                 int bitPos = 0;
-                int audioObjectType = (asc[0] >> 3); // First 5 bits
+                /*int*/ audioObjectType = (asc[0] >> 3); // First 5 bits
                 bitPos += 5;
                 int sfIndex = ((asc[0] & 0x07) << 1) | ((asc[1] >> 7) & 0x01);
                 bitPos += 4;
@@ -13674,7 +13597,14 @@ uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
     free(pos);
     free(size);
 
-    *samplerate = output_samplerate; // Use output rate for ALSA
-    printf("Extracted AAC: %uHz, %dch\n", *samplerate, *channels);
+    *profile_out = AAC_PROFILE_LC;  // Default
+    if (audioObjectType == 5) {
+        sbr_enabled = 1;
+        output_samplerate *= 2;
+        *profile_out = 5;  // HE-AAC
+        printf("Detected HE-AAC with SBR, core samplerate: %uHz, output: %uHz\n", *samplerate, output_samplerate);
+    } else {
+        printf("Extracted AAC: %uHz, %dch\n", *samplerate, *channels);
+    }
     return data;
 }

@@ -13373,6 +13373,7 @@ printf("type:%x/%x\n",type, ATOM_soun);
 	return firstChunk;
 }
 #endif
+#if 1
 uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels, int *profile_out)
 {
     _ATOM ftyp = uaac_findMp4Atom("ftyp", 0, 0, fd);
@@ -13608,3 +13609,39 @@ uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels, int 
     }
     return data;
 }
+#else
+uint8_t *uaac_extract_aac(int fd, int *len, int *samplerate, int *channels)
+{
+	_ATOM ftyp = uaac_findMp4Atom("ftyp", 0, 0, fd);
+	if (!ftyp.size) return 0; // no mp4/m4a file
+	_ATOM free = uaac_findMp4Atom("free", ftyp.pos + ftyp.size, 1, fd);
+	if (!free.size) return 0; // no mp4/m4a file
+
+	_ATOM mdat = uaac_findMp4Atom("mdat", free.pos + free.size, 1, fd);
+	printf("mdat.size: %d\n", mdat.size);
+	*len = mdat.size;
+	uint8_t *data = (uint8_t*)malloc(mdat.size);
+	if (!data) return 0; // memory error!
+
+	ssize_t bytes_read = read(fd, data, mdat.size);
+	printf("bytes_read: %zd\n", bytes_read);
+
+	_ATOM moov = uaac_findMp4Atom("moov", mdat.pos + mdat.size, 0, fd);
+	_ATOM trak = uaac_findMp4Atom("trak", moov.pos + 8, 1, fd);
+	_ATOM mdia = uaac_findMp4Atom("mdia", trak.pos + 8, 1, fd);
+	_ATOM mdhd = uaac_findMp4Atom("mdhd", mdia.pos + 8, 1, fd);
+	_ATOM hdlr = uaac_findMp4Atom("hdlr", mdhd.pos + mdhd.size, 1, fd);
+	_ATOM minf = uaac_findMp4Atom("minf", hdlr.pos + hdlr.size, 1, fd);
+	_ATOM stbl = uaac_findMp4Atom("stbl", minf.pos + 8, 1, fd);
+	_ATOM stsd = uaac_findMp4Atom("stsd", stbl.pos + 8, 1, fd);
+	if (!stsd.size) return 0; // something is not ok
+
+	*channels = uaac_read16(stsd.pos + 8 + 0x20, fd);
+	*samplerate = uaac_read32(stsd.pos + 8 + 0x26, fd);
+
+	printf("channels: %d\n", *channels);
+	printf("samplerate: %d\n", *samplerate);
+
+	return data;
+}
+#endif

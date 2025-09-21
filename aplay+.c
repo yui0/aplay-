@@ -1077,140 +1077,104 @@ int play_wma(char *name, int flag)
 }*/
 int play_aac(char *name, int flag)
 {
-	unsigned char *file_data;
-	unsigned char *stream_pos;
-	short sample_buf[AAC_BUF_SIZE * 2];
-	int bytes_left;
-	int max_resync_attempts = 5;
-	int resync_attempts = 0;
+    unsigned char *file_data;
+    unsigned char *stream_pos;
+    short sample_buf[AAC_BUF_SIZE * 2];
+    int bytes_left;
+    int max_resync_attempts = 5;
+    int resync_attempts = 0;
 
-	int fd = open(name, O_RDONLY);
-	if (fd < 0) {
-		printf("Error: cannot open `%s`\n", name);
-		return 1;
-	}
+    int fd = open(name, O_RDONLY);
+    if (fd < 0) {
+        printf("Error: cannot open `%s`\n", name);
+        return 1;
+    }
 
-	int samplerate, channels, profile;
-	file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels, &profile);
-	if (!file_data) {
-		printf("Error: cannot read AAC data\n");
-		close(fd);
-		return 1;
-	}
-	stream_pos = file_data;
+    int samplerate, channels, profile;
+    file_data = uaac_extract_aac(fd, &bytes_left, &samplerate, &channels, &profile);
+    if (!file_data) {
+        printf("Error: cannot read AAC data\n");
+        close(fd);
+        return 1;
+    }
+    stream_pos = file_data;
 
-	AACFrameInfo info;
-	memset(&info, 0, sizeof(AACFrameInfo));
-	info.nChans = channels;
-	info.sampRateCore = samplerate;
-	info.profile = profile;
+    AACFrameInfo info;
+    memset(&info, 0, sizeof(AACFrameInfo));
+    info.nChans = channels;
+    info.sampRateCore = samplerate;
+    info.profile = profile;
 
-	HAACDecoder aac = AACInitDecoder();
-	AACSetRawBlockParams(aac, 0, &info);
+    HAACDecoder aac = AACInitDecoder();
+    AACSetRawBlockParams(aac, 0, &info);
 
-	int output_samplerate = samplerate;
-	int sbr_enabled = (profile == 5);
-	if (sbr_enabled) {
-		output_samplerate *= 2;
-	} else if (samplerate <= 24000) {
-		sbr_enabled = 1;
-		info.profile = 5;
-		output_samplerate *= 2;
-		printf("Assuming potential HE-AAC with SBR, output samplerate: %dHz\n", output_samplerate);
-	}
-	printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
+    int output_samplerate = samplerate;
+    int sbr_enabled = (profile == 5);
+    if (sbr_enabled) {
+        output_samplerate *= 2;
+    } else if (samplerate <= 24000) {
+        sbr_enabled = 1;
+        info.profile = 5;
+        output_samplerate *= 2;
+        printf("Assuming potential HE-AAC with SBR, output samplerate: %dHz\n", output_samplerate);
+    }
+    printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
 
-	AUDIO a;
-	if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
-		printf("Error: failed to initialize ALSA with %dHz, %dch\n", output_samplerate, info.nChans);
-		free(file_data);
-		close(fd);
-		AACFreeDecoder(aac);
-		return 1;
-	}
+    AUDIO a;
+    if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
+        printf("Error: failed to initialize ALSA with %dHz, %dch\n", output_samplerate, info.nChans);
+        free(file_data);
+        close(fd);
+        AACFreeDecoder(aac);
+        return 1;
+    }
 
-	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, output_samplerate, info.nChans);
+    CrosstalkCancel xtc;
+    init_crosstalk_cancellation(&xtc, output_samplerate, info.nChans);
 
-	printf("\e[?25l");
-	while (bytes_left > 0) {
-		int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
-		if (verbose) {
-			printf("\rDecoded %d bytes, %d bytes left, result=%d\n", (int)(stream_pos - file_data), bytes_left, r);
-		} else {
-			printf("\r%d/%d", (int)(stream_pos - file_data), bytes_left + (int)(stream_pos - file_data));
-		}
-		if (!r) {
-			resync_attempts = 0; // Reset on successful decode
-			AACGetLastFrameInfo(aac, &info);
-			int samples_per_frame = sbr_enabled ? 2048 : 1024; // Samples per channel
-			if (verbose) {
-				printf("Frame: %d samples/channel, %d channels, %dHz\n", samples_per_frame, info.nChans, info.sampRateCore);
-			}
-			int frames = samples_per_frame; // Samples per channel
-			if (flag & USE_CROSSTALK) {
-				apply_crosstalk_cancellation(&xtc, sample_buf, frames, info.nChans, 0);
-			}
-			AUDIO_play(&a, (char*)sample_buf, frames);
-			AUDIO_wait(&a, 100);
-		} else {
-			printf("\nAAC decode error %d, attempting resync (%d/%d)\n", r, resync_attempts + 1, max_resync_attempts);
-			if (!sbr_enabled && info.sampRateCore <= 24000) {
-				printf("Trying HE-AAC with SBR\n");
-				sbr_enabled = 1;
-				output_samplerate = info.sampRateCore * 2; // Double output only
-				info.profile = 5; // HE-AAC
-				AACFreeDecoder(aac);
-				aac = AACInitDecoder();
-				AACSetRawBlockParams(aac, 0, &info); // Same core rate
-				stream_pos = file_data;
-				bytes_left = *(&bytes_left); // Reset to start
-				// Reinitialize ALSA with new output samplerate
-				AUDIO_close(&a);
-				if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
-					printf("Error: failed to reinitialize ALSA with %dHz\n", output_samplerate);
-					free(file_data);
-					close(fd);
-					AACFreeDecoder(aac);
-					free_crosstalk_cancellation(&xtc);
-					return 1;
-				}
-				continue;
-			}
-			int nextSync = AACFindSyncWord(stream_pos, bytes_left);
-			if (nextSync >= 0) {
-				stream_pos += nextSync;
-				bytes_left -= nextSync;
-				resync_attempts = 0;
-				continue;
-			} else if (++resync_attempts < max_resync_attempts) {
-				stream_pos += 1;
-				bytes_left -= 1;
-				if (verbose) {
-					printf("Skipping 1 byte, %d bytes left\n", bytes_left);
-				}
-				continue;
-			} else {
-				printf("Failed to resync after %d attempts, stopping\n", max_resync_attempts);
-				break;
-			}
-		}
+    printf("\e[?25l");
+    while (bytes_left > 0) {
+        int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
+        if (verbose) {
+            printf("\rDecoded %d bytes, %d bytes left, result=%d\n", (int)(stream_pos - file_data), bytes_left, r);
+        } else {
+            printf("\r%d/%d", (int)(stream_pos - file_data), bytes_left + (int)(stream_pos - file_data));
+        }
+        if (!r) {
+            resync_attempts = 0; // Reset on successful decode
+            AACGetLastFrameInfo(aac, &info);
+            int samples_per_frame = sbr_enabled ? 2048 : 1024; // Samples per channel
+            if (verbose) {
+                printf("Frame: %d samples/channel, %d channels, %dHz\n", samples_per_frame, info.nChans, info.sampRateCore);
+            }
+            int frames = samples_per_frame; // Samples per channel
+            if (flag & USE_CROSSTALK) {
+                apply_crosstalk_cancellation(&xtc, sample_buf, frames, info.nChans, 0);
+            }
+            AUDIO_play(&a, (char*)sample_buf, frames);
+            AUDIO_wait(&a, 100);
+        } else {
+            printf("\nAAC decode error %d\n", r);
+            // For raw AAC (MP4), do not attempt ADTS-based resync—just stop on error.
+            // If this is an ADTS file (.aac), you could add conditional resync logic here.
+            break;
+        }
 
-		int k = key(&a);
-		if (k == 'c') {
-			flag ^= USE_CROSSTALK;
-		} else if (k) {
-			break;
-		}
-	}
-	printf("\e[?25h");
+        int k = key(&a);
+        if (k == 'c') {
+            flag ^= USE_CROSSTALK;
+        } else if (k) {
+            break;
+        }
+    }
+    printf("\e[?25h");
 
-	AUDIO_close(&a);
-	AACFreeDecoder(aac);
-	free(file_data);
-	close(fd);
-	free_crosstalk_cancellation(&xtc);
-	return 0;
+    AUDIO_close(&a);
+    AACFreeDecoder(aac);
+    free(file_data);
+    close(fd);
+    free_crosstalk_cancellation(&xtc);
+    return 0;
 }
 
 void play_dir(char *name, char *type, char *regexp, int flag)

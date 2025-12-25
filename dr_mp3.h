@@ -1,6 +1,6 @@
 /*
 MP3 audio decoder. Choice of public domain or MIT-0. See license statements at the end of this file.
-dr_mp3 - v0.7.2 - TBD
+dr_mp3 - v0.7.3 - TBD
 
 David Reid - mackron@gmail.com
 
@@ -72,7 +72,7 @@ extern "C" {
 
 #define DRMP3_VERSION_MAJOR     0
 #define DRMP3_VERSION_MINOR     7
-#define DRMP3_VERSION_REVISION  2
+#define DRMP3_VERSION_REVISION  3
 #define DRMP3_VERSION_STRING    DRMP3_XSTRINGIFY(DRMP3_VERSION_MAJOR) "." DRMP3_XSTRINGIFY(DRMP3_VERSION_MINOR) "." DRMP3_XSTRINGIFY(DRMP3_VERSION_REVISION)
 
 #include <stddef.h> /* For size_t. */
@@ -1234,7 +1234,7 @@ static float drmp3_L3_ldexp_q2(float y, int exp_q2)
 I've had reports of GCC 14 throwing an incorrect -Wstringop-overflow warning here. This is an attempt
 to silence this warning.
 */
-#if (defined(__GNUC__) && (__GNUC__ >= 14)) && !defined(__clang__)
+#if (defined(__GNUC__) && (__GNUC__ >= 13)) && !defined(__clang__)
     #pragma GCC diagnostic push
     #pragma GCC diagnostic ignored "-Wstringop-overflow"
 #endif
@@ -1299,7 +1299,7 @@ static void drmp3_L3_decode_scalefactors(const drmp3_uint8 *hdr, drmp3_uint8 *is
         scf[i] = drmp3_L3_ldexp_q2(gain, iscf[i] << scf_shift);
     }
 }
-#if (defined(__GNUC__) && (__GNUC__ >= 14)) && !defined(__clang__)
+#if (defined(__GNUC__) && (__GNUC__ >= 13)) && !defined(__clang__)
     #pragma GCC diagnostic pop
 #endif
 
@@ -3018,23 +3018,27 @@ static drmp3_bool32 drmp3_init_internal(drmp3* pMP3, drmp3_read_proc onRead, drm
                                 ((drmp3_uint32)ape[26] << 16) |
                                 ((drmp3_uint32)ape[27] << 24);
 
-                            streamEndOffset -= 32 + tagSize;
-                            streamLen       -= 32 + tagSize;
-                            
-                            /* Fire a metadata callback for the APE data. Must include both the main content and footer. */
-                            if (onMeta != NULL) {
-                                /* We first need to seek to the start of the APE tag. */
-                                if (onSeek(pUserData, streamEndOffset, DRMP3_SEEK_END)) {
-                                    size_t apeTagSize = (size_t)tagSize + 32;
-                                    drmp3_uint8* pTagData = (drmp3_uint8*)drmp3_malloc(apeTagSize, pAllocationCallbacks);
-                                    if (pTagData != NULL) {
-                                        if (onRead(pUserData, pTagData, apeTagSize) == apeTagSize) {
-                                            drmp3__on_meta(pMP3, DRMP3_METADATA_TYPE_APE, pTagData, apeTagSize);
-                                        }
+                            if (32 + tagSize < streamLen) {
+                                streamEndOffset -= 32 + tagSize;
+                                streamLen       -= 32 + tagSize;
+                                
+                                /* Fire a metadata callback for the APE data. Must include both the main content and footer. */
+                                if (onMeta != NULL) {
+                                    /* We first need to seek to the start of the APE tag. */
+                                    if (onSeek(pUserData, streamEndOffset, DRMP3_SEEK_END)) {
+                                        size_t apeTagSize = (size_t)tagSize + 32;
+                                        drmp3_uint8* pTagData = (drmp3_uint8*)drmp3_malloc(apeTagSize, pAllocationCallbacks);
+                                        if (pTagData != NULL) {
+                                            if (onRead(pUserData, pTagData, apeTagSize) == apeTagSize) {
+                                                drmp3__on_meta(pMP3, DRMP3_METADATA_TYPE_APE, pTagData, apeTagSize);
+                                            }
 
-                                        drmp3_free(pTagData, pAllocationCallbacks);
+                                            drmp3_free(pTagData, pAllocationCallbacks);
+                                        }
                                     }
                                 }
+                            } else {
+                                /* The tag size is larger than the stream. Invalid APE tag. */
                             }
                         }
                     }
@@ -4800,6 +4804,8 @@ static float* drmp3__full_read_and_close_f32(drmp3* pMP3, drmp3_config* pConfig,
             pNewFrames = (float*)drmp3__realloc_from_callbacks(pFrames, (size_t)newFramesBufferSize, (size_t)oldFramesBufferSize, &pMP3->allocationCallbacks);
             if (pNewFrames == NULL) {
                 drmp3__free_from_callbacks(pFrames, &pMP3->allocationCallbacks);
+                pFrames = NULL;
+                totalFramesRead = 0;
                 break;
             }
 
@@ -4867,6 +4873,8 @@ static drmp3_int16* drmp3__full_read_and_close_s16(drmp3* pMP3, drmp3_config* pC
             pNewFrames = (drmp3_int16*)drmp3__realloc_from_callbacks(pFrames, (size_t)newFramesBufferSize, (size_t)oldFramesBufferSize, &pMP3->allocationCallbacks);
             if (pNewFrames == NULL) {
                 drmp3__free_from_callbacks(pFrames, &pMP3->allocationCallbacks);
+                pFrames = NULL;
+                totalFramesRead = 0;
                 break;
             }
 
@@ -5001,9 +5009,13 @@ DIFFERENCES BETWEEN minimp3 AND dr_mp3
 /*
 REVISION HISTORY
 ================
-v0.7.2 - TBD
+v0.7.3 - TBD
+  - Fix an error in drmp3_open_and_read_pcm_frames_s16() and family when memory allocation fails.
+
+v0.7.2 - 2025-12-02
   - Reduce stack space to improve robustness on embedded systems.
   - Fix a compilation error with MSVC Clang toolset relating to cpuid.
+  - Fix an error with APE tag parsing.
 
 v0.7.1 - 2025-09-10
   - Silence a warning with GCC.

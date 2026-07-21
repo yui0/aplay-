@@ -1,4 +1,4 @@
-// ©2017-2026 Yuichiro Nakada
+// ©2017-2025 Yuichiro Nakada
 // clang -Os -o aplay+ aplay+.c -lasound
 
 #include <stdio.h>
@@ -34,18 +34,13 @@
 #include "random.h"
 #include "ls.h"
 #include "kbhit.h"
-#include "tui.h"
 
 int verbose = 0;
 float volume = 1.0f;
 int loop_mode = 0;
 float speaker_distance_m = 0.5;
 int cmd;
-int track_index = 0, track_total = 0; // current position in the playlist, for the TUI panel
-
-// `ts`, if non-NULL, is re-rendered immediately on pause/resume so the TUI
-// panel reflects the paused state instead of freezing silently.
-int key(AUDIO *a, tui_state_t *ts)
+int key(AUDIO *a)
 {
 	if (!kbhit()) {
 		return 0;
@@ -57,10 +52,6 @@ int key(AUDIO *a, tui_state_t *ts)
 	}
 	if (c==0x20) {
 		snd_pcm_pause(a->handle, 1);
-		if (ts) {
-			ts->paused = 1;
-			tui_render(ts);
-		}
 		do {
 			usleep(1000); // us
 		} while (!kbhit());
@@ -68,10 +59,6 @@ int key(AUDIO *a, tui_state_t *ts)
 		cmd = 0;
 		snd_pcm_pause(a->handle, 0);
 		snd_pcm_prepare(a->handle);
-		if (ts) {
-			ts->paused = 0;
-			tui_render(ts);
-		}
 		return 0;
 	}
 
@@ -232,23 +219,26 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
 	}
 }
 
-void print_test_mode_status(int phase, int flag, CrosstalkCancel *xtc, int sample_rate, int channels)
+void print_test_mode_status(int phase, int flag, CrosstalkCancel *xtc)
 {
-	static const char *phase_name[3] = {"Left channel", "Right channel", "Panning L->R"};
-	tui_state_t ts = {0};
-	ts.filename = phase_name[phase];
-	ts.codec = "TEST";
-	ts.rate = sample_rate;
-	ts.channels = channels;
-	ts.device = dev;
-	ts.use_time = 0;
-	ts.unit = "";
-	ts.volume = volume;
-	ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-	ts.xtc_atten = xtc->attenuation;
-	ts.loop_mode = loop_mode;
-	ts.note = "[+/-] adjust attenuation";
-	tui_render(&ts);
+	printf("\r\e[K");
+
+	if (phase == 0) {
+		printf("Phase: Left channel   | ");
+	} else if (phase == 1) {
+		printf("Phase: Right channel  | ");
+	} else {
+		printf("Phase: Panning L->R | ");
+	}
+
+	if (flag & USE_CROSSTALK) {
+		printf("Crosstalk: ON (%.2f) | ", xtc->attenuation);
+	} else {
+		printf("Crosstalk: OFF        | ");
+	}
+
+	printf("Keys: [c]toggle-xtalk, [+,-]adjust, [q]uit");
+	fflush(stdout);
 }
 
 void play_test_mode(int format, int flag)
@@ -279,10 +269,10 @@ void play_test_mode(int format, int flag)
 	uint64_t global_sample_index = 0;
 	int phase_sample_index = 0;
 	int phase = 0;
-	tui_open();
-	print_test_mode_status(phase, flag, &xtc, sample_rate, channels);
+	printf("\e[?25l");
+	print_test_mode_status(phase, flag, &xtc);
 	while (1) {
-		int k = key(&a, NULL);
+		int k = key(&a);
 		if (k) {
 			if (k == 'q' || k == 0x1b) {
 				break;
@@ -302,7 +292,7 @@ void play_test_mode(int format, int flag)
 					xtc.attenuation = 0.0f;
 				}
 			}
-			print_test_mode_status(phase, flag, &xtc, sample_rate, channels);
+			print_test_mode_status(phase, flag, &xtc);
 		}
 
 		void *output_buffer = a.buffer;
@@ -353,10 +343,10 @@ void play_test_mode(int format, int flag)
 		if (phase_sample_index >= frames_per_phase) {
 			phase_sample_index = 0;
 			phase = (phase + 1) % total_phases;
-			print_test_mode_status(phase, flag, &xtc, sample_rate, channels);
+			print_test_mode_status(phase, flag, &xtc);
 		}
 	}
-	tui_close();
+	printf("\n\e[?25h");
 
 	AUDIO_close(&a);
 	free_crosstalk_cancellation(&xtc);
@@ -383,6 +373,8 @@ void play_wav(char *name, int format, int flag)
 {
 	drwav wav;
 	if (drwav_init_file(&wav, name, NULL)) {
+		printf("%dHz %dch\n", wav.sampleRate, wav.channels);
+
 		AUDIO a;
 		if (AUDIO_init(&a, dev, wav.sampleRate, wav.channels, FRAMES, 1, format)) {
 			return;
@@ -394,48 +386,33 @@ void play_wav(char *name, int format, int flag)
 		uint64_t (*func)(drwav* pWav, drflac_uint64 framesToRead, void* pBufferOut);
 		if (format) {
 			func = (uint64_t (*)(drwav *, drflac_uint64, void *))drwav_read_pcm_frames_f32;
+			printf(" with FLOAT 32bit\n");
 		} else {
 			func = (uint64_t (*)(drwav *, drflac_uint64, void *))drwav_read_pcm_frames_s16;
 		}
 
-		tui_state_t ts = {0};
-		ts.track_index = track_index;
-		ts.track_total = track_total;
-		ts.filename = name;
-		ts.codec = format ? "WAV/F32" : "WAV";
-		ts.rate = wav.sampleRate;
-		ts.bits = format ? 32 : 16;
-		ts.channels = wav.channels;
-		ts.device = dev;
-		ts.use_time = 1;
-		ts.total = wav.totalPCMFrameCount > 0 ? (double)wav.totalPCMFrameCount / wav.sampleRate : 0.0;
-		ts.volume = volume;
-		ts.loop_mode = loop_mode;
-
-		uint64_t c = 0;
-		tui_open();
+		int c = 0;
+		printf("\e[?25l");
 		size_t n; // numberOfSamplesActuallyDecoded
 		while ((n = func(&wav, a.frames, (drwav_int16*)a.buffer)) > 0) {
+			if (n!=a.frames) {
+				printf("!");
+			}
 			if (flag & USE_CROSSTALK) {
 				apply_crosstalk_cancellation(&xtc, a.buffer, a.frames, wav.channels, format);
 			}
 			AUDIO_play0(&a);
 			AUDIO_wait(&a, 100);
-			int k = key(&a, &ts);
+			int k = key(&a);
 			if (k=='c') {
 				flag ^= USE_CROSSTALK;
 			} else if (k) {
 				break;
 			}
 
+			printf("\r%d/%llu", c, wav.totalPCMFrameCount);
 			c += n;
-			ts.cur = (double)c / wav.sampleRate;
-			ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-			ts.xtc_atten = xtc.attenuation;
-			ts.note = (n != a.frames) ? "! short read" : NULL;
-			tui_render(&ts);
 		}
-		tui_close();
 
 		AUDIO_close(&a);
 		drwav_uninit(&wav);
@@ -450,6 +427,7 @@ void play_flac(char *name, int format, int flag)
 		fprintf(stderr, "Failed to open FLAC: %s\n", name);
 		return;
 	}
+	printf("%dHz %dbit %dch\n", flac->sampleRate, flac->bitsPerSample, flac->channels);
 
 	AUDIO a;
 	if (AUDIO_init(&a, dev, flac->sampleRate, flac->channels, FRAMES, 1, format)) {
@@ -463,26 +441,13 @@ void play_flac(char *name, int format, int flag)
 	uint64_t (*func)(drflac* pFlac, drflac_uint64 framesToRead, void* pBufferOut);
 	if (format) {
 		func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_f32;
+		printf(" with FLOAT 32bit\n");
 	} else {
 		func = (uint64_t (*)(drflac *, drflac_uint64, void *))drflac_read_pcm_frames_s16;
 	}
 
-	tui_state_t ts = {0};
-	ts.track_index = track_index;
-	ts.track_total = track_total;
-	ts.filename = name;
-	ts.codec = "FLAC";
-	ts.rate = flac->sampleRate;
-	ts.bits = format ? 32 : flac->bitsPerSample;
-	ts.channels = flac->channels;
-	ts.device = dev;
-	ts.use_time = 1;
-	ts.total = flac->totalPCMFrameCount > 0 ? (double)flac->totalPCMFrameCount / flac->sampleRate : 0.0;
-	ts.volume = volume;
-	ts.loop_mode = loop_mode;
-
-	uint64_t c = 0;
-	tui_open();
+	int c = 0;
+	printf("\e[?25l");
 	size_t n; // numberOfSamplesActuallyDecoded
 	while ((n = func(flac, a.frames, (void*)a.buffer)) > 0) {
 		if (flag & USE_CROSSTALK) {
@@ -490,20 +455,17 @@ void play_flac(char *name, int format, int flag)
 		}
 		AUDIO_play0(&a);
 		AUDIO_wait(&a, 100);
-		int k = key(&a, &ts);
+		int k = key(&a);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
 		} else if (k) {
 			break;
 		}
 
+		printf("\r%d/%llu", c, flac->totalPCMFrameCount);
 		c += n;
-		ts.cur = (double)c / flac->sampleRate;
-		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-		ts.xtc_atten = xtc.attenuation;
-		tui_render(&ts);
 	}
-	tui_close();
+	printf("\e[?25h");
 
 	AUDIO_close(&a);
 	drflac_close(flac);
@@ -526,6 +488,13 @@ void play_dsf(char *name, int format, int flag)
 		return;
 	}
 
+	printf("%dHz %dch\n", decoder->sample_rate_pcm, decoder->channels);
+	if (format == SND_PCM_FORMAT_FLOAT_LE) {
+		printf(" with FLOAT 32bit\n");
+	} else {
+		printf(" with S16_LE 16bit\n");
+	}
+
 	AUDIO a;
 	if (AUDIO_init(&a, dev, decoder->sample_rate_pcm, decoder->channels, FRAMES, 1, format)) {
 		dsd_decoder_free(decoder);
@@ -536,25 +505,14 @@ void play_dsf(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, decoder->sample_rate_pcm, decoder->channels);
 
-	tui_state_t ts = {0};
-	ts.track_index = track_index;
-	ts.track_total = track_total;
-	ts.filename = name;
-	ts.codec = "DSF";
-	ts.rate = decoder->sample_rate_pcm;
-	ts.bits = format == SND_PCM_FORMAT_FLOAT_LE ? 32 : 16;
-	ts.channels = decoder->channels;
-	ts.device = dev;
-	ts.use_time = 1;
-	ts.total = decoder->totalPCMFrameCount > 0 ?
-	           (double)decoder->totalPCMFrameCount / decoder->sample_rate_pcm : 0.0;
-	ts.volume = volume;
-	ts.loop_mode = loop_mode;
-
 	uint64_t frames_played = 0;
-	tui_open();
+	printf("\e[?25l");
 	size_t n;
 	while ((n = dsd_decoder_read_pcm_frames(decoder, a.frames, a.buffer, format)) > 0) {
+		if (n != a.frames) {
+			printf("!");        // Can happen at the end of the file
+		}
+
 		if (flag & USE_CROSSTALK) {
 			apply_crosstalk_cancellation(&xtc, a.buffer, n, decoder->channels, format);
 		}
@@ -562,7 +520,7 @@ void play_dsf(char *name, int format, int flag)
 		AUDIO_play0(&a);
 		AUDIO_wait(&a, 100);
 
-		int k = key(&a, &ts);
+		int k = key(&a);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
 		} else if (k) {
@@ -570,13 +528,10 @@ void play_dsf(char *name, int format, int flag)
 		}
 
 		frames_played += n;
-		ts.cur = (double)frames_played / decoder->sample_rate_pcm;
-		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-		ts.xtc_atten = xtc.attenuation;
-		ts.note = (n != a.frames) ? "! short read (end of file)" : NULL;
-		tui_render(&ts);
+		printf("\r%lu/%lu", frames_played, decoder->totalPCMFrameCount);
+		fflush(stdout);
 	}
-	tui_close();
+	printf("\n\e[?25h");
 
 	AUDIO_close(&a);
 	dsd_decoder_free(decoder);
@@ -593,6 +548,7 @@ int play_mp3(char *name, int format, int flag)
 		return 1;
 	}
 
+	printf("%dHz %dch\n", mp3.sampleRate, mp3.channels);
 	AUDIO a;
 	if (AUDIO_init(&a, dev, mp3.sampleRate, mp3.channels, FRAMES, 1, format)) {
 		return 1;
@@ -604,28 +560,14 @@ int play_mp3(char *name, int format, int flag)
 	uint64_t (*func)(drmp3*, drflac_uint64, void*);
 	if (format) {
 		func = (uint64_t (*)(drmp3 *, drflac_uint64, void *))drmp3_read_pcm_frames_f32;
+		printf(" with FLOAT 32bit\n");
 	} else {
 		func = (uint64_t (*)(drmp3 *, drflac_uint64, void *))drmp3_read_pcm_frames_s16;
 	}
 
-	drmp3_uint64 totalPCMFrameCount = drmp3_get_pcm_frame_count(&mp3);
-
-	tui_state_t ts = {0};
-	ts.track_index = track_index;
-	ts.track_total = track_total;
-	ts.filename = name;
-	ts.codec = "MP3";
-	ts.rate = mp3.sampleRate;
-	ts.bits = format ? 32 : 16;
-	ts.channels = mp3.channels;
-	ts.device = dev;
-	ts.use_time = 1;
-	ts.total = totalPCMFrameCount > 0 ? (double)totalPCMFrameCount / mp3.sampleRate : 0.0;
-	ts.volume = volume;
-	ts.loop_mode = loop_mode;
-
-	uint64_t c = 0;
-	tui_open();
+	int totalPCMFrameCount = drmp3_get_pcm_frame_count(&mp3);
+	int c = 0;
+	printf("\e[?25l");
 	size_t n;
 	while ((n = func(&mp3, a.frames, (drmp3_int16*)a.buffer)) > 0) {
 		if (flag & USE_CROSSTALK) {
@@ -633,20 +575,17 @@ int play_mp3(char *name, int format, int flag)
 		}
 		AUDIO_play0(&a);
 		AUDIO_wait(&a, 100);
-		int k = key(&a, &ts);
+		int k = key(&a);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
 		} else if (k) {
 			break;
 		}
 
+		printf("\r%d/%d", c, totalPCMFrameCount);
 		c += n;
-		ts.cur = (double)c / mp3.sampleRate;
-		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-		ts.xtc_atten = xtc.attenuation;
-		tui_render(&ts);
 	}
-	tui_close();
+	printf("\e[?25h");
 
 	AUDIO_close(&a);
 	drmp3_uninit(&mp3);
@@ -686,7 +625,7 @@ int play_mp3(char *name, int format, int flag)
 
 	int c = 0;
 	printf("\e[?25l");
-	while ((bytes_left >= 0) && (frame_size > 0) && !key(&a, NULL)) {
+	while ((bytes_left >= 0) && (frame_size > 0) && !key(&a)) {
 		printf("\r%d", c);
 
 		if (flag & USE_CROSSTALK) {
@@ -722,6 +661,7 @@ void play_ogg(char *name, int flag)
 		printf("Error: cannot open `%s`\n", name);
 		return;
 	}
+	printf("%dHz %dch\n", v->sample_rate, v->channels);
 
 	AUDIO a;
 	if (AUDIO_init(&a, dev, v->sample_rate, v->channels, FRAMES*2, 1, 0)) {
@@ -732,42 +672,24 @@ void play_ogg(char *name, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, v->sample_rate, v->channels);
 
-	// stb_vorbis doesn't give us a cheap total-sample count up front, so this
-	// stream is shown with elapsed time only (no total / no progress bar fill).
-	tui_state_t ts = {0};
-	ts.track_index = track_index;
-	ts.track_total = track_total;
-	ts.filename = name;
-	ts.codec = "OGG";
-	ts.rate = v->sample_rate;
-	ts.channels = v->channels;
-	ts.device = dev;
-	ts.use_time = 1;
-	ts.total = 0.0;
-	ts.volume = volume;
-	ts.loop_mode = loop_mode;
-
-	uint64_t c = 0;
-	tui_open();
+	int c = 0;
+	printf("\e[?25l");
 	while ((n = stb_vorbis_get_frame_short_interleaved(v, v->channels, outputs, FRAMES*100))) {
+		printf("\r%d", c);
 		if (flag & USE_CROSSTALK) {
 			apply_crosstalk_cancellation(&xtc, outputs, n, v->channels, 0);
 		}
 		AUDIO_play(&a, (char*)outputs, n);
 		AUDIO_wait(&a, 100);
-		int k = key(&a, &ts);
+		int k = key(&a);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
 		} else if (k) {
 			break;
 		}
 		c += n;
-		ts.cur = (double)c / v->sample_rate;
-		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-		ts.xtc_atten = xtc.attenuation;
-		tui_render(&ts);
 	}
-	tui_close();
+	printf("\e[?25h");
 
 	AUDIO_close(&a);
 	stb_vorbis_close(v);
@@ -850,6 +772,7 @@ int play_wma(char *name, int flag)
 		return 1;
 	}
 
+	printf("%dHz %dch\n", cc.sample_rate, cc.channels);
 	AUDIO a;
 	if (AUDIO_init(&a, dev, cc.sample_rate, cc.channels, FRAMES, 1, 0)) {
 		fprintf(stderr, "Error: failed to initialize audio\n");
@@ -863,21 +786,7 @@ int play_wma(char *name, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, cc.sample_rate, cc.channels);
 
-	tui_state_t ts = {0};
-	ts.track_index = track_index;
-	ts.track_total = track_total;
-	ts.filename = name;
-	ts.codec = "WMA";
-	ts.rate = cc.sample_rate;
-	ts.channels = cc.channels;
-	ts.device = dev;
-	ts.use_time = 0; // decoded frame timing isn't tracked; show raw byte progress instead
-	ts.unit = "bytes";
-	ts.total_raw = (uint64_t)len;
-	ts.volume = volume;
-	ts.loop_mode = loop_mode;
-
-	tui_open();
+	printf("\e[?25l");
 	while (bytes_left > 0) {
 		int out_size = 0;
 		int frame_size = wma_decode_superframe(&cc, sample_buf, &out_size, stream_pos, bytes_left);
@@ -912,19 +821,17 @@ int play_wma(char *name, int flag)
 		stream_pos += frame_size;
 		bytes_left -= frame_size;
 
-		int k = key(&a, &ts);
+		int k = key(&a);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
 		} else if (k) {
 			break;
 		}
 
-		ts.cur_raw = (uint64_t)(len - bytes_left);
-		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-		ts.xtc_atten = xtc.attenuation;
-		tui_render(&ts);
+		printf("\r%d/%d", len - bytes_left, len);
+		fflush(stdout);
 	}
-	tui_close();
+	printf("\n\e[?25h");
 
 	AUDIO_close(&a);
 	wma_decode_end(&cc);
@@ -1211,6 +1118,8 @@ int play_aac(char *name, int flag)
         output_samplerate *= 2;
         printf("Assuming potential HE-AAC with SBR, output samplerate: %dHz\n", output_samplerate);
     }
+    printf("%dHz (output: %dHz) %dch\n", info.sampRateCore, output_samplerate, info.nChans);
+
     AUDIO a;
     if (AUDIO_init(&a, dev, output_samplerate, info.nChans, FRAMES, 1, 0)) {
         printf("Error: failed to initialize ALSA with %dHz, %dch\n", output_samplerate, info.nChans);
@@ -1223,25 +1132,13 @@ int play_aac(char *name, int flag)
     CrosstalkCancel xtc;
     init_crosstalk_cancellation(&xtc, output_samplerate, info.nChans);
 
-    tui_state_t ts = {0};
-    ts.track_index = track_index;
-    ts.track_total = track_total;
-    ts.filename = name;
-    ts.codec = sbr_enabled ? "AAC/SBR" : "AAC";
-    ts.rate = output_samplerate;
-    ts.channels = info.nChans;
-    ts.device = dev;
-    ts.use_time = 0; // AAC is decoded from a raw byte stream; show byte progress instead of time
-    ts.unit = "bytes";
-    ts.total_raw = (uint64_t)bytes_left;
-    ts.volume = volume;
-    ts.loop_mode = loop_mode;
-
-    tui_open();
+    printf("\e[?25l");
     while (bytes_left > 0) {
         int r = AACDecode(aac, &stream_pos, &bytes_left, sample_buf);
         if (verbose) {
             printf("\rDecoded %d bytes, %d bytes left, result=%d\n", (int)(stream_pos - file_data), bytes_left, r);
+        } else {
+            printf("\r%d/%d", (int)(stream_pos - file_data), bytes_left + (int)(stream_pos - file_data));
         }
         if (!r) {
             resync_attempts = 0; // Reset on successful decode
@@ -1257,26 +1154,20 @@ int play_aac(char *name, int flag)
             AUDIO_play(&a, (char*)sample_buf, frames);
             AUDIO_wait(&a, 100);
         } else {
-            ts.note = "AAC decode error, stopping";
-            tui_render(&ts);
+            printf("\nAAC decode error %d\n", r);
             // For raw AAC (MP4), do not attempt ADTS-based resync—just stop on error.
             // If this is an ADTS file (.aac), you could add conditional resync logic here.
             break;
         }
 
-        int k = key(&a, &ts);
+        int k = key(&a);
         if (k == 'c') {
             flag ^= USE_CROSSTALK;
         } else if (k) {
             break;
         }
-
-        ts.cur_raw = (uint64_t)(stream_pos - file_data);
-        ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-        ts.xtc_atten = xtc.attenuation;
-        tui_render(&ts);
     }
-    tui_close();
+    printf("\e[?25h");
 
     AUDIO_close(&a);
     AACFreeDecoder(aac);
@@ -1315,8 +1206,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 				}
 			}
 
-			track_index = i + 1;
-			track_total = num;
+			printf("\n\e[1m\e[35m%s\e[0m\n", ls[i].d_name);
 			snprintf(path, 1024, "%s", ls[i].d_name);
 			if (access(ls[i].d_name, F_OK)<0) {
 				continue;

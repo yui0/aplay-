@@ -43,6 +43,26 @@ float speaker_distance_m = 0.5;
 int cmd;
 int track_index = 0, track_total = 0; // current position in the playlist, for the TUI panel
 
+//char *dev = "default";  // "plughw:0,0"
+char *dev = "hw:0,0";  // BitPerfect
+
+// Synthetic key codes for cursor keys, well outside the char range so they
+// can never collide with a real byte read from the terminal.
+#define KEY_UP     1001
+#define KEY_DOWN   1002
+#define KEY_LEFT   1003
+#define KEY_RIGHT  1004
+
+#define SEEK_SECONDS   10      // amount of fast-forward/rewind per Left/Right press
+#define VOLUME_STEP    0.05f   // amount of volume change per Up/Down press
+
+// Pushes the current `volume` (0.0-1.0) out to the ALSA hardware mixer so
+// decoded PCM samples stay bit-exact (no software gain on the buffer).
+void apply_alsa_volume(void)
+{
+	AUDIO_set_volume(dev, volume);
+}
+
 // `ts`, if non-NULL, is re-rendered immediately on pause/resume so the TUI
 // panel reflects the paused state instead of freezing silently.
 int key(AUDIO *a, tui_state_t *ts)
@@ -55,6 +75,71 @@ int key(AUDIO *a, tui_state_t *ts)
 	if (verbose) {
 		printf("%x\n", c);
 	}
+
+	// Cursor keys arrive as multi-byte ANSI escape sequences: ESC '[' <A|B|C|D>.
+	// A lone Esc (meant to quit) never has more bytes following it, while a
+	// real terminal emits the whole 3-byte sequence in one burst, so a short
+	// bounded poll is enough to tell the two apart.
+	if (c == 0x1b) {
+		int tries = 0;
+		while (!kbhit() && tries < 20) {
+			usleep(500);
+			tries++;
+		}
+		if (kbhit()) {
+			int c2 = getchar();
+			if (c2 == '[' || c2 == 'O') {
+				tries = 0;
+				while (!kbhit() && tries < 20) {
+					usleep(500);
+					tries++;
+				}
+				if (kbhit()) {
+					int c3 = getchar();
+					switch (c3) {
+					case 'A':
+						c = KEY_UP;
+						break;
+					case 'B':
+						c = KEY_DOWN;
+						break;
+					case 'C':
+						c = KEY_RIGHT;
+						break;
+					case 'D':
+						c = KEY_LEFT;
+						break;
+					default:
+						c = 0; // unrecognized escape sequence, ignore
+						break;
+					}
+				} else {
+					c = 0; // incomplete sequence, drop it
+				}
+			}
+			// else: not an escape sequence we understand; c2 is dropped and
+			// the original Esc (c == 0x1b) still falls through as Quit below.
+		}
+		// else: no more bytes followed -> lone Esc, falls through as Quit.
+		cmd = c;
+	}
+
+	if (c == KEY_UP || c == KEY_DOWN) {
+		volume += (c == KEY_UP ? VOLUME_STEP : -VOLUME_STEP);
+		if (volume > 1.0f) {
+			volume = 1.0f;
+		}
+		if (volume < 0.0f) {
+			volume = 0.0f;
+		}
+		apply_alsa_volume();
+		if (ts) {
+			ts->volume = volume;
+			tui_render(ts);
+		}
+		return 0;
+	}
+
 	if (c==0x20) {
 		snd_pcm_pause(a->handle, 1);
 		if (ts) {
@@ -77,9 +162,6 @@ int key(AUDIO *a, tui_state_t *ts)
 
 	return c;
 }
-
-//char *dev = "default";  // "plughw:0,0"
-char *dev = "hw:0,0";  // BitPerfect
 
 #define USE_FLOAT32   128
 #define USE_CROSSTALK 256 // Flag for crosstalk cancellation
@@ -166,8 +248,8 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
 			if (new_right < -1.0f) new_right = -1.0f;
 			data[idx] = new_left;
 			data[idx + 1] = new_right;*/
-			data[idx] = fmaxf(fminf(new_left, 1.0f), -1.0f) * volume;  // Apply volume
-			data[idx + 1] = fmaxf(fminf(new_right, 1.0f), -1.0f) * volume;
+			data[idx] = fmaxf(fminf(new_left, 1.0f), -1.0f);
+			data[idx + 1] = fmaxf(fminf(new_right, 1.0f), -1.0f);
 		}
 	} else { // SND_PCM_FORMAT_S16_LE
 		/*int16_t *data = (int16_t*)buffer;
@@ -221,8 +303,8 @@ void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames
 			float delayed_left = xtc->delay_buffer[delay_idx];
 			float delayed_right = xtc->delay_buffer[delay_idx + 1];
 
-			temp[idx] = (temp[idx] - xtc->attenuation * delayed_right) * volume;
-			temp[idx + 1] = (temp[idx + 1] - xtc->attenuation * delayed_left) * volume;
+			temp[idx] = temp[idx] - xtc->attenuation * delayed_right;
+			temp[idx + 1] = temp[idx + 1] - xtc->attenuation * delayed_left;
 		}
 
 		for (int i = 0; i < frames * 2; i++) {
@@ -424,6 +506,21 @@ void play_wav(char *name, int format, int flag)
 			int k = key(&a, &ts);
 			if (k=='c') {
 				flag ^= USE_CROSSTALK;
+			} else if (k == KEY_LEFT || k == KEY_RIGHT) {
+				int64_t delta = (int64_t)SEEK_SECONDS * wav.sampleRate * (k == KEY_RIGHT ? 1 : -1);
+				int64_t target = (int64_t)c + delta;
+				if (target < 0) {
+					target = 0;
+				}
+				if (wav.totalPCMFrameCount > 0 && (uint64_t)target > wav.totalPCMFrameCount) {
+					target = (int64_t)wav.totalPCMFrameCount;
+				}
+				if (drwav_seek_to_pcm_frame(&wav, (drwav_uint64)target)) {
+					c = (uint64_t)target;
+					ts.cur = (double)c / wav.sampleRate;
+					ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+					tui_render(&ts);
+				}
 			} else if (k) {
 				break;
 			}
@@ -493,6 +590,21 @@ void play_flac(char *name, int format, int flag)
 		int k = key(&a, &ts);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
+		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
+			int64_t delta = (int64_t)SEEK_SECONDS * flac->sampleRate * (k == KEY_RIGHT ? 1 : -1);
+			int64_t target = (int64_t)c + delta;
+			if (target < 0) {
+				target = 0;
+			}
+			if (flac->totalPCMFrameCount > 0 && (uint64_t)target > flac->totalPCMFrameCount) {
+				target = (int64_t)flac->totalPCMFrameCount;
+			}
+			if (drflac_seek_to_pcm_frame(flac, (drflac_uint64)target)) {
+				c = (uint64_t)target;
+				ts.cur = (double)c / flac->sampleRate;
+				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+				tui_render(&ts);
+			}
 		} else if (k) {
 			break;
 		}
@@ -565,6 +677,9 @@ void play_dsf(char *name, int format, int flag)
 		int k = key(&a, &ts);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
+		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
+			ts.note = "seek not supported for DSF";
+			tui_render(&ts);
 		} else if (k) {
 			break;
 		}
@@ -636,6 +751,21 @@ int play_mp3(char *name, int format, int flag)
 		int k = key(&a, &ts);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
+		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
+			int64_t delta = (int64_t)SEEK_SECONDS * mp3.sampleRate * (k == KEY_RIGHT ? 1 : -1);
+			int64_t target = (int64_t)c + delta;
+			if (target < 0) {
+				target = 0;
+			}
+			if (totalPCMFrameCount > 0 && (uint64_t)target > totalPCMFrameCount) {
+				target = (int64_t)totalPCMFrameCount;
+			}
+			if (drmp3_seek_to_pcm_frame(&mp3, (drmp3_uint64)target)) {
+				c = (uint64_t)target;
+				ts.cur = (double)c / mp3.sampleRate;
+				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+				tui_render(&ts);
+			}
 		} else if (k) {
 			break;
 		}
@@ -758,6 +888,18 @@ void play_ogg(char *name, int flag)
 		int k = key(&a, &ts);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
+		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
+			int64_t delta = (int64_t)SEEK_SECONDS * v->sample_rate * (k == KEY_RIGHT ? 1 : -1);
+			int64_t target = (int64_t)c + delta;
+			if (target < 0) {
+				target = 0;
+			}
+			if (stb_vorbis_seek(v, (unsigned int)target)) {
+				c = (uint64_t)target;
+				ts.cur = (double)c / v->sample_rate;
+				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+				tui_render(&ts);
+			}
 		} else if (k) {
 			break;
 		}
@@ -915,6 +1057,9 @@ int play_wma(char *name, int flag)
 		int k = key(&a, &ts);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
+		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
+			ts.note = "seek not supported for WMA";
+			tui_render(&ts);
 		} else if (k) {
 			break;
 		}
@@ -1267,6 +1412,9 @@ int play_aac(char *name, int flag)
         int k = key(&a, &ts);
         if (k == 'c') {
             flag ^= USE_CROSSTALK;
+        } else if (k == KEY_LEFT || k == KEY_RIGHT) {
+            ts.note = "seek not supported for AAC";
+            tui_render(&ts);
         } else if (k) {
             break;
         }
@@ -1420,12 +1568,21 @@ void usage(FILE* fp, int argc, char** argv)
 	        "-p                 Optimize for Linux platforms\n"
 	        "-l                 Loop the directory playlist\n"
 	        "-v                 Verbose mode\n"
-	        "-V <volume>        Set software volume (0.0-1.0, default 1.0)\n"
+	        "-V <volume>        Set ALSA mixer volume (0.0-1.0, default 1.0)\n"
 	        "-c                 Enable crosstalk cancellation\n"
 	        "-D                 Speaker distance for crosstalk cancellation\n"
 	        "-T                 Enable test mode (sine wave: left, right, pan)\n"
+	        "\n"
+	        "During playback:\n"
+	        "  Space              Pause / resume\n"
+	        "  Left / Right       Seek -/+ %ds (FLAC, MP3, WAV, OGG)\n"
+	        "  Up / Down          Volume +/- %.0f%%\n"
+	        "  C                  Toggle crosstalk cancellation\n"
+	        "  B / \\              Back to previous track\n"
+	        "  Q / Esc            Quit\n"
+	        "  (any other key)    Next track\n"
 	        "\n",
-	        argv[0]);
+	        argv[0], SEEK_SECONDS, VOLUME_STEP * 100.0f);
 }
 
 int main(int argc, char *argv[])
@@ -1501,6 +1658,8 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
+
+	apply_alsa_volume(); // push -V's initial value (or the 1.0 default) to the mixer
 
 	if (flag & USE_TEST_MODE) {
 		int format = flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;

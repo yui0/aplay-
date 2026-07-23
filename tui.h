@@ -108,8 +108,116 @@ static int tui_get_width(void)
 	return cols;
 }
 
+/* ---- UTF-8 helpers -------------------------------------------------
+ * The panel needs to know, in bytes, how long a UTF-8 sequence is (so it
+ * never splits one in half -- that's what causes garbled/mojibake output
+ * when truncating or scrolling Japanese text), and in terminal columns,
+ * how wide the resulting character is (CJK ideographs, kana, hangul and
+ * fullwidth forms are double-width in virtually every terminal). */
+static int utf8_seq_len(unsigned char c)
+{
+	if ((c & 0x80) == 0) {
+		return 1;
+	}
+	if ((c & 0xE0) == 0xC0) {
+		return 2;
+	}
+	if ((c & 0xF0) == 0xE0) {
+		return 3;
+	}
+	if ((c & 0xF8) == 0xF0) {
+		return 4;
+	}
+	return 1; /* stray continuation/invalid byte: treat as 1 to keep progressing */
+}
+
+/* Validate that s[1..seqlen-1] are proper UTF-8 continuation bytes; if not
+ * (truncated/corrupt input), fall back to treating just the lead byte as
+ * a single "character" instead of reading past the end of the string. */
+static int utf8_valid_seq(const char *s, int seqlen)
+{
+	for (int i = 1; i < seqlen; i++) {
+		if (!s[i] || ((unsigned char)s[i] & 0xC0) != 0x80) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static uint32_t utf8_decode(const char *s, int seqlen)
+{
+	unsigned char c0 = (unsigned char)s[0];
+	uint32_t cp;
+	switch (seqlen) {
+	case 2: cp = c0 & 0x1F; break;
+	case 3: cp = c0 & 0x0F; break;
+	case 4: cp = c0 & 0x07; break;
+	default: return c0;
+	}
+	for (int i = 1; i < seqlen; i++) {
+		cp = (cp << 6) | ((unsigned char)s[i] & 0x3F);
+	}
+	return cp;
+}
+
+/* 1 for normal-width codepoints, 2 for East Asian Wide/Fullwidth ranges
+ * (covers hiragana, katakana, CJK ideographs, hangul, fullwidth forms). */
+static int utf8_char_width(uint32_t cp)
+{
+	if ((cp >= 0x1100 && cp <= 0x115F) ||
+	    cp == 0x2329 || cp == 0x232A ||
+	    (cp >= 0x2E80 && cp <= 0xA4CF && cp != 0x303F) ||
+	    (cp >= 0xAC00 && cp <= 0xD7A3) ||
+	    (cp >= 0xF900 && cp <= 0xFAFF) ||
+	    (cp >= 0xFE30 && cp <= 0xFE6F) ||
+	    (cp >= 0xFF00 && cp <= 0xFF60) ||
+	    (cp >= 0xFFE0 && cp <= 0xFFE6) ||
+	    (cp >= 0x20000 && cp <= 0x3FFFD)) {
+		return 2;
+	}
+	return 1;
+}
+
+/* Decode the UTF-8 char at *s (advancing past any color escapes is the
+ * caller's job); returns byte length and, via *out_w, its column width. */
+static int utf8_next(const char *s, int *out_w)
+{
+	int seqlen = utf8_seq_len((unsigned char)*s);
+	if (seqlen > 1 && !utf8_valid_seq(s, seqlen)) {
+		seqlen = 1;
+	}
+	*out_w = (seqlen == 1) ? 1 : utf8_char_width(utf8_decode(s, seqlen));
+	return seqlen;
+}
+
+typedef struct {
+	const char *ptr;
+	int bytelen;
+	int width;
+} utf8_cell_t;
+
+/* Split `s` into an array of UTF-8 "cells" (one per character) with their
+ * byte length and display width, up to max_cells entries. Used by the
+ * marquee so it can rotate/truncate on character boundaries. */
+static int utf8_decompose(const char *s, utf8_cell_t *cells, int max_cells)
+{
+	int n = 0;
+	while (*s && n < max_cells) {
+		int w;
+		int seqlen = utf8_next(s, &w);
+		cells[n].ptr = s;
+		cells[n].bytelen = seqlen;
+		cells[n].width = w;
+		n++;
+		s += seqlen;
+	}
+	return n;
+}
+
 /* Visible-column length of `s`, skipping over any "\e[...m" SGR escape
- * sequences so color codes never throw off panel alignment. */
+ * sequences so color codes never throw off panel alignment, and counting
+ * multi-byte UTF-8 characters (e.g. Japanese) at their correct terminal
+ * column width instead of one column per byte. */
 static int tui_visible_len(const char *s)
 {
 	int len = 0;
@@ -123,8 +231,9 @@ static int tui_visible_len(const char *s)
 				s++;
 			}
 		} else {
-			len++;
-			s++;
+			int w;
+			s += utf8_next(s, &w);
+			len += w;
 		}
 	}
 	return len;
@@ -155,10 +264,18 @@ static void tui_line(const char *s, int w)
 				}
 				fwrite(start, 1, (size_t)(p - start), stdout);
 			} else {
-				fputc(*p, stdout);
-				p++;
-				printed++;
+				int cw;
+				int seqlen = utf8_next(p, &cw);
+				if (printed + cw > w) {
+					break; /* would split a wide (e.g. Japanese) char across the border */
+				}
+				fwrite(p, 1, (size_t)seqlen, stdout);
+				p += seqlen;
+				printed += cw;
 			}
+		}
+		for (int i = printed; i < w; i++) {
+			fputc(' ', stdout); /* pad leftover column if a wide char didn't fit */
 		}
 		fputs(C_RESET, stdout); /* guard against a color left open by truncation */
 	} else {
@@ -254,6 +371,8 @@ typedef struct {
 	struct timespec t0;
 } tui_marquee_state_t;
 
+#define TUI_MAX_MARQUEE_CELLS 300
+
 static void tui_marquee_ex(tui_marquee_state_t *ms, const char *text, int width, char *out, int outsz)
 {
 	if (!text) {
@@ -268,14 +387,30 @@ static void tui_marquee_ex(tui_marquee_state_t *ms, const char *text, int width,
 		out[0] = 0;
 		return;
 	}
-	int flen = (int)strlen(text);
-	if (flen <= width) {
+	/* Compare *display columns*, not bytes -- a Japanese filename can be
+	 * short in characters (and even shorter in bytes-per-column ratio
+	 * terms doesn't apply since it's wide) but still overflow `width`. */
+	int fwidth = tui_visible_len(text);
+	if (fwidth <= width) {
 		snprintf(out, (size_t)outsz, "%s", text);
 		return;
 	}
 	char loop[600];
 	snprintf(loop, sizeof(loop), "%s   *   ", text);
-	int looplen = (int)strlen(loop);
+
+	/* Decompose into whole characters so rotation/truncation never lands
+	 * inside a multi-byte UTF-8 sequence (that mid-sequence split is what
+	 * produced the garbled/mojibake output). */
+	static utf8_cell_t cells[TUI_MAX_MARQUEE_CELLS];
+	int ncells = utf8_decompose(loop, cells, TUI_MAX_MARQUEE_CELLS);
+	if (ncells <= 0) {
+		out[0] = 0;
+		return;
+	}
+	int looplen = 0; /* total display width of one loop of the marquee text */
+	for (int i = 0; i < ncells; i++) {
+		looplen += cells[i].width;
+	}
 	if (looplen <= 0) {
 		out[0] = 0;
 		return;
@@ -288,13 +423,35 @@ static void tui_marquee_ex(tui_marquee_state_t *ms, const char *text, int width,
 	if (elapsed < 0.0) {
 		elapsed = 0.0;
 	}
-	ms->pos = (int)(elapsed * (double)TUI_MARQUEE_CPS) % looplen;
+	/* ms->pos is a column offset (not a byte or char index) into the loop */
+	ms->pos = ((int)(elapsed * (double)TUI_MARQUEE_CPS)) % looplen;
 
-	int cnt = width < outsz - 1 ? width : outsz - 1;
-	for (int i = 0; i < cnt; i++) {
-		out[i] = loop[(ms->pos + i) % looplen];
+	/* Find which cell that column offset falls in. If it lands in the
+	 * middle of a wide character, start at the *next* cell rather than
+	 * emitting half of it. */
+	int acc = 0, start_idx = 0;
+	for (start_idx = 0; start_idx < ncells; start_idx++) {
+		if (acc >= ms->pos) {
+			break;
+		}
+		acc += cells[start_idx].width;
 	}
-	out[cnt] = 0;
+
+	int col = 0, p = 0, idx = start_idx % ncells;
+	for (int guard = 0; guard < ncells && col < width; guard++) {
+		utf8_cell_t *c = &cells[idx];
+		if (col + c->width > width) {
+			break; /* would overflow by splitting this wide char across the edge */
+		}
+		if (p + c->bytelen >= outsz) {
+			break;
+		}
+		memcpy(out + p, c->ptr, (size_t)c->bytelen);
+		p += c->bytelen;
+		col += c->width;
+		idx = (idx + 1) % ncells;
+	}
+	out[p] = 0;
 }
 
 static tui_marquee_state_t tui_fn_marquee = {0};

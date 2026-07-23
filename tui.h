@@ -58,11 +58,14 @@
 #define C_VOL_LO	"\e[1;38;5;203m"	/* bold orange/red (<33%) */
 #define C_NOTEMSG	"\e[1;38;5;226m"	/* bold yellow transient note */
 #define C_FOOTER	"\e[38;5;244m"
+#define C_DIR		"\e[38;5;109m"		/* muted teal-blue - current directory */
 
 typedef struct {
 	int track_index;	/* 1-based current track number (0 = unknown) */
 	int track_total;	/* total tracks in playlist (0 = unknown) */
 	const char *filename;	/* path/name of the current file */
+	const char *dir;	/* directory the current file lives in, shown right-aligned
+				 * on the title line (NULL/empty = don't show) */
 	const char *codec;	/* e.g. "FLAC", "MP3", "AAC" ... */
 	int rate;		/* sample rate in Hz */
 	int bits;		/* bit depth (0 if not applicable/unknown) */
@@ -240,34 +243,38 @@ static void tui_bar(char *out, int outsz, int bw, double ratio)
 	out[p] = 0;
 }
 
-/* Scrolling "telop" for filenames that don't fit the panel width.
- * Advances by wall-clock time (TUI_MARQUEE_CPS chars/sec) so speed is
- * independent of filename length and of how often tui_render() is called. */
-static char tui_marquee_last[512] = {0};
-static int tui_marquee_pos = 0;
-static struct timespec tui_marquee_t0 = {0, 0};
+/* Scrolling "telop" for text that doesn't fit the panel width. Advances
+ * by wall-clock time (TUI_MARQUEE_CPS chars/sec) so speed is independent
+ * of text length and of how often tui_render() is called. Each on-screen
+ * telop (filename, directory, ...) needs its own state so they don't reset
+ * or jump when one changes but not the other. */
+typedef struct {
+	char last[512];
+	int pos;
+	struct timespec t0;
+} tui_marquee_state_t;
 
-static void tui_marquee(const char *filename, int width, char *out, int outsz)
+static void tui_marquee_ex(tui_marquee_state_t *ms, const char *text, int width, char *out, int outsz)
 {
-	if (!filename) {
-		filename = "(unknown)";
+	if (!text) {
+		text = "(unknown)";
 	}
-	if (strcmp(filename, tui_marquee_last) != 0) {
-		snprintf(tui_marquee_last, sizeof(tui_marquee_last), "%.500s", filename);
-		tui_marquee_pos = 0;
-		clock_gettime(CLOCK_MONOTONIC, &tui_marquee_t0);
+	if (strcmp(text, ms->last) != 0) {
+		snprintf(ms->last, sizeof(ms->last), "%.500s", text);
+		ms->pos = 0;
+		clock_gettime(CLOCK_MONOTONIC, &ms->t0);
 	}
 	if (width <= 0) {
 		out[0] = 0;
 		return;
 	}
-	int flen = (int)strlen(filename);
+	int flen = (int)strlen(text);
 	if (flen <= width) {
-		snprintf(out, (size_t)outsz, "%s", filename);
+		snprintf(out, (size_t)outsz, "%s", text);
 		return;
 	}
 	char loop[600];
-	snprintf(loop, sizeof(loop), "%s   *   ", filename);
+	snprintf(loop, sizeof(loop), "%s   *   ", text);
 	int looplen = (int)strlen(loop);
 	if (looplen <= 0) {
 		out[0] = 0;
@@ -276,18 +283,26 @@ static void tui_marquee(const char *filename, int width, char *out, int outsz)
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
-	double elapsed = (double)(now.tv_sec - tui_marquee_t0.tv_sec) +
-	                 (double)(now.tv_nsec - tui_marquee_t0.tv_nsec) * 1e-9;
+	double elapsed = (double)(now.tv_sec - ms->t0.tv_sec) +
+	                 (double)(now.tv_nsec - ms->t0.tv_nsec) * 1e-9;
 	if (elapsed < 0.0) {
 		elapsed = 0.0;
 	}
-	tui_marquee_pos = (int)(elapsed * (double)TUI_MARQUEE_CPS) % looplen;
+	ms->pos = (int)(elapsed * (double)TUI_MARQUEE_CPS) % looplen;
 
 	int cnt = width < outsz - 1 ? width : outsz - 1;
 	for (int i = 0; i < cnt; i++) {
-		out[i] = loop[(tui_marquee_pos + i) % looplen];
+		out[i] = loop[(ms->pos + i) % looplen];
 	}
 	out[cnt] = 0;
+}
+
+static tui_marquee_state_t tui_fn_marquee = {0};
+static tui_marquee_state_t tui_dir_marquee = {0};
+
+static void tui_marquee(const char *filename, int width, char *out, int outsz)
+{
+	tui_marquee_ex(&tui_fn_marquee, filename, width, out, outsz);
 }
 
 static void tui_render(tui_state_t *s)
@@ -304,17 +319,37 @@ static void tui_render(tui_state_t *s)
 
 	tui_hline("\xe2\x94\x8c", "\xe2\x94\x80", "\xe2\x94\x90", inner); /* ┌──┐ */
 
-	/* line 1: title + playlist position */
-	if (s->track_total > 0) {
-		snprintf(line, sizeof(line),
-		         " " C_NOTE_ICON "\xe2\x99\xaa" C_RESET " " C_TITLE "aplay+" C_RESET
-		         "  " C_LABEL "[%d/%d]" C_RESET "%s",
-		         s->track_index, s->track_total,
-		         s->paused ? "  " C_PAUSE "\xe2\x8f\xb8 PAUSED" C_RESET : "");
-	} else {
-		snprintf(line, sizeof(line),
-		         " " C_NOTE_ICON "\xe2\x99\xaa" C_RESET " " C_TITLE "aplay+" C_RESET "%s",
-		         s->paused ? "  " C_PAUSE "\xe2\x8f\xb8 PAUSED" C_RESET : "");
+	/* line 1: title + playlist position, with the current directory
+	 * right-aligned at the far end of the same line */
+	{
+		char left[400];
+		if (s->track_total > 0) {
+			snprintf(left, sizeof(left),
+			         " " C_NOTE_ICON "\xe2\x99\xaa" C_RESET " " C_TITLE "aplay+" C_RESET
+			         "  " C_LABEL "[%d/%d]" C_RESET "%s",
+			         s->track_index, s->track_total,
+			         s->paused ? "  " C_PAUSE "\xe2\x8f\xb8 PAUSED" C_RESET : "");
+		} else {
+			snprintf(left, sizeof(left),
+			         " " C_NOTE_ICON "\xe2\x99\xaa" C_RESET " " C_TITLE "aplay+" C_RESET "%s",
+			         s->paused ? "  " C_PAUSE "\xe2\x8f\xb8 PAUSED" C_RESET : "");
+		}
+
+		int left_len = tui_visible_len(left);
+		/* room left for "  " + dir before running into the right border */
+		int avail = inner - left_len - 2;
+		if (s->dir && s->dir[0] && avail >= 3) {
+			char dirbuf[300];
+			tui_marquee_ex(&tui_dir_marquee, s->dir, avail, dirbuf, sizeof(dirbuf));
+			int dbuf_len = tui_visible_len(dirbuf);
+			int pad = inner - left_len - dbuf_len;
+			if (pad < 1) {
+				pad = 1;
+			}
+			snprintf(line, sizeof(line), "%s%*s" C_DIR "%s" C_RESET, left, pad, "", dirbuf);
+		} else {
+			snprintf(line, sizeof(line), "%s", left);
+		}
 	}
 	tui_line(line, inner);
 

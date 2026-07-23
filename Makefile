@@ -1,6 +1,6 @@
 # ©2017-2025 YUICHIRO NAKADA
 
-PROGRAM = $(patsubst %.c,%,$(wildcard *.c))
+PROGRAM = aplay+
 
 ifneq (, $(shell which clang))
 CC = clang

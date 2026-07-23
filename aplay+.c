@@ -1,5 +1,7 @@
 // ©2017-2026 Yuichiro Nakada
-// clang -Os -o aplay+ aplay+.c -lasound
+// clang -Os -o aplay+ aplay+.c -lasound                          (dr_flac, default)
+// clang -Os -DUSE_FOXEN_FLAC -o aplay+ aplay+.c -lasound         (foxen-flac)
+// Generate flac.h (required for foxen-flac): ./make_flac_h.sh
 
 #include <stdio.h>
 #include <sys/mman.h>
@@ -7,10 +9,16 @@
 #include <math.h>   // for sin
 #include <fcntl.h>  // for open, lseek
 #include <unistd.h> // for close
+#include <limits.h> // for PATH_MAX
 
 #include "alsa.h"
+#ifdef USE_FOXEN_FLAC
+#define FLAC_IMPLEMENTATION
+#include "flac.h"
+#else
 #define DR_FLAC_IMPLEMENTATION
 #include "dr_flac.h"
+#endif
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 #define DR_MP3_IMPLEMENTATION
@@ -55,6 +63,21 @@ char *dev = "hw:0,0";  // BitPerfect
 
 #define SEEK_SECONDS   10      // amount of fast-forward/rewind per Left/Right press
 #define VOLUME_STEP    0.05f   // amount of volume change per Up/Down press
+
+// Returns a pointer to the filename portion of `path`, stripping any
+// leading directory components (everything up to and including the last
+// '/'). Used so the TUI marquee shows only the file name, not the full path.
+static const char *get_basename(const char *path)
+{
+	const char *slash = strrchr(path, '/');
+	return slash ? slash + 1 : path;
+}
+
+// Extracts the parent directory portion of path into dir (size bytes).
+// "music/rock/song.flac" -> "music/rock", "song.flac" -> "."
+// (defined further down, forward-declared here so the play_* functions
+// above it can use it to feed tui_state_t.dir for the TUI title line)
+static void get_dirpart(const char *path, char *dir, size_t size);
 
 // Pushes the current `volume` (0.0-1.0) out to the ALSA hardware mixer so
 // decoded PCM samples stay bit-exact (no software gain on the buffer).
@@ -473,17 +496,20 @@ void play_wav(char *name, int format, int flag)
 		CrosstalkCancel xtc;
 		init_crosstalk_cancellation(&xtc, wav.sampleRate, wav.channels);
 
-		uint64_t (*func)(drwav* pWav, drflac_uint64 framesToRead, void* pBufferOut);
+		uint64_t (*func)(drwav* pWav, drwav_uint64 framesToRead, void* pBufferOut);
 		if (format) {
-			func = (uint64_t (*)(drwav *, drflac_uint64, void *))drwav_read_pcm_frames_f32;
+			func = (uint64_t (*)(drwav *, drwav_uint64, void *))drwav_read_pcm_frames_f32;
 		} else {
-			func = (uint64_t (*)(drwav *, drflac_uint64, void *))drwav_read_pcm_frames_s16;
+			func = (uint64_t (*)(drwav *, drwav_uint64, void *))drwav_read_pcm_frames_s16;
 		}
 
 		tui_state_t ts = {0};
 		ts.track_index = track_index;
 		ts.track_total = track_total;
-		ts.filename = name;
+		ts.filename = get_basename(name);
+		char dirbuf[PATH_MAX];
+		get_dirpart(name, dirbuf, sizeof(dirbuf));
+		ts.dir = dirbuf;
 		ts.codec = format ? "WAV/F32" : "WAV";
 		ts.rate = wav.sampleRate;
 		ts.bits = format ? 32 : 16;
@@ -540,6 +566,226 @@ void play_wav(char *name, int format, int flag)
 	}
 }
 
+#ifdef USE_FOXEN_FLAC
+
+#include <stdlib.h>
+
+#define FX_IN_BUF_SIZE  8192
+/* One Subset block × max channels; covers all common FLAC files. */
+#define FX_OUT_SAMPLES  (FLAC_SUBSET_MAX_BLOCK_SIZE * FLAC_MAX_CHANNEL_COUNT)
+
+/* Seek to target_frame by rewinding the file and decoding forward.
+ * foxen-flac has no native seek; this is O(target) but acceptable for
+ * a music player where seeks are at most a few seconds at a time. */
+static int fx_seek_to_frame(FILE *f, fx_flac_t *flac, uint64_t target_frame,
+                            uint32_t channels)
+{
+	rewind(f);
+	fx_flac_reset(flac);
+
+	uint8_t in_buf[FX_IN_BUF_SIZE];
+	uint32_t in_fill = 0;
+	int32_t *out_buf = malloc(FX_OUT_SAMPLES * sizeof(int32_t));
+	if (!out_buf) return 0;
+
+	uint64_t discarded = 0;
+	uint64_t target_samples = target_frame * channels;
+	fx_flac_state_t state = FLAC_INIT;
+
+	while (discarded < target_samples) {
+		if (in_fill < FX_IN_BUF_SIZE && !feof(f)) {
+			size_t rd = fread(in_buf + in_fill, 1, FX_IN_BUF_SIZE - in_fill, f);
+			in_fill += (uint32_t)rd;
+		}
+		if (in_fill == 0) break;
+
+		uint32_t in_len = in_fill;
+		uint32_t out_len = FX_OUT_SAMPLES;
+		state = fx_flac_process(flac, in_buf, &in_len, out_buf, &out_len);
+		memmove(in_buf, in_buf + in_len, in_fill - in_len);
+		in_fill -= in_len;
+
+		if (state == FLAC_ERR) break;
+		discarded += out_len;
+		if (in_len == 0 && out_len == 0) break; /* no progress guard */
+	}
+
+	free(out_buf);
+	return state != FLAC_ERR;
+}
+
+void play_flac(char *name, int format, int flag)
+{
+	FILE *f = fopen(name, "rb");
+	if (!f) {
+		fprintf(stderr, "Failed to open FLAC: %s\n", name);
+		return;
+	}
+
+	fx_flac_t *flac = FX_FLAC_ALLOC_DEFAULT();
+	if (!flac) { fclose(f); return; }
+	fx_flac_reset(flac);
+
+	int32_t *out_buf = malloc(FX_OUT_SAMPLES * sizeof(int32_t));
+	if (!out_buf) { free(flac); fclose(f); return; }
+
+	uint8_t in_buf[FX_IN_BUF_SIZE];
+	uint32_t in_fill = 0;
+
+	/* Phase 1: pump decoder until stream info is available. */
+	fx_flac_state_t state = FLAC_INIT;
+	while (state < FLAC_END_OF_METADATA) {
+		if (in_fill < FX_IN_BUF_SIZE) {
+			size_t rd = fread(in_buf + in_fill, 1, FX_IN_BUF_SIZE - in_fill, f);
+			in_fill += (uint32_t)rd;
+		}
+		if (in_fill == 0) {
+			fprintf(stderr, "FLAC: EOF before metadata: %s\n", name);
+			goto done;
+		}
+		uint32_t in_len = in_fill;
+		uint32_t out_len = FX_OUT_SAMPLES;
+		state = fx_flac_process(flac, in_buf, &in_len, out_buf, &out_len);
+		memmove(in_buf, in_buf + in_len, in_fill - in_len);
+		in_fill -= in_len;
+		if (state == FLAC_ERR) {
+			fprintf(stderr, "FLAC: metadata error: %s\n", name);
+			goto done;
+		}
+	}
+
+	{
+	uint32_t sample_rate = (uint32_t)fx_flac_get_streaminfo(flac, FLAC_KEY_SAMPLE_RATE);
+	uint32_t channels    = (uint32_t)fx_flac_get_streaminfo(flac, FLAC_KEY_N_CHANNELS);
+	uint32_t bits        = (uint32_t)fx_flac_get_streaminfo(flac, FLAC_KEY_SAMPLE_SIZE);
+	int64_t  n_samples   = fx_flac_get_streaminfo(flac, FLAC_KEY_N_SAMPLES);
+
+	AUDIO a;
+	if (AUDIO_init(&a, dev, sample_rate, channels, FRAMES, 1, format)) goto done;
+
+	CrosstalkCancel xtc;
+	init_crosstalk_cancellation(&xtc, sample_rate, channels);
+
+	tui_state_t ts = {0};
+	ts.track_index = track_index;
+	ts.track_total = track_total;
+	ts.filename = get_basename(name);
+	char dirbuf[PATH_MAX];
+	get_dirpart(name, dirbuf, sizeof(dirbuf));
+	ts.dir = dirbuf;
+	ts.codec = "FLAC";
+	ts.rate = sample_rate;
+	ts.bits = format ? 32 : bits;
+	ts.channels = channels;
+	ts.device = dev;
+	ts.use_time = 1;
+	ts.total = n_samples > 0 ? (double)n_samples / sample_rate : 0.0;
+	ts.volume = volume;
+	ts.loop_mode = loop_mode;
+
+	/* Accumulation buffer: foxen-flac decodes one block at a time
+	 * (up to FX_OUT_SAMPLES interleaved samples).  We drain it FRAMES
+	 * frames at a time to match the ALSA period size. */
+	int32_t *pcm_acc = malloc(FX_OUT_SAMPLES * sizeof(int32_t));
+	if (!pcm_acc) { AUDIO_close(&a); free_crosstalk_cancellation(&xtc); goto done; }
+	uint32_t acc_fill = 0;
+	int eof = 0;
+
+	uint64_t frame_pos = 0;
+	uint32_t frames_ch = FRAMES * channels;
+
+	tui_open();
+	for (;;) {
+		/* Refill accumulation buffer. */
+		while (!eof && acc_fill < frames_ch) {
+			if (in_fill < FX_IN_BUF_SIZE && !feof(f)) {
+				size_t rd = fread(in_buf + in_fill, 1, FX_IN_BUF_SIZE - in_fill, f);
+				in_fill += (uint32_t)rd;
+			}
+			if (in_fill == 0) { eof = 1; break; }
+
+			uint32_t in_len = in_fill;
+			uint32_t out_len = FX_OUT_SAMPLES;
+			state = fx_flac_process(flac, in_buf, &in_len, out_buf, &out_len);
+			memmove(in_buf, in_buf + in_len, in_fill - in_len);
+			in_fill -= in_len;
+
+			if (state == FLAC_ERR) { eof = 1; break; }
+			if (out_len > 0) {
+				uint32_t space = FX_OUT_SAMPLES - acc_fill;
+				if (out_len > space) out_len = space;
+				memcpy(pcm_acc + acc_fill, out_buf, out_len * sizeof(int32_t));
+				acc_fill += out_len;
+			}
+			if (in_len == 0 && out_len == 0) {
+				if (feof(f) && in_fill == 0) eof = 1;
+				break; /* no progress — try again after draining ALSA */
+			}
+		}
+
+		if (acc_fill < frames_ch) break;
+
+		/* Convert one ALSA period from int32_t to target format.
+		 * foxen-flac left-shifts samples to fill all 32 bits. */
+		if (format) {
+			float *dst = (float *)a.buffer;
+			for (uint32_t i = 0; i < frames_ch; i++)
+				dst[i] = (float)pcm_acc[i] * (1.0f / 2147483648.0f);
+		} else {
+			int16_t *dst = (int16_t *)a.buffer;
+			for (uint32_t i = 0; i < frames_ch; i++)
+				dst[i] = (int16_t)(pcm_acc[i] >> 16);
+		}
+
+		memmove(pcm_acc, pcm_acc + frames_ch, (acc_fill - frames_ch) * sizeof(int32_t));
+		acc_fill -= frames_ch;
+
+		if (flag & USE_CROSSTALK)
+			apply_crosstalk_cancellation(&xtc, a.buffer, FRAMES, channels, format);
+		AUDIO_play0(&a);
+		AUDIO_wait(&a, 100);
+
+		frame_pos += FRAMES;
+		ts.cur = (double)frame_pos / sample_rate;
+		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
+		ts.xtc_atten = xtc.attenuation;
+		tui_render(&ts);
+
+		int k = key(&a, &ts);
+		if (k == 'c') {
+			flag ^= USE_CROSSTALK;
+		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
+			int64_t delta = (int64_t)SEEK_SECONDS * sample_rate * (k == KEY_RIGHT ? 1 : -1);
+			int64_t target = (int64_t)frame_pos + delta;
+			if (target < 0) target = 0;
+			if (n_samples > 0 && target > n_samples) target = n_samples;
+			if (fx_seek_to_frame(f, flac, (uint64_t)target, channels)) {
+				frame_pos = (uint64_t)target;
+				acc_fill = 0;
+				in_fill = 0;
+				eof = 0;
+				ts.cur = (double)frame_pos / sample_rate;
+				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+				tui_render(&ts);
+			}
+		} else if (k) {
+			break;
+		}
+	}
+	tui_close();
+
+	AUDIO_close(&a);
+	free_crosstalk_cancellation(&xtc);
+	free(pcm_acc);
+	}
+done:
+	free(out_buf);
+	free(flac);
+	fclose(f);
+}
+
+#else  /* !USE_FOXEN_FLAC — use dr_flac */
+
 void play_flac(char *name, int format, int flag)
 {
 	drflac *flac = drflac_open_file(name, NULL);
@@ -567,7 +813,10 @@ void play_flac(char *name, int format, int flag)
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
 	ts.track_total = track_total;
-	ts.filename = name;
+	ts.filename = get_basename(name);
+	char dirbuf[PATH_MAX];
+	get_dirpart(name, dirbuf, sizeof(dirbuf));
+	ts.dir = dirbuf;
 	ts.codec = "FLAC";
 	ts.rate = flac->sampleRate;
 	ts.bits = format ? 32 : flac->bitsPerSample;
@@ -622,6 +871,8 @@ void play_flac(char *name, int format, int flag)
 	free_crosstalk_cancellation(&xtc);
 }
 
+#endif /* USE_FOXEN_FLAC */
+
 void play_dsf(char *name, int format, int flag)
 {
 	FILE *f = fopen(name, "rb");
@@ -651,7 +902,10 @@ void play_dsf(char *name, int format, int flag)
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
 	ts.track_total = track_total;
-	ts.filename = name;
+	ts.filename = get_basename(name);
+	char dirbuf[PATH_MAX];
+	get_dirpart(name, dirbuf, sizeof(dirbuf));
+	ts.dir = dirbuf;
 	ts.codec = "DSF";
 	ts.rate = decoder->sample_rate_pcm;
 	ts.bits = format == SND_PCM_FORMAT_FLOAT_LE ? 32 : 16;
@@ -716,11 +970,11 @@ int play_mp3(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, mp3.sampleRate, mp3.channels);
 
-	uint64_t (*func)(drmp3*, drflac_uint64, void*);
+	uint64_t (*func)(drmp3*, drmp3_uint64, void*);
 	if (format) {
-		func = (uint64_t (*)(drmp3 *, drflac_uint64, void *))drmp3_read_pcm_frames_f32;
+		func = (uint64_t (*)(drmp3 *, drmp3_uint64, void *))drmp3_read_pcm_frames_f32;
 	} else {
-		func = (uint64_t (*)(drmp3 *, drflac_uint64, void *))drmp3_read_pcm_frames_s16;
+		func = (uint64_t (*)(drmp3 *, drmp3_uint64, void *))drmp3_read_pcm_frames_s16;
 	}
 
 	drmp3_uint64 totalPCMFrameCount = drmp3_get_pcm_frame_count(&mp3);
@@ -728,7 +982,10 @@ int play_mp3(char *name, int format, int flag)
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
 	ts.track_total = track_total;
-	ts.filename = name;
+	ts.filename = get_basename(name);
+	char dirbuf[PATH_MAX];
+	get_dirpart(name, dirbuf, sizeof(dirbuf));
+	ts.dir = dirbuf;
 	ts.codec = "MP3";
 	ts.rate = mp3.sampleRate;
 	ts.bits = format ? 32 : 16;
@@ -867,7 +1124,10 @@ void play_ogg(char *name, int flag)
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
 	ts.track_total = track_total;
-	ts.filename = name;
+	ts.filename = get_basename(name);
+	char dirbuf[PATH_MAX];
+	get_dirpart(name, dirbuf, sizeof(dirbuf));
+	ts.dir = dirbuf;
 	ts.codec = "OGG";
 	ts.rate = v->sample_rate;
 	ts.channels = v->channels;
@@ -1008,7 +1268,10 @@ int play_wma(char *name, int flag)
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
 	ts.track_total = track_total;
-	ts.filename = name;
+	ts.filename = get_basename(name);
+	char dirbuf[PATH_MAX];
+	get_dirpart(name, dirbuf, sizeof(dirbuf));
+	ts.dir = dirbuf;
 	ts.codec = "WMA";
 	ts.rate = cc.sample_rate;
 	ts.channels = cc.channels;
@@ -1371,7 +1634,10 @@ int play_aac(char *name, int flag)
     tui_state_t ts = {0};
     ts.track_index = track_index;
     ts.track_total = track_total;
-    ts.filename = name;
+    ts.filename = get_basename(name);
+    char dirbuf[PATH_MAX];
+    get_dirpart(name, dirbuf, sizeof(dirbuf));
+    ts.dir = dirbuf;
     ts.codec = sbr_enabled ? "AAC/SBR" : "AAC";
     ts.rate = output_samplerate;
     ts.channels = info.nChans;
@@ -1432,6 +1698,17 @@ int play_aac(char *name, int flag)
     close(fd);
     free_crosstalk_cancellation(&xtc);
     return 0;
+}
+
+// Extracts the parent directory portion of path into dir (size bytes).
+// "music/rock/song.flac" -> "music/rock", "song.flac" -> "."
+static void get_dirpart(const char *path, char *dir, size_t size)
+{
+	strncpy(dir, path, size - 1);
+	dir[size - 1] = '\0';
+	char *slash = strrchr(dir, '/');
+	if (slash) *slash = '\0';
+	else strcpy(dir, ".");
 }
 
 void play_dir(char *name, char *type, char *regexp, int flag)
@@ -1502,11 +1779,22 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 
 			if (cmd=='\\' || cmd=='p' || cmd=='b') {
 				i = back;
+			} else if (cmd == 'd') {
+				// Skip remaining tracks in the current directory
+				char cur_dir[PATH_MAX];
+				get_dirpart(ls[i].d_name, cur_dir, sizeof(cur_dir));
+				while (i + 1 < num) {
+					char next_dir[PATH_MAX];
+					get_dirpart(ls[i + 1].d_name, next_dir, sizeof(next_dir));
+					if (strcmp(cur_dir, next_dir) != 0) break;
+					i++;
+				}
+				back = i - 1;
 			}
 			if (cmd=='q' || cmd==0x1b) {
 				break;
 			}
-			back = i-1;
+			if (cmd != 'd') back = i-1;
 		}
 		free(ls);
 	} while (loop_mode);
@@ -1579,6 +1867,7 @@ void usage(FILE* fp, int argc, char** argv)
 	        "  Up / Down          Volume +/- %.0f%%\n"
 	        "  C                  Toggle crosstalk cancellation\n"
 	        "  B / \\              Back to previous track\n"
+	        "  d                  Skip to next directory\n"
 	        "  Q / Esc            Quit\n"
 	        "  (any other key)    Next track\n"
 	        "\n",

@@ -164,6 +164,8 @@ int key(AUDIO *a, tui_state_t *ts)
 	}
 
 	if (c==0x20) {
+		// Quick pause: keeps the device open, resumes instantly, but the
+		// sound card stays held by us the whole time.
 		snd_pcm_pause(a->handle, 1);
 		if (ts) {
 			ts->paused = 1;
@@ -176,6 +178,29 @@ int key(AUDIO *a, tui_state_t *ts)
 		cmd = 0;
 		snd_pcm_pause(a->handle, 0);
 		snd_pcm_prepare(a->handle);
+		if (ts) {
+			ts->paused = 0;
+			tui_render(ts);
+		}
+		return 0;
+	}
+
+	if (c==0x09) { // Tab
+		// Release pause: actually gives up the device (snd_pcm_close) so
+		// another application can use the sound card while we're paused.
+		// Slower to resume than Space, since the device has to be reopened.
+		AUDIO_release(a);
+		if (ts) {
+			ts->paused = 1;
+			tui_render(ts);
+		}
+		do {
+			usleep(1000); // us
+		} while (!kbhit());
+		getchar(); // clear
+		cmd = 0;
+		AUDIO_reopen(a);
+		apply_alsa_volume(); // mixer setting is lost if the device changed hands
 		if (ts) {
 			ts->paused = 0;
 			tui_render(ts);
@@ -1863,6 +1888,8 @@ void usage(FILE* fp, int argc, char** argv)
 	        "\n"
 	        "During playback:\n"
 	        "  Space              Pause / resume\n"
+	        "  Tab                Pause / resume, releasing the ALSA device meanwhile\n"
+	        "                     (so other apps can use the sound card)\n"
 	        "  Left / Right       Seek -/+ %ds (FLAC, MP3, WAV, OGG)\n"
 	        "  Up / Down          Volume +/- %.0f%%\n"
 	        "  C                  Toggle crosstalk cancellation\n"

@@ -13,6 +13,7 @@
 ## 💿 Supported File Formats
 aplay+ supports a variety of popular audio formats:
 - 🌟 **FLAC**: High-quality lossless compression
+- 🌟 **DSD (DSF)**: Direct Stream Digital (high-resolution 1-bit audio)
 - 🌊 **WAV**: Uncompressed audio with crystal-clear quality
 - 🎶 **MP3**: The most commonly used compressed format
 - 🎵 **Ogg Vorbis**: Great compression with excellent sound

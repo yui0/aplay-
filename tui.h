@@ -85,6 +85,7 @@ typedef struct {
 	int xtc_on;
 	float xtc_atten;
 	int loop_mode;
+	const char *format_filter; /* active playlist format filter (e.g. "flac"), NULL/"" = ALL */
 
 	const char *note;	/* optional short transient note, e.g. "buffer underrun", NULL if none */
 } tui_state_t;
@@ -577,23 +578,35 @@ static void tui_render(tui_state_t *s)
 		const char *vol_color = pct > 66 ? C_VOL_HI : (pct > 33 ? C_VOL_MID : C_VOL_LO);
 		const char *xtc_color = s->xtc_on ? C_ON : C_OFF;
 		const char *loop_color = s->loop_mode ? C_ON : C_OFF;
+		int has_filter = s->format_filter && s->format_filter[0];
+		const char *filter_color = has_filter ? C_ON : C_OFF;
 		char xtc_part[64];
 		if (s->xtc_on) {
 			snprintf(xtc_part, sizeof(xtc_part), "%sXTC:ON(%.2f)%s", xtc_color, s->xtc_atten, C_RESET);
 		} else {
 			snprintf(xtc_part, sizeof(xtc_part), "%sXTC:OFF%s", xtc_color, C_RESET);
 		}
+		char filter_part[64];
+		snprintf(filter_part, sizeof(filter_part), "%s%s%s", filter_color,
+		         has_filter ? s->format_filter : "ALL", C_RESET);
+		char note_part[300];
+		if (s->note) {
+			snprintf(note_part, sizeof(note_part), "  " C_NOTEMSG "%s" C_RESET, s->note);
+		} else {
+			note_part[0] = 0;
+		}
 		snprintf(line, sizeof(line),
-		         " " C_LABEL "Vol:" C_RESET "%s%3d%%" C_RESET "  %s  " C_LABEL "Loop:" C_RESET "%s%s" C_RESET "%s%s%s",
+		         " " C_LABEL "Vol:" C_RESET "%s%3d%%" C_RESET "  %s  " C_LABEL "Loop:" C_RESET "%s%s" C_RESET
+		         "  " C_LABEL "Fmt:" C_RESET "%s%s",
 		         vol_color, pct, xtc_part,
 		         loop_color, s->loop_mode ? "ON" : "OFF",
-		         s->note ? "  " C_NOTEMSG : "", s->note ? s->note : "", s->note ? C_RESET : "");
+		         filter_part, note_part);
 	}
 	tui_line(line, inner);
 
 	/* line 6: keybind footer */
-	tui_line(" " C_FOOTER "[Space]Pause [\xe2\x86\x90\xe2\x86\x92]Seek" "\xc2\xb1" "10s [\xe2\x86\x91\xe2\x86\x93]Vol"
-	         " [C]rosstalk [B]ack [Q/Esc]Quit" C_RESET, inner);
+	tui_line(" " C_FOOTER "[Tab]Pause [\xe2\x86\x90\xe2\x86\x92]Seek" "\xc2\xb1" "10s [\xe2\x86\x91\xe2\x86\x93]Vol"
+	         " [C]rosstalk [F]ormat [B]ack [Q/Esc]Quit" C_RESET, inner);
 
 	tui_hline("\xe2\x94\x94", "\xe2\x94\x80", "\xe2\x94\x98", inner); /* └──┘ */
 

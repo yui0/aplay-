@@ -51,6 +51,15 @@ float speaker_distance_m = 0.5;
 int cmd;
 int track_index = 0, track_total = 0; // current position in the playlist, for the TUI panel
 
+// Interactive format filter, cycled with the 'f' key during playback (see
+// key() below). NULL means "ALL" (no filtering). play_dir() re-checks this
+// on every file in its listing, so a change takes effect from the very next
+// track without needing to restart the player.
+static const char *fmt_cycle[] = { NULL, "flac", "mp3", "m4a", "ogg", "wav", "wma", "dsf", "dff" };
+static const int fmt_cycle_n = sizeof(fmt_cycle) / sizeof(fmt_cycle[0]);
+static int fmt_filter_idx = 0;
+char *fmt_filter = NULL;
+
 //char *dev = "default";  // "plughw:0,0"
 char *dev = "hw:0,0";  // BitPerfect
 
@@ -147,6 +156,20 @@ int key(AUDIO *a, tui_state_t *ts)
 		cmd = c;
 	}
 
+	if (c == 'f') {
+		// Cycle to the next format filter (ALL -> flac -> mp3 -> ... -> ALL).
+		// Takes effect from the next track play_dir() considers; the current
+		// track keeps playing.
+		fmt_filter_idx = (fmt_filter_idx + 1) % fmt_cycle_n;
+		fmt_filter = (char *)fmt_cycle[fmt_filter_idx];
+		if (ts) {
+			ts->format_filter = fmt_filter;
+			ts->note = fmt_filter ? fmt_filter : "ALL";
+			tui_render(ts);
+		}
+		return 0;
+	}
+
 	if (c == KEY_UP || c == KEY_DOWN) {
 		volume += (c == KEY_UP ? VOLUME_STEP : -VOLUME_STEP);
 		if (volume > 1.0f) {
@@ -163,7 +186,7 @@ int key(AUDIO *a, tui_state_t *ts)
 		return 0;
 	}
 
-	if (c==0x20) {
+	if (c==0x09) { // Tab
 		// Quick pause: keeps the device open, resumes instantly, but the
 		// sound card stays held by us the whole time.
 		snd_pcm_pause(a->handle, 1);
@@ -185,10 +208,10 @@ int key(AUDIO *a, tui_state_t *ts)
 		return 0;
 	}
 
-	if (c==0x09) { // Tab
+	if (c==0x20) { // Space
 		// Release pause: actually gives up the device (snd_pcm_close) so
 		// another application can use the sound card while we're paused.
-		// Slower to resume than Space, since the device has to be reopened.
+		// Slower to resume than Tab, since the device has to be reopened.
 		AUDIO_release(a);
 		if (ts) {
 			ts->paused = 1;
@@ -377,6 +400,7 @@ void print_test_mode_status(int phase, int flag, CrosstalkCancel *xtc, int sampl
 	ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
 	ts.xtc_atten = xtc->attenuation;
 	ts.loop_mode = loop_mode;
+	ts.format_filter = fmt_filter;
 	ts.note = "[+/-] adjust attenuation";
 	tui_render(&ts);
 }
@@ -544,6 +568,7 @@ void play_wav(char *name, int format, int flag)
 		ts.total = wav.totalPCMFrameCount > 0 ? (double)wav.totalPCMFrameCount / wav.sampleRate : 0.0;
 		ts.volume = volume;
 		ts.loop_mode = loop_mode;
+		ts.format_filter = fmt_filter;
 
 		uint64_t c = 0;
 		tui_open();
@@ -707,6 +732,7 @@ void play_flac(char *name, int format, int flag)
 	ts.total = n_samples > 0 ? (double)n_samples / sample_rate : 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
+	ts.format_filter = fmt_filter;
 
 	/* Accumulation buffer: foxen-flac decodes one block at a time
 	 * (up to FX_OUT_SAMPLES interleaved samples).  We drain it FRAMES
@@ -851,6 +877,7 @@ void play_flac(char *name, int format, int flag)
 	ts.total = flac->totalPCMFrameCount > 0 ? (double)flac->totalPCMFrameCount / flac->sampleRate : 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
+	ts.format_filter = fmt_filter;
 
 	uint64_t c = 0;
 	tui_open();
@@ -898,6 +925,8 @@ void play_flac(char *name, int format, int flag)
 
 #endif /* USE_FOXEN_FLAC */
 
+// Handles both .dsf (Sony DSF) and .dff (Philips DSDIFF) files; dsd.h
+// auto-detects the container format from the file's magic bytes.
 void play_dsf(char *name, int format, int flag)
 {
 	FILE *f = fopen(name, "rb");
@@ -931,7 +960,7 @@ void play_dsf(char *name, int format, int flag)
 	char dirbuf[PATH_MAX];
 	get_dirpart(name, dirbuf, sizeof(dirbuf));
 	ts.dir = dirbuf;
-	ts.codec = "DSF";
+	ts.codec = (decoder->file_type == DSD_FILE_DFF) ? "DFF" : "DSF";
 	ts.rate = decoder->sample_rate_pcm;
 	ts.bits = format == SND_PCM_FORMAT_FLOAT_LE ? 32 : 16;
 	ts.channels = decoder->channels;
@@ -941,6 +970,7 @@ void play_dsf(char *name, int format, int flag)
 	           (double)decoder->totalPCMFrameCount / decoder->sample_rate_pcm : 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
+	ts.format_filter = fmt_filter;
 
 	uint64_t frames_played = 0;
 	tui_open();
@@ -957,7 +987,7 @@ void play_dsf(char *name, int format, int flag)
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
 		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
-			ts.note = "seek not supported for DSF";
+			ts.note = (decoder->file_type == DSD_FILE_DFF) ? "seek not supported for DFF" : "seek not supported for DSF";
 			tui_render(&ts);
 		} else if (k) {
 			break;
@@ -1020,6 +1050,7 @@ int play_mp3(char *name, int format, int flag)
 	ts.total = totalPCMFrameCount > 0 ? (double)totalPCMFrameCount / mp3.sampleRate : 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
+	ts.format_filter = fmt_filter;
 
 	uint64_t c = 0;
 	tui_open();
@@ -1161,6 +1192,7 @@ void play_ogg(char *name, int flag)
 	ts.total = 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
+	ts.format_filter = fmt_filter;
 
 	uint64_t c = 0;
 	tui_open();
@@ -1306,6 +1338,7 @@ int play_wma(char *name, int flag)
 	ts.total_raw = (uint64_t)len;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
+	ts.format_filter = fmt_filter;
 
 	tui_open();
 	while (bytes_left > 0) {
@@ -1672,6 +1705,7 @@ int play_aac(char *name, int flag)
     ts.total_raw = (uint64_t)bytes_left;
     ts.volume = volume;
     ts.loop_mode = loop_mode;
+    ts.format_filter = fmt_filter;
 
     tui_open();
     while (bytes_left > 0) {
@@ -1751,6 +1785,13 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 					continue;
 				}
 			}
+			// Interactive filter set with the 'f' key (see key()); re-read live
+			// so toggling it mid-playlist takes effect from the next track.
+			if (fmt_filter) {
+				if (!strstr(e, fmt_filter)) {
+					continue;
+				}
+			}
 			if (regexp) {
 				const char *error;
 				//Reprog *p = regcomp(regexp, 0, &error);
@@ -1796,7 +1837,7 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 				play_wav(path, format, flag);
 			} else if (strstr(e, "wma")) {
 				play_wma(path, flag);
-			} else if (strstr(e, "dsf")) {
+			} else if (strstr(e, "dsf") || strstr(e, "dff")) {
 				play_dsf(path, format, flag);
 			} else {
 				continue;
@@ -1877,7 +1918,7 @@ void usage(FILE* fp, int argc, char** argv)
 	        "-r                 Recursively search directories\n"
 	        "-x                 Enable random playback\n"
 	        "-s <regexp>        Search files with a regex\n"
-	        "-t <ext type>      Specify file type (e.g., flac, mp3, wma, dsf...)\n"
+	        "-t <ext type>      Specify file type (e.g., flac, mp3, wma, dsf, dff...)\n"
 	        "-p                 Optimize for Linux platforms\n"
 	        "-l                 Loop the directory playlist\n"
 	        "-v                 Verbose mode\n"
@@ -1887,12 +1928,13 @@ void usage(FILE* fp, int argc, char** argv)
 	        "-T                 Enable test mode (sine wave: left, right, pan)\n"
 	        "\n"
 	        "During playback:\n"
-	        "  Space              Pause / resume\n"
-	        "  Tab                Pause / resume, releasing the ALSA device meanwhile\n"
+	        "  Tab                Pause / resume\n"
+	        "  Space              Pause / resume, releasing the ALSA device meanwhile\n"
 	        "                     (so other apps can use the sound card)\n"
 	        "  Left / Right       Seek -/+ %ds (FLAC, MP3, WAV, OGG)\n"
 	        "  Up / Down          Volume +/- %.0f%%\n"
 	        "  C                  Toggle crosstalk cancellation\n"
+	        "  F                  Cycle playlist format filter (ALL/flac/mp3/m4a/ogg/wav/wma/dsf/dff)\n"
 	        "  B / \\              Back to previous track\n"
 	        "  d                  Skip to next directory\n"
 	        "  Q / Esc            Quit\n"

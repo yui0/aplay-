@@ -2,7 +2,7 @@
 
 ![GitHub Repo stars](https://img.shields.io/github/stars/yui0/aplay-?style=social)
 ![GitHub code size in bytes](https://img.shields.io/github/languages/code-size/yui0/aplay-)
-![Lines of code](https://img.shields.io/tokei/lines/github/yui0/aplay-)
+![Languages](https://img.shields.io/github/languages/top/yui0/aplay-)
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/yui0/aplay-)](https://github.com/yui0/aplay-/releases)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](LICENSE)
 
@@ -130,6 +130,13 @@ echo tsc > /sys/devices/system/clocksource/clocksource0/current_clocksource
 ```
 
 ulimit -a
+
+## 🎶 Sample Music
+
+- https://www.nativedsd.com/dsd-reviews/homeland-pure-dsd256-large-orchestra-recording-from-eudora-records/
+- https://www.iriver.jp/products/product_94.php#5
+- https://samplerateconverter.com/educational/dsd1024
+- https://www.hifistatement.net/download/item/2227-pcm-384-32-dsd64-dsd128-und-dsd-256-a-trace-of-grace
 
 ## 📖 References
 

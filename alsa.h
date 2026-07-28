@@ -1,5 +1,5 @@
 /* public domain Simple, Minimalistic, Audio library for ALSA
- *	©2017,2020 Yuichiro Nakada
+ *	©2017,2020,2026 Yuichiro Nakada
  *
  * Basic usage:
  *	AUDIO a;
@@ -93,6 +93,10 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 		snd_pcm_close(thiz->handle);
 		return 1;
 	}
+	// Persist the rate ALSA actually selected (may differ from the request
+	// when the hardware cannot do the exact rate). Callers that need a
+	// bit-exact match (DoP / DSD monitor) must compare against thiz->freq.
+	thiz->freq = freq;
 
 	// Set period size to 32 frames.
 	thiz->frames = frames;
@@ -113,7 +117,6 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	thiz->size = thiz->frames * 4 * ch; /* 4 bytes/sample, 2 channels */
 	thiz->buffer = (char*)malloc(thiz->size);
 
-	snd_pcm_hw_params_get_period_time(params, &freq, &dir);
 	return 0;
 }
 

@@ -5,6 +5,7 @@
 ![Languages](https://img.shields.io/github/languages/top/yui0/aplay-)
 [![GitHub release (latest by date)](https://img.shields.io/github/v/release/yui0/aplay-)](https://github.com/yui0/aplay-/releases)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg?style=flat)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/Sponsor%20this%20project-%E2%9D%A4%EF%B8%8F-white?logo=githubsponsors&logoColor=EA4AAA&labelColor=EA4AAA)](https://github.com/sponsors/yui0)
 
 🎧 **Enjoy BitPerfect audio playback with simplicity and precision!**
 

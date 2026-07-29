@@ -5,11 +5,13 @@
 
 #include <stdio.h>
 #include <sys/mman.h>
+#include <sys/select.h> // for select(), used to sleep without busy-waiting
 #include <string.h> // for memcpy
 #include <math.h>   // for sin
 #include <fcntl.h>  // for open, lseek
 #include <unistd.h> // for close
 #include <limits.h> // for PATH_MAX
+#include <time.h>   // for clock_gettime, used to throttle keyboard polling
 
 #include "alsa.h"
 #ifdef USE_FOXEN_FLAC
@@ -53,6 +55,17 @@ float speaker_distance_m = 0.5;
 int cmd;
 int track_index = 0, track_total = 0; // current position in the playlist, for the TUI panel
 
+// Accumulates the net effect of runtime toggles made with the 'c' (crosstalk)
+// and 'e' (DSD/DoP) keys during playback. Each play_*() function only ever
+// sees a *copy* of the `flag` bitmask passed in by play_dir(), so toggling a
+// bit locally does not, by itself, survive into the next track. Since both
+// toggles are implemented as `flag ^= BIT`, XORing the same bit into this
+// global on every toggle reproduces the exact cumulative effect regardless of
+// how many times it was pressed; play_dir() then XORs it back into the
+// original command-line flag before starting each new track, so the c/e
+// state carries over correctly from one track to the next.
+int g_flag_diff = 0;
+
 // -o <path>: when set, every DSD-encoded chunk (whichever track/route produced
 // it) is also appended here as a raw bitstream, in addition to (or instead of,
 // if playback fails to open) DoP playback. Optional feature, off by default.
@@ -81,6 +94,26 @@ char *dev = "hw:0,0";  // BitPerfect
 #define SEEK_SECONDS   10      // amount of fast-forward/rewind per Left/Right press
 #define VOLUME_STEP    0.05f   // amount of volume change per Up/Down press
 
+// key() is invoked once per decoded audio buffer -- with FRAMES=32 at
+// 44.1kHz that's over 1000 times/sec -- and kbhit() polls the terminal via a
+// syscall (select/poll) each time. Nobody presses keys at kHz rates, so
+// gating actual kbhit() calls to at most once per this interval cuts that
+// syscall overhead by ~80%+ while staying far below human reaction time
+// (i.e. no perceptible loss of responsiveness).
+#define KEY_POLL_INTERVAL_US 4000 // 4ms -> at most ~250 kbhit() calls/sec
+
+// Blocks until a key is available on stdin, without busy-waiting: sleeps
+// inside the kernel via select() (0% CPU while idle) instead of the
+// wake-up-every-millisecond-and-poll loop this replaces. Used while paused
+// (Tab/Space), where we have nothing else to do until the user presses a key.
+static void wait_for_keypress(void)
+{
+	fd_set fds;
+	FD_ZERO(&fds);
+	FD_SET(STDIN_FILENO, &fds);
+	select(STDIN_FILENO + 1, &fds, NULL, NULL, NULL);
+}
+
 // Returns a pointer to the filename portion of `path`, stripping any
 // leading directory components (everything up to and including the last
 // '/'). Used so the TUI marquee shows only the file name, not the full path.
@@ -107,6 +140,18 @@ void apply_alsa_volume(void)
 // panel reflects the paused state instead of freezing silently.
 int key(AUDIO *a, tui_state_t *ts)
 {
+	// Throttle how often we actually hit kbhit() (see KEY_POLL_INTERVAL_US
+	// above); called this often, checking every single time is wasted CPU.
+	static struct timespec last_check = {0, 0};
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	long elapsed_us = (now.tv_sec - last_check.tv_sec) * 1000000L +
+	                  (now.tv_nsec - last_check.tv_nsec) / 1000L;
+	if (elapsed_us < KEY_POLL_INTERVAL_US) {
+		return 0;
+	}
+	last_check = now;
+
 	if (!kbhit()) {
 		return 0;
 	}
@@ -194,7 +239,7 @@ int key(AUDIO *a, tui_state_t *ts)
 		return 0;
 	}
 
-	if (c==0x09) { // Tab
+	if (c==0x20) { // Space
 		// Quick pause: keeps the device open, resumes instantly, but the
 		// sound card stays held by us the whole time.
 		snd_pcm_pause(a->handle, 1);
@@ -202,9 +247,7 @@ int key(AUDIO *a, tui_state_t *ts)
 			ts->paused = 1;
 			tui_render(ts);
 		}
-		do {
-			usleep(1000); // us
-		} while (!kbhit());
+		wait_for_keypress(); // sleeps at 0% CPU instead of polling every 1ms
 		getchar(); // clear
 		cmd = 0;
 		snd_pcm_pause(a->handle, 0);
@@ -216,18 +259,16 @@ int key(AUDIO *a, tui_state_t *ts)
 		return 0;
 	}
 
-	if (c==0x20) { // Space
+	if (c==0x09) { // Tab
 		// Release pause: actually gives up the device (snd_pcm_close) so
 		// another application can use the sound card while we're paused.
-		// Slower to resume than Tab, since the device has to be reopened.
+		// Slower to resume than Space, since the device has to be reopened.
 		AUDIO_release(a);
 		if (ts) {
 			ts->paused = 1;
 			tui_render(ts);
 		}
-		do {
-			usleep(1000); // us
-		} while (!kbhit());
+		wait_for_keypress(); // sleeps at 0% CPU instead of polling every 1ms
 		getchar(); // clear
 		cmd = 0;
 		AUDIO_reopen(a);
@@ -906,6 +947,7 @@ void play_test_mode(int format, int flag)
 			}
 			if (k == 'c') {
 				flag ^= USE_CROSSTALK;
+				g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 			}
 			if (k == '+' || k == '=') {
 				xtc.attenuation += 0.05f;
@@ -1043,8 +1085,10 @@ void play_wav(char *name, int format, int flag)
 		int k = key(outr_audio(&router), &ts);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
+			g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 		} else if (k=='e') {
 			outr_toggle(&router);
+			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE; // persist toggle across tracks
 			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "WAV->DSD(mon)" : "WAV->DSD(DoP)") : (format ? "WAV/F32" : "WAV");
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
@@ -1267,8 +1311,10 @@ void play_flac(char *name, int format, int flag)
 		int k = key(outr_audio(&router), &ts);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
+			g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 		} else if (k == 'e') {
 			outr_toggle(&router);
+			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE; // persist toggle across tracks
 			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)") : "FLAC";
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
@@ -1356,8 +1402,10 @@ void play_flac(char *name, int format, int flag)
 		int k = key(outr_audio(&router), &ts);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
+			g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 		} else if (k=='e') {
 			outr_toggle(&router);
+			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE; // persist toggle across tracks
 			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)") : "FLAC";
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
@@ -1458,6 +1506,7 @@ void play_dsf(char *name, int format, int flag)
 		int k = key(&a, &ts);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
+			g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
 			ts.note = (decoder->file_type == DSD_FILE_DFF) ? "seek not supported for DFF" : "seek not supported for DSF";
 			tui_render(&ts);
@@ -1533,8 +1582,10 @@ int play_mp3(char *name, int format, int flag)
 		int k = key(outr_audio(&router), &ts);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
+			g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 		} else if (k=='e') {
 			outr_toggle(&router);
+			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE; // persist toggle across tracks
 			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "MP3->DSD(mon)" : "MP3->DSD(DoP)") : "MP3";
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
@@ -1701,8 +1752,10 @@ void play_ogg(char *name, int flag)
 		int k = key(outr_audio(&router), &ts);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
+			g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 		} else if (k=='e') {
 			outr_toggle(&router);
+			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE; // persist toggle across tracks
 			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "OGG->DSD(mon)" : "OGG->DSD(DoP)") : "OGG";
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
@@ -1885,8 +1938,10 @@ int play_wma(char *name, int flag)
 		int k = key(outr_audio(&router), &ts);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
+			g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 		} else if (k == 'e') {
 			outr_toggle(&router);
+			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE; // persist toggle across tracks
 			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "WMA->DSD(mon)" : "WMA->DSD(DoP)") : "WMA";
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
@@ -1999,7 +2054,7 @@ int play_wma(char *name, int flag)
         }
 
         int k = key(&a);
-        if (k=='c') flag ^= USE_CROSSTALK;
+        if (k=='c') { flag ^= USE_CROSSTALK; g_flag_diff ^= USE_CROSSTALK; } // persist toggle across tracks
         else if (k) break;
     }
     printf("\e[?25h");
@@ -2134,6 +2189,7 @@ int play_wma(char *name, int flag)
 		int k = key(&a);
 		if (k=='c') {
 			flag ^= USE_CROSSTALK;
+			g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
 		} else if (k) {
 			break;
 		}
@@ -2259,8 +2315,10 @@ int play_aac(char *name, int flag)
         int k = key(outr_audio(&router), &ts);
         if (k == 'c') {
             flag ^= USE_CROSSTALK;
+            g_flag_diff ^= USE_CROSSTALK; // persist toggle across tracks
         } else if (k == 'e') {
             outr_toggle(&router);
+            flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE; // persist toggle across tracks
             ts.codec = router.use_dsd
                 ? (router.dsd.monitor_mode
                    ? (sbr_enabled ? "AAC/SBR->DSD(mon)" : "AAC->DSD(mon)")
@@ -2355,22 +2413,28 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 				continue;
 			}
 
+			// Fold in any 'c'/'e' toggles made during previous tracks (see
+			// g_flag_diff) so the crosstalk/DSD state carries over instead
+			// of resetting back to the original command-line flags.
+			int cur_flag = flag ^ g_flag_diff;
+			int cur_format = cur_flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
+
 			if (strstr(e, "flac")) {
-				play_flac(path, format, flag);
+				play_flac(path, cur_format, cur_flag);
 			} else if (strstr(e, "mp3")) {
-				play_mp3(path, format, flag);
+				play_mp3(path, cur_format, cur_flag);
 			} else if (strstr(e, "mp4")) {
-				play_aac(path, flag);
+				play_aac(path, cur_flag);
 			} else if (strstr(e, "m4a")) {
-				play_aac(path, flag);
+				play_aac(path, cur_flag);
 			} else if (strstr(e, "ogg")) {
-				play_ogg(path, flag);
+				play_ogg(path, cur_flag);
 			} else if (strstr(e, "wav")) {
-				play_wav(path, format, flag);
+				play_wav(path, cur_format, cur_flag);
 			} else if (strstr(e, "wma")) {
-				play_wma(path, flag);
+				play_wma(path, cur_flag);
 			} else if (strstr(e, "dsf") || strstr(e, "dff")) {
-				play_dsf(path, format, flag);
+				play_dsf(path, cur_format, cur_flag);
 			} else {
 				continue;
 			}
@@ -2466,8 +2530,8 @@ void usage(FILE* fp, int argc, char** argv)
 	        "                   by default, playback is unaffected either way)\n"
 	        "\n"
 	        "During playback:\n"
-	        "  Tab                Pause / resume\n"
-	        "  Space              Pause / resume, releasing the ALSA device meanwhile\n"
+	        "  Space              Pause / resume\n"
+	        "  Tab                Pause / resume, releasing the ALSA device meanwhile\n"
 	        "                     (so other apps can use the sound card)\n"
 	        "  Left / Right       Seek -/+ %ds (FLAC, MP3, WAV, OGG)\n"
 	        "  Up / Down          Volume +/- %.0f%%\n"

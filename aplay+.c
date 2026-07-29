@@ -2419,6 +2419,15 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 			int cur_flag = flag ^ g_flag_diff;
 			int cur_format = cur_flag & USE_FLOAT32 ? SND_PCM_FORMAT_FLOAT_LE : 0;
 
+			// Reset cmd before playing this track. Otherwise, if the track
+			// ends naturally (end of file, no key pressed) rather than via
+			// a keypress, cmd still holds whatever key was pressed to end
+			// the *previous* track (e.g. 'b'/'d'/'q'), and the code below
+			// would misinterpret that stale value as if the user had just
+			// pressed it again for this track too (e.g. repeatedly jumping
+			// back, or quitting on the next natural track end).
+			cmd = 0;
+
 			if (strstr(e, "flac")) {
 				play_flac(path, cur_format, cur_flag);
 			} else if (strstr(e, "mp3")) {

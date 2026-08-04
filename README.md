@@ -11,6 +11,12 @@
 
 ![Logo](logo.jpeg)
 
+<p align="center">
+  <img src="screenshots/aplay-ui-hero.png" alt="aplay+ Ember UI — player, equalizer, and playlist" width="320">
+</p>
+
+<p align="center"><em>Ember Edition — Winamp-classic soul, audiophile controls, ALSA BitPerfect output</em></p>
+
 ## 💿 Supported File Formats
 aplay+ supports a variety of popular audio formats:
 - 🌟 **FLAC**: High-quality lossless compression
@@ -19,6 +25,13 @@ aplay+ supports a variety of popular audio formats:
 - 🎶 **MP3**: The most commonly used compressed format
 - 🎵 **Ogg Vorbis**: Great compression with excellent sound
 - 📱 **AAC (mp4/m4a)**: Widely used in iPhones and YouTube
+- 🎼 **WMA**: Windows Media Audio
+
+Realtime extras during playback:
+- 🔀 Crosstalk cancellation (XTC)
+- 🎹 PCM → DSD64 (DoP) output
+- ✨ Super-resolution upsampling
+- 🎚️ ALSA mixer volume and live device switching
 
 ## 🔧 How to build
 
@@ -29,8 +42,16 @@ aplay+ supports a variety of popular audio formats:
 ### Build Locally
 1. Install required libraries:
   ```bash
-  # dnf install alsa-lib-devel
-  $ make
+  sudo dnf install alsa-lib-devel
+  # GUI also needs: glfw, OpenGL, unzip (for .wsz skins)
+  sudo dnf install alsa-lib-devel glfw-devel mesa-libGL-devel unzip
+  make
+  ```
+
+  ```bash
+  sudo apt install -y libasound2-dev rpm build-essential git
+  sudo apt install -y libglfw3-dev libgl-dev unzip
+  make
   ```
 
 2. Clone the repository and build:
@@ -39,6 +60,77 @@ aplay+ supports a variety of popular audio formats:
   cd aplay-
   make
   ```
+
+### Build the graphical player
+
+The graphical build uses ALSA, GLFW, and OpenGL. It also uses the `unzip`
+command at runtime when a compressed Winamp `.wsz` skin is selected.
+
+```bash
+make ui
+```
+
+### Winamp Classic skins
+
+Pass either a Winamp Classic `.wsz` file or an already extracted skin
+directory. A valid skin must contain `MAIN.BMP` and `CBUTTONS.BMP` (matching
+is case-insensitive). The original card-style interface has been removed.
+Without `--skin`, or when a custom skin is invalid, the player uses the
+built-in **aplay+ Ember** Winamp-style skin (warm charcoal + copper).
+
+The Ember artwork is generated entirely by `aplay+ui.c`, contains no
+Winamp artwork, and is distributed under this project's MIT license. It is
+safe to redistribute with the player. (Earlier builds called this skin
+**Graphite**; the built-in theme is now Ember.)
+
+```bash
+./aplay+ui --skin ~/Skins/MySkin.wsz /Music
+./aplay+ui -S ~/Skins/MySkin/ /Music
+./aplay+ui -R ~/Skins/          # skin pack: random skin per track
+```
+
+The Winamp main window and transport sprites are rendered from the skin.
+aplay+-specific XTC, DSD, repeat, and format controls remain in the rack below
+the classic player — and are also available from the right-click menu.
+
+<p align="center">
+  <img src="screenshots/aplay-ui-player.png" alt="aplay+ stacked player windows" width="280">
+</p>
+
+## 🖥️ Graphical player (`aplay+ui`)
+
+`make ui` builds a multi-window Winamp-style shell on top of the same playback
+engine as `aplay+`:
+
+| Window | Role |
+|--------|------|
+| Player | Transport, time, title, volume |
+| Equalizer | Spectrum / EQ chrome |
+| Playlist | Track list, device status, notes |
+| Context menu | Right-click anywhere on a surface |
+
+Right-click the player (or equalizer / playlist) for Play/Pause, seek, volume,
+XTC, DSD, super resolution, repeat, format filter, skins, About, and Exit.
+
+### ALSA device — hierarchical menu
+
+Output devices are chosen from a cascading submenu so cards stay easy to scan:
+
+1. **ALSA device ▸** in the context menu
+2. **Sound cards** flyout (`hw:N · Card name`)
+3. **Devices** flyout (`hw:N,M` for that card)
+
+The active card and PCM device are marked with a check. You can still click the
+device label in the playlist footer for the flat picker, or pass `-d` on the
+command line.
+
+<p align="center">
+  <img src="screenshots/aplay-ui-alsa-flyout.png" alt="Hierarchical ALSA device menu: cards then PCM devices" width="720">
+</p>
+
+<p align="center">
+  <img src="screenshots/aplay-ui-alsa-hierarchy.png" alt="aplay+ with ALSA card and device flyouts open" width="720">
+</p>
 
 ## 🌸 How to use
 
@@ -49,6 +141,8 @@ Usage: ./aplay+ [options] dir
 
 Options:
 -h                 Print this help message
+-S <path>          Use a Winamp Classic .wsz file or extracted skin directory
+--skin <path>      Same as -S
 -d <device name>   Specify ALSA device [e.g., default hw:0,0 plughw:0,0...]
 -f                 Use 32-bit floating-point playback
 -r                 Recursively search directories
@@ -56,6 +150,43 @@ Options:
 -s <regexp>        Search files with a regex
 -t <ext type>      Specify file type (e.g., flac, mp3, wma...)
 -p                 Optimize for Linux platforms
+```
+
+`aplay+ui` accepts the same playback options, plus skin-pack and audiophile
+flags. Summary of the GUI help:
+
+```bash
+$ ./aplay+ui -h
+Usage: ./aplay+ui [options] dir
+
+A luna-ui player window opens automatically. Playback, seek, volume,
+Crosstalk, DSD, super resolution, format filter, repeat, device, and quit are
+controlled from the right-click menu (and keyboard shortcuts).
+Add folder... appends a directory to the playlist.
+
+Options:
+-h                 Print this help message
+-S <path>          Use a Winamp Classic .wsz file or extracted skin directory
+--skin <path>      Same as -S
+-R <dir>           Skin pack folder (.wsz files and/or skin directories).
+                   When set, a random skin is applied on each track change
+                   (toggle from the right-click menu)
+--skins <dir>      Same as -R
+-d <device name>   Specify ALSA device [e.g., default hw:0,0 plughw:0,0...]
+-f                 Use 32-bit floating-point playback
+-r                 Recursively search directories
+-x                 Enable random playback
+-s <regexp>        Search files with a regex
+-t <ext type>      Specify file type (e.g., flac, mp3, wma, dsf, dff...)
+-p                 Optimize for Linux platforms
+-l                 Loop the directory playlist
+-v                 Verbose mode
+-V <volume>        Set ALSA mixer volume (0.0-1.0, default 1.0)
+-c                 Enable crosstalk cancellation
+-D                 Speaker distance for crosstalk cancellation
+-T                 Enable test mode (sine wave: left, right, pan)
+-e                 Start playback with real-time PCM->DSD64 (DoP) output
+-o <path>          Also write the raw DSD bitstream when DoP is active
 ```
 
 ### Examples
@@ -70,6 +201,14 @@ Options:
 - 🎹 **Exclude instrumentals from playback**:
   ```bash
   $ ./aplay+ -rfx -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
+  ```
+- 🖥️ **Graphical Ember UI with a USB DAC**:
+  ```bash
+  $ ./aplay+ui -rxfp -d hw:7,0 /Music/
+  ```
+- 🎨 **Skin pack (random skin each track)**:
+  ```bash
+  $ ./aplay+ui -R ~/Skins -d hw:7,0 /Music/
   ```
 
 ## 🌟 Linux Optimization Settings

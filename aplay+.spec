@@ -1,5 +1,5 @@
 %define name aplay+
-%define version 1.3
+%define version 1.4
 %define release b1
 
 Name:		%{name}
@@ -20,11 +20,12 @@ a simple BitPerfect player
 
 %build
 make
+make ui
 
 %install
 mkdir -p %{buildroot}/usr/bin
 strip aplay+
-install -m 755 aplay+ %{buildroot}/usr/bin
+install -m 755 aplay+* %{buildroot}/usr/bin
 
 %clean
 [ -n "%{buildroot}" -a "%{buildroot}" != / ] && rm -rf %{buildroot}

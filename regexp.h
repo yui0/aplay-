@@ -4,9 +4,9 @@
 typedef struct Reprog Reprog;
 typedef struct Resub Resub;
 
-Reprog *regcomp(const char *pattern, int cflags, const char **errorp);
-int regexec(Reprog *prog, const char *string, Resub *sub, int eflags);
-void regfree(Reprog *prog);
+static Reprog *regcomp(const char *pattern, int cflags, const char **errorp);
+static int regexec(Reprog *prog, const char *string, Resub *sub, int eflags);
+static void regfree(Reprog *prog);
 
 enum {
 	/* regcomp flags */
@@ -867,7 +867,7 @@ static void dumpprog(Reprog *prog)
 }
 #endif
 
-Reprog *regcomp(const char *pattern, int cflags, const char **errorp)
+static Reprog *regcomp(const char *pattern, int cflags, const char **errorp)
 {
 	Renode *node;
 	Reinst *split, *jump;
@@ -942,7 +942,7 @@ Reprog *regcomp(const char *pattern, int cflags, const char **errorp)
 	return g.prog;
 }
 
-void regfree(Reprog *prog)
+static void regfree(Reprog *prog)
 {
 	if (prog) {
 		free(prog->start);
@@ -1151,7 +1151,7 @@ static int match(Reinst *pc, const char *sp, const char *bol, int flags, Resub *
 	}
 }
 
-int regexec(Reprog *prog, const char *sp, Resub *sub, int eflags)
+static int regexec(Reprog *prog, const char *sp, Resub *sub, int eflags)
 {
 	Resub scratch;
 	int i;

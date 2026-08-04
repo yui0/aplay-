@@ -71,14 +71,24 @@ static void gui_requeue_key(int key_code)
 		__atomic_store_n(&g_injected_key, key_code, __ATOMIC_SEQ_CST);
 }
 
+enum {
+	GUI_DIRTY_META           = 1u << 0,
+	GUI_DIRTY_STATE          = 1u << 1,
+	GUI_DIRTY_TIME           = 1u << 2,
+	GUI_DIRTY_VOLUME         = 1u << 3,
+	GUI_DIRTY_NOTE           = 1u << 4,
+	GUI_DIRTY_PLAYLIST_ROWS  = 1u << 5,
+	GUI_DIRTY_PLAYLIST_STYLE = 1u << 6,
+	GUI_DIRTY_MENU           = 1u << 7,
+	GUI_DIRTY_ALL            = (1u << 8) - 1u
+};
+
 typedef struct {
-	pthread_mutex_t lock;
 	char filename[PATH_MAX];
 	char dir[PATH_MAX];
 	char codec[32];
 	char note[128];
 	char device[64];
-	char format_filter[16];
 	int rate, bits, channels;
 	double cur, total;
 	float volume;
@@ -91,10 +101,11 @@ typedef struct {
 	int track_index, track_total;
 	int playlist_first, playlist_count;
 	char playlist_lines[13][256];
-	unsigned version;
+	unsigned dirty;
 } GuiState;
 
-static GuiState g_gui = { .lock = PTHREAD_MUTEX_INITIALIZER };
+static pthread_mutex_t g_gui_lock = PTHREAD_MUTEX_INITIALIZER;
+static GuiState g_gui = { .dirty = GUI_DIRTY_ALL };
 static volatile int g_gui_should_close = 0;
 static char g_playlist_names[1024][256];
 static int g_playlist_name_count = 0;
@@ -106,10 +117,46 @@ static volatile int g_playlist_request_direction = 1;
 static volatile int g_device_picker_mode = 0;
 static int g_device_picker_scroll = 0;
 static int g_device_picker_selected = -1;
-static double g_playlist_last_click_time = 0.0;
-static int g_playlist_last_click_item = -1;
 /* Initial engine flag bitmask; XOR with g_flag_diff gives live DSD/SR/XTC. */
 static int g_start_flag = 0;
+
+static int gui_copy_string_if_changed(char *dst, size_t dst_n, const char *src)
+{
+	if (!dst || dst_n == 0) return 0;
+	if (!src) src = "";
+	size_t n = strlen(src);
+	if (n >= dst_n) n = dst_n - 1;
+	if (strlen(dst) == n && !memcmp(dst, src, n)) return 0;
+	memcpy(dst, src, n);
+	dst[n] = '\0';
+	return 1;
+}
+
+static void gui_mark_dirty_locked(unsigned bits)
+{
+	g_gui.dirty |= bits;
+}
+
+static void gui_set_note_locked(const char *note)
+{
+	if (gui_copy_string_if_changed(g_gui.note, sizeof(g_gui.note), note))
+		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+}
+
+static void gui_fill_playlist_rows_locked(int first)
+{
+	int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
+	if (first < 0) first = 0;
+	if (first > max_first) first = max_first;
+	g_gui.playlist_first = first;
+	g_gui.playlist_count = g_playlist_name_count;
+	for (int i = 0; i < 13; i++) {
+		int item = first + i;
+		snprintf(g_gui.playlist_lines[i], sizeof(g_gui.playlist_lines[i]), "%s",
+			item < g_playlist_name_count ? g_playlist_names[item] : "");
+	}
+	gui_mark_dirty_locked(GUI_DIRTY_PLAYLIST_ROWS | GUI_DIRTY_PLAYLIST_STYLE);
+}
 
 static void gui_request_close(void)
 {
@@ -128,18 +175,19 @@ static void gui_fill_device_picker_rows_locked(void)
 	g_gui.playlist_count = count;
 	for (int i = 0; i < 13; i++) {
 		int item = first + i;
-		const char *label = aplay_device_label(item);
+		const char *label = item < count ? aplay_device_label(item) : NULL;
 		snprintf(g_gui.playlist_lines[i], sizeof(g_gui.playlist_lines[i]), "%s",
 			label ? label : "");
 	}
+	gui_mark_dirty_locked(GUI_DIRTY_PLAYLIST_ROWS | GUI_DIRTY_PLAYLIST_STYLE);
 }
 
 static void gui_set_device_picker(int enabled)
 {
+	if (enabled) aplay_refresh_devices();
 	__atomic_store_n(&g_device_picker_mode, enabled ? 1 : 0, __ATOMIC_SEQ_CST);
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	if (enabled) {
-		aplay_refresh_devices();
 		g_device_picker_scroll = 0;
 		g_device_picker_selected = -1;
 		/* Prefer scrolling so the current device is visible. */
@@ -153,75 +201,103 @@ static void gui_set_device_picker(int enabled)
 			}
 		}
 		gui_fill_device_picker_rows_locked();
-		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "Select ALSA device");
+		gui_set_note_locked("Select ALSA device");
 	} else {
 		g_device_picker_selected = -1;
-		/* Restore playlist rows from the cached names. */
-		int first = g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first;
-		int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
-		if (first > max_first) first = max_first;
-		if (first < 0) first = 0;
-		g_gui.playlist_first = first;
-		g_gui.playlist_count = g_playlist_name_count;
-		for (int i = 0; i < 13; i++) {
-			int item = first + i;
-			snprintf(g_gui.playlist_lines[i], sizeof(g_gui.playlist_lines[i]), "%s",
-				item < g_playlist_name_count ? g_playlist_names[item] : "");
+		/* Restore playlist rows without reusing the device-picker scroll offset. */
+		int first;
+		if (g_playlist_scroll_first >= 0) {
+			first = g_playlist_scroll_first;
+		} else {
+			int current = g_gui.track_index > 0 ? g_gui.track_index - 1 : 0;
+			first = current - 6;
 		}
+		gui_fill_playlist_rows_locked(first);
 	}
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	gui_mark_dirty_locked(GUI_DIRTY_MENU);
+	pthread_mutex_unlock(&g_gui_lock);
 }
 
 static void gui_sync_from_playback_state(tui_state_t *ts)
 {
 	if (!ts) return;
-	pthread_mutex_lock(&g_gui.lock);
-	snprintf(g_gui.filename, sizeof(g_gui.filename), "%s", ts->filename ? ts->filename : "");
-	snprintf(g_gui.dir, sizeof(g_gui.dir), "%s", ts->dir ? ts->dir : "");
-	snprintf(g_gui.codec, sizeof(g_gui.codec), "%s", ts->codec ? ts->codec : "");
-	snprintf(g_gui.note, sizeof(g_gui.note), "%s", ts->note ? ts->note : "");
-	snprintf(g_gui.device, sizeof(g_gui.device), "%s", ts->device ? ts->device : "");
-	snprintf(g_gui.format_filter, sizeof(g_gui.format_filter), "%s", ts->format_filter ? ts->format_filter : "ALL");
-	g_gui.rate = ts->rate;
-	g_gui.bits = ts->bits;
-	g_gui.channels = ts->channels;
-	g_gui.cur = ts->cur;
-	g_gui.total = ts->total;
-	g_gui.volume = ts->volume;
-	g_gui.paused = ts->paused;
-	g_gui.loop_mode = ts->loop_mode;
-	g_gui.xtc_on = ts->xtc_on;
-	g_gui.xtc_atten = ts->xtc_atten;
-	g_gui.dsd_on = ((g_start_flag ^ g_flag_diff) & USE_DSD_ENCODE) ? 1 : 0;
-	g_gui.sr_on = ((g_start_flag ^ g_flag_diff) & USE_SUPER_RES) ? 1 : 0;
-	g_gui.track_index = ts->track_index;
-	g_gui.track_total = ts->track_total;
-	if (__atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST)) {
-		gui_fill_device_picker_rows_locked();
-		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "Select ALSA device");
-	} else {
+	unsigned dirty = 0;
+	const int picker = __atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST);
+	const int dsd_on = ((g_start_flag ^ g_flag_diff) & USE_DSD_ENCODE) ? 1 : 0;
+	const int sr_on = ((g_start_flag ^ g_flag_diff) & USE_SUPER_RES) ? 1 : 0;
+
+	pthread_mutex_lock(&g_gui_lock);
+	if (gui_copy_string_if_changed(g_gui.filename, sizeof(g_gui.filename), ts->filename)) dirty |= GUI_DIRTY_META;
+	if (gui_copy_string_if_changed(g_gui.dir, sizeof(g_gui.dir), ts->dir)) dirty |= GUI_DIRTY_META;
+	if (gui_copy_string_if_changed(g_gui.codec, sizeof(g_gui.codec), ts->codec)) dirty |= GUI_DIRTY_META;
+	if (gui_copy_string_if_changed(g_gui.device, sizeof(g_gui.device), ts->device))
+		dirty |= GUI_DIRTY_META | GUI_DIRTY_PLAYLIST_STYLE | GUI_DIRTY_MENU;
+
+	const char *note = picker ? "Select ALSA device" : (ts->note ? ts->note : "");
+	if (gui_copy_string_if_changed(g_gui.note, sizeof(g_gui.note), note)) dirty |= GUI_DIRTY_NOTE;
+
+	if (g_gui.rate != ts->rate || g_gui.bits != ts->bits || g_gui.channels != ts->channels) {
+		g_gui.rate = ts->rate;
+		g_gui.bits = ts->bits;
+		g_gui.channels = ts->channels;
+		dirty |= GUI_DIRTY_META;
+	}
+	if (g_gui.cur != ts->cur || g_gui.total != ts->total) {
+		g_gui.cur = ts->cur;
+		g_gui.total = ts->total;
+		dirty |= GUI_DIRTY_TIME;
+	}
+	if (g_gui.volume != ts->volume) {
+		g_gui.volume = ts->volume;
+		dirty |= GUI_DIRTY_VOLUME | GUI_DIRTY_MENU;
+	}
+	if (g_gui.paused != ts->paused) {
+		g_gui.paused = ts->paused;
+		dirty |= GUI_DIRTY_STATE;
+	}
+	if (g_gui.loop_mode != ts->loop_mode) {
+		g_gui.loop_mode = ts->loop_mode;
+		dirty |= GUI_DIRTY_MENU;
+	}
+	if (g_gui.xtc_on != ts->xtc_on || g_gui.xtc_atten != ts->xtc_atten) {
+		g_gui.xtc_on = ts->xtc_on;
+		g_gui.xtc_atten = ts->xtc_atten;
+		dirty |= GUI_DIRTY_MENU;
+	}
+	if (g_gui.dsd_on != dsd_on || g_gui.sr_on != sr_on) {
+		g_gui.dsd_on = dsd_on;
+		g_gui.sr_on = sr_on;
+		dirty |= GUI_DIRTY_MENU;
+	}
+
+	const int track_changed = g_gui.track_index != ts->track_index;
+	if (track_changed || g_gui.track_total != ts->track_total) {
+		g_gui.track_index = ts->track_index;
+		g_gui.track_total = ts->track_total;
+		dirty |= GUI_DIRTY_STATE | GUI_DIRTY_PLAYLIST_STYLE;
+	}
+
+	/* Recenter/copy playlist rows only when the active track actually changes.
+	 * A simple time update no longer touches the 13 cached row strings. */
+	if (!picker && track_changed && g_playlist_scroll_first < 0) {
 		int current = ts->track_index > 0 ? ts->track_index - 1 : 0;
-		int first = g_playlist_scroll_first;
-		if (first < 0) first = current - 6;
+		int first = current - 6;
+		int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
 		if (first < 0) first = 0;
-		if (first + 13 > g_playlist_name_count) first = g_playlist_name_count - 13;
-		if (first < 0) first = 0;
-		g_gui.playlist_first = first;
-		g_gui.playlist_count = g_playlist_name_count;
-		for (int i = 0; i < 13; i++) {
-			int item = first + i;
-			snprintf(g_gui.playlist_lines[i], sizeof(g_gui.playlist_lines[i]), "%s",
-				item < g_playlist_name_count ? g_playlist_names[item] : "");
+		if (first > max_first) first = max_first;
+		if (g_gui.playlist_first != first || g_gui.playlist_count != g_playlist_name_count) {
+			gui_fill_playlist_rows_locked(first);
+			dirty |= GUI_DIRTY_PLAYLIST_ROWS | GUI_DIRTY_PLAYLIST_STYLE;
 		}
 	}
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+
+	gui_mark_dirty_locked(dirty);
+	pthread_mutex_unlock(&g_gui_lock);
 }
 
 static void gui_scroll_playlist(int delta)
 {
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	if (__atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST)) {
 		int count = aplay_device_count();
 		int first = g_device_picker_scroll;
@@ -229,10 +305,11 @@ static void gui_scroll_playlist(int delta)
 		first += delta;
 		if (first < 0) first = 0;
 		if (first > max_first) first = max_first;
-		g_device_picker_scroll = first;
-		gui_fill_device_picker_rows_locked();
-		g_gui.version++;
-		pthread_mutex_unlock(&g_gui.lock);
+		if (first != g_device_picker_scroll) {
+			g_device_picker_scroll = first;
+			gui_fill_device_picker_rows_locked();
+		}
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
 	int first = g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first;
@@ -240,15 +317,11 @@ static void gui_scroll_playlist(int delta)
 	first += delta;
 	if (first < 0) first = 0;
 	if (first > max_first) first = max_first;
-	g_playlist_scroll_first = first;
-	g_gui.playlist_first = first;
-	for (int i = 0; i < 13; i++) {
-		int item = first + i;
-		snprintf(g_gui.playlist_lines[i], sizeof(g_gui.playlist_lines[i]), "%s",
-			item < g_playlist_name_count ? g_playlist_names[item] : "");
+	if (first != g_gui.playlist_first || g_playlist_scroll_first < 0) {
+		g_playlist_scroll_first = first;
+		gui_fill_playlist_rows_locked(first);
 	}
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	pthread_mutex_unlock(&g_gui_lock);
 }
 
 static void gui_select_device_item(int item, int apply)
@@ -257,7 +330,8 @@ static void gui_select_device_item(int item, int apply)
 	if (count <= 0) return;
 	if (item < 0) item = 0;
 	if (item >= count) item = count - 1;
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
+	int selection_changed = g_device_picker_selected != item;
 	g_device_picker_selected = item;
 	int first = g_device_picker_scroll;
 	if (item < first) first = item;
@@ -265,10 +339,13 @@ static void gui_select_device_item(int item, int apply)
 	int max_first = count > 13 ? count - 13 : 0;
 	if (first > max_first) first = max_first;
 	if (first < 0) first = 0;
-	g_device_picker_scroll = first;
-	gui_fill_device_picker_rows_locked();
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	if (first != g_device_picker_scroll) {
+		g_device_picker_scroll = first;
+		gui_fill_device_picker_rows_locked();
+	} else if (selection_changed) {
+		gui_mark_dirty_locked(GUI_DIRTY_PLAYLIST_STYLE);
+	}
+	pthread_mutex_unlock(&g_gui_lock);
 	if (apply) {
 		__atomic_store_n(&g_device_select_idx, item, __ATOMIC_SEQ_CST);
 		gui_inject_key('D'); /* wake key() which applies g_device_select_idx */
@@ -282,13 +359,15 @@ static void gui_select_playlist_item(int item, int play)
 		gui_select_device_item(item, play);
 		return;
 	}
-	pthread_mutex_lock(&g_gui.lock);
+	int current = 0;
+	pthread_mutex_lock(&g_gui_lock);
 	if (item < 0) item = 0;
 	if (item >= g_playlist_name_count) item = g_playlist_name_count - 1;
 	if (item < 0) {
-		pthread_mutex_unlock(&g_gui.lock);
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
+	int selection_changed = g_playlist_selected != item;
 	g_playlist_selected = item;
 	int first = g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first;
 	if (item < first) first = item;
@@ -296,20 +375,16 @@ static void gui_select_playlist_item(int item, int play)
 	int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
 	if (first > max_first) first = max_first;
 	if (first < 0) first = 0;
-	g_playlist_scroll_first = first;
-	g_gui.playlist_first = first;
-	for (int i = 0; i < 13; i++) {
-		int absolute = first + i;
-		snprintf(g_gui.playlist_lines[i], sizeof(g_gui.playlist_lines[i]), "%s",
-			absolute < g_playlist_name_count ? g_playlist_names[absolute] : "");
+	if (first != g_gui.playlist_first || g_playlist_scroll_first < 0) {
+		g_playlist_scroll_first = first;
+		gui_fill_playlist_rows_locked(first);
+	} else if (selection_changed) {
+		gui_mark_dirty_locked(GUI_DIRTY_PLAYLIST_STYLE);
 	}
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	current = g_gui.track_index;
+	pthread_mutex_unlock(&g_gui_lock);
 
 	if (play) {
-		pthread_mutex_lock(&g_gui.lock);
-		int current = g_gui.track_index;
-		pthread_mutex_unlock(&g_gui.lock);
 		__atomic_store_n(&g_playlist_request_direction,
 			current > 0 && item + 1 < current ? -1 : 1, __ATOMIC_SEQ_CST);
 		__atomic_store_n(&g_playlist_requested_track, item + 1, __ATOMIC_SEQ_CST);
@@ -326,17 +401,17 @@ static void gui_scroll_playlist_to_fraction(double fraction)
 		int count = aplay_device_count();
 		int max_first = count > 13 ? count - 13 : 0;
 		int target = (int)lround(fraction * max_first);
-		pthread_mutex_lock(&g_gui.lock);
+		pthread_mutex_lock(&g_gui_lock);
 		int current = g_device_picker_scroll;
-		pthread_mutex_unlock(&g_gui.lock);
+		pthread_mutex_unlock(&g_gui_lock);
 		gui_scroll_playlist(target - current);
 		return;
 	}
 	int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
 	int target = (int)lround(fraction * max_first);
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	int current = g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first;
-	pthread_mutex_unlock(&g_gui.lock);
+	pthread_mutex_unlock(&g_gui_lock);
 	gui_scroll_playlist(target - current);
 }
 
@@ -420,12 +495,8 @@ static void gui_publish_playlist_names(const LS_LIST *list, int num)
 			g_playlist_name_count++;
 		}
 	}
-	g_gui.playlist_first = 0;
-	g_gui.playlist_count = g_playlist_name_count;
-	for (int i = 0; i < 13; i++)
-		snprintf(g_gui.playlist_lines[i], sizeof(g_gui.playlist_lines[i]), "%s",
-			i < g_playlist_name_count ? g_playlist_names[i] : "");
-	g_gui.version++;
+	int current = g_gui.track_index > 0 ? g_gui.track_index - 1 : 0;
+	gui_fill_playlist_rows_locked(current - 6);
 	fprintf(stderr, "aplay+ui: playlist contains %d item%s\n",
 		g_playlist_name_count, g_playlist_name_count == 1 ? "" : "s");
 }
@@ -480,9 +551,9 @@ static LS_LIST *gui_ls_dir(char *dir, int flag, int *num)
 		}
 	}
 
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	gui_publish_playlist_names(list, num ? *num : 0);
-	pthread_mutex_unlock(&g_gui.lock);
+	pthread_mutex_unlock(&g_gui_lock);
 	return list;
 }
 
@@ -532,10 +603,8 @@ static int gui_hold_playback(AUDIO *a, tui_state_t *ts, int hard_stop)
 				apply_alsa_volume();
 		}
 	} else if (a && a->handle) {
-		if (snd_pcm_pause(a->handle, 0) < 0)
-			snd_pcm_prepare(a->handle);
-		else
-			snd_pcm_prepare(a->handle);
+		(void)snd_pcm_pause(a->handle, 0);
+		snd_pcm_prepare(a->handle);
 	}
 	if (ts) { ts->paused = 0; tui_render(ts); }
 
@@ -1332,7 +1401,7 @@ static int prepare_winamp_skin(const char *source)
 }
 
 static const char *WINAMP_HTML =
-    "<div id=\"app\" class=\"winamp-app ts-1\">"
+    "<div id=\"app\" class=\"winamp-app ts-2\">"
     "  <div id=\"surface-main\" class=\"skin-surface skin-main\">"
     "    <span id=\"badge-state\" class=\"skin-state\">PLAYING</span>"
     "    <span id=\"track-count\" class=\"skin-track-count\"></span>"
@@ -1596,32 +1665,20 @@ static void onDevicePicker(LunaElement *e)
 	int on = __atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST);
 	gui_set_device_picker(!on);
 }
-/* Playlist rows are thin (12px). Luna's press-scale hit test often misses the
- * matching release, so the GLFW surface maps Y → row directly. */
-static int gui_playlist_row_at(double lx, double ly)
-{
-	if (lx < 12.0 || lx >= 255.0) return -1;
-	if (ly < 23.0 || ly >= 23.0 + 13.0 * 12.0) return -1;
-	int row = (int)((ly - 23.0) / 12.0);
-	return (row >= 0 && row < 13) ? row : -1;
-}
+static int gui_playlist_row_at(double lx, double ly);
 
 static void gui_handle_playlist_row(int row)
 {
 	if (row < 0 || row >= 13) return;
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	int item = g_gui.playlist_first + row;
 	char label[256];
 	snprintf(label, sizeof(label), "%s",
 		(row >= 0 && row < 13) ? g_gui.playlist_lines[row] : "");
-	pthread_mutex_unlock(&g_gui.lock);
+	pthread_mutex_unlock(&g_gui_lock);
 	if (!label[0]) return;
 
-	/* Highlight immediately; activate (play / apply device) on the same click
-	 * so the list feels like a real file picker rather than requiring a
-	 * double-click that luna-ui often drops. */
-	g_playlist_last_click_item = item;
-	g_playlist_last_click_time = glfwGetTime();
+	/* Activate immediately so the list behaves like a native file picker. */
 	if (__atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST)) {
 		if (item < aplay_device_count()) gui_select_device_item(item, 1);
 		return;
@@ -1654,12 +1711,23 @@ typedef struct {
 	LunaContext *context;
 	int kind, width, height;
 	float origin_x, origin_y;
-	int visible, dragging, resizing, playlist_thumb_dragging;
+	int visible, dirty, dragging, resizing, playlist_thumb_dragging;
 	double drag_x, drag_y;
 	double resize_screen_x, resize_screen_y;
 	int resize_width, resize_height;
 } AuiSurface;
 static AuiSurface g_surfaces[AUI_SURFACE_COUNT];
+static void aui_mark_surface_dirty(int kind)
+{
+	if (kind >= 0 && kind < AUI_SURFACE_COUNT)
+		g_surfaces[kind].dirty = 1;
+}
+
+static void aui_mark_all_surfaces_dirty(void)
+{
+	for (int i = 0; i < AUI_SURFACE_COUNT; i++)
+		g_surfaces[i].dirty = 1;
+}
 static GLFWcursor *g_resize_cursor = NULL;
 static int g_dev_card_ids[AUI_MAX_DEV_CARDS];
 static int g_dev_card_count = 0;
@@ -1672,7 +1740,7 @@ static int g_el_pcm_heading = -1;
 static int g_el_mi_dev = -1;
 static int g_el_app = -1;
 static int g_el_mi_text = -1;
-static int g_text_scale = 1; /* 0 Classic .. 3 Extra; default Comfortable */
+static int g_text_scale = 2; /* 0 Classic .. 3 Extra; default Large */
 static const char *const g_text_scale_names[AUI_TEXT_SCALE_COUNT] = {
 	"Classic", "Comfortable", "Large", "Extra"
 };
@@ -1695,6 +1763,7 @@ static void aui_set_surface_visible(int kind, int visible)
 	if (kind < 0 || kind >= AUI_SURFACE_COUNT || !g_surfaces[kind].window) return;
 	g_surfaces[kind].visible = visible;
 	if (visible) {
+		aui_mark_surface_dirty(kind);
 		glfwSetWindowShouldClose(g_surfaces[kind].window, GLFW_FALSE);
 		glfwShowWindow(g_surfaces[kind].window);
 	} else {
@@ -1761,11 +1830,7 @@ static void aui_apply_text_scale(void)
 	for (int i = 0; i < AUI_TEXT_SCALE_COUNT; i++)
 		luna_remove_class(g_el_app, g_text_scale_classes[i]);
 	luna_add_class(g_el_app, g_text_scale_classes[g_text_scale]);
-	pthread_mutex_lock(&g_gui.lock);
-	snprintf(g_gui.note, sizeof(g_gui.note), "Text size · %s",
-		g_text_scale_names[g_text_scale]);
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	aui_mark_all_surfaces_dirty();
 }
 
 static void onMenuTextSize(LunaElement *e)
@@ -1773,6 +1838,11 @@ static void onMenuTextSize(LunaElement *e)
 	(void)e;
 	g_text_scale = (g_text_scale + 1) % AUI_TEXT_SCALE_COUNT;
 	aui_apply_text_scale();
+	pthread_mutex_lock(&g_gui_lock);
+	snprintf(g_gui.note, sizeof(g_gui.note), "Text size · %s",
+		g_text_scale_names[g_text_scale]);
+	gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+	pthread_mutex_unlock(&g_gui_lock);
 	aui_refresh_context_menu_labels();
 }
 
@@ -1833,10 +1903,10 @@ static void aui_show_device_pcm_menu(int card)
 		snprintf(heading, sizeof(heading), "Devices");
 	if (g_el_pcm_heading >= 0) luna_set_text(g_el_pcm_heading, heading);
 
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	char cur_dev[64];
 	snprintf(cur_dev, sizeof(cur_dev), "%s", g_gui.device[0] ? g_gui.device : g_dev_storage);
-	pthread_mutex_unlock(&g_gui.lock);
+	pthread_mutex_unlock(&g_gui_lock);
 
 	for (int i = 0; i < AUI_MAX_DEV_PCMS; i++) {
 		if (i < g_dev_pcm_count) {
@@ -1880,10 +1950,10 @@ static void aui_show_device_card_menu(void)
 		return;
 	}
 
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	char cur_dev[64];
 	snprintf(cur_dev, sizeof(cur_dev), "%s", g_gui.device[0] ? g_gui.device : g_dev_storage);
-	pthread_mutex_unlock(&g_gui.lock);
+	pthread_mutex_unlock(&g_gui_lock);
 	int cur_card = -2;
 	{
 		int n = aplay_device_count();
@@ -2006,10 +2076,10 @@ static void onSkinRandom(LunaElement *e)
 	(void)e;
 	aui_hide_context_menu();
 	if (g_skin_pack_count <= 0) {
-		pthread_mutex_lock(&g_gui.lock);
+		pthread_mutex_lock(&g_gui_lock);
 		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "Set a skin folder first");
-		g_gui.version++;
-		pthread_mutex_unlock(&g_gui.lock);
+		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
 	g_skin_random = !g_skin_random;
@@ -2018,11 +2088,11 @@ static void onSkinRandom(LunaElement *e)
 		const char *pick = skin_pack_pick(1);
 		if (pick) aui_request_skin_path(pick);
 	}
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	snprintf(g_gui.note, sizeof(g_gui.note), "%s",
 		g_skin_random ? "Random skin per track on" : "Random skin per track off");
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+	pthread_mutex_unlock(&g_gui_lock);
 }
 
 static void onSkinNext(LunaElement *e)
@@ -2031,10 +2101,10 @@ static void onSkinNext(LunaElement *e)
 	aui_hide_context_menu();
 	const char *pick = skin_pack_pick(1);
 	if (!pick) {
-		pthread_mutex_lock(&g_gui.lock);
+		pthread_mutex_lock(&g_gui_lock);
 		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "No skins in pack");
-		g_gui.version++;
-		pthread_mutex_unlock(&g_gui.lock);
+		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
 	aui_request_skin_path(pick);
@@ -2054,18 +2124,18 @@ static void onSkinFolder(LunaElement *e)
 	aui_hide_context_menu();
 	char chosen[PATH_MAX] = "";
 	if (!aui_pick_directory("aplay+ skin folder", chosen, sizeof(chosen))) {
-		pthread_mutex_lock(&g_gui.lock);
+		pthread_mutex_lock(&g_gui_lock);
 		snprintf(g_gui.note, sizeof(g_gui.note), "%s",
 			"Skin folder: use -R <dir> (no dialog)");
-		g_gui.version++;
-		pthread_mutex_unlock(&g_gui.lock);
+		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
 	if (scan_skins_folder(chosen) <= 0) {
-		pthread_mutex_lock(&g_gui.lock);
+		pthread_mutex_lock(&g_gui_lock);
 		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "No skins in that folder");
-		g_gui.version++;
-		pthread_mutex_unlock(&g_gui.lock);
+		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
 	snprintf(g_skins_folder, sizeof(g_skins_folder), "%s", chosen);
@@ -2073,10 +2143,10 @@ static void onSkinFolder(LunaElement *e)
 	xoroshiro128plus_init((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 16));
 	const char *pick = skin_pack_pick(0);
 	if (pick) aui_request_skin_path(pick);
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	snprintf(g_gui.note, sizeof(g_gui.note), "Skins: %d in pack", g_skin_pack_count);
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+	pthread_mutex_unlock(&g_gui_lock);
 }
 
 static void onAddFolder(LunaElement *e)
@@ -2085,19 +2155,19 @@ static void onAddFolder(LunaElement *e)
 	aui_hide_context_menu();
 	char chosen[PATH_MAX] = "";
 	if (!aui_pick_directory("aplay+ add folder", chosen, sizeof(chosen))) {
-		pthread_mutex_lock(&g_gui.lock);
+		pthread_mutex_lock(&g_gui_lock);
 		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "Add folder cancelled");
-		g_gui.version++;
-		pthread_mutex_unlock(&g_gui.lock);
+		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
 	int before = g_playlist_root_count;
 	playlist_root_add(chosen);
 	if (g_playlist_root_count == before) {
-		pthread_mutex_lock(&g_gui.lock);
+		pthread_mutex_lock(&g_gui_lock);
 		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "Folder already in playlist");
-		g_gui.version++;
-		pthread_mutex_unlock(&g_gui.lock);
+		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
 
@@ -2106,7 +2176,7 @@ static void onAddFolder(LunaElement *e)
 	int scan_flag = g_start_flag & LS_RECURSIVE;
 	LS_LIST *part = ls_dir(chosen, scan_flag, &part_n);
 	int added = 0;
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	if (part) {
 		for (int i = 0; i < part_n && g_playlist_name_count < 1024; i++) {
 			if (!part[i].d_name[0]) continue;
@@ -2128,16 +2198,10 @@ static void onAddFolder(LunaElement *e)
 	if (first > max_first) first = max_first;
 	if (first < 0) first = 0;
 	g_playlist_scroll_first = first;
-	g_gui.playlist_first = first;
-	g_gui.playlist_count = g_playlist_name_count;
-	for (int i = 0; i < 13; i++) {
-		int item = first + i;
-		snprintf(g_gui.playlist_lines[i], sizeof(g_gui.playlist_lines[i]), "%s",
-			item < g_playlist_name_count ? g_playlist_names[item] : "");
-	}
+	gui_fill_playlist_rows_locked(first);
 	snprintf(g_gui.note, sizeof(g_gui.note), "Added %d file%s", added, added == 1 ? "" : "s");
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+	pthread_mutex_unlock(&g_gui_lock);
 
 	aplay_playlist_request_reload();
 	aui_set_surface_visible(AUI_PLAYLIST, 1);
@@ -2195,10 +2259,10 @@ static int g_el_mi_volup = -1, g_el_mi_voldn = -1;
 
 static void aui_refresh_context_menu_labels(void)
 {
-	pthread_mutex_lock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
 	int xtc = g_gui.xtc_on, dsd = g_gui.dsd_on, sr = g_gui.sr_on, loop = g_gui.loop_mode;
 	float vol = g_gui.volume, atten = g_gui.xtc_atten;
-	pthread_mutex_unlock(&g_gui.lock);
+	pthread_mutex_unlock(&g_gui_lock);
 
 	char buf[96];
 	int vol_pct = (int)(vol * 100.0f + 0.5f);
@@ -2229,10 +2293,10 @@ static void aui_refresh_context_menu_labels(void)
 	aui_set_menu_check(g_el_mi_eq, g_surfaces[AUI_EQUALIZER].visible, "Equalizer");
 	aui_set_menu_check(g_el_mi_pl, g_surfaces[AUI_PLAYLIST].visible, "Playlist editor");
 	if (g_el_mi_dev >= 0) {
-		pthread_mutex_lock(&g_gui.lock);
+		pthread_mutex_lock(&g_gui_lock);
 		char cur[80];
 		snprintf(cur, sizeof(cur), "%s", g_gui.device[0] ? g_gui.device : "");
-		pthread_mutex_unlock(&g_gui.lock);
+		pthread_mutex_unlock(&g_gui_lock);
 		char buf_dev[96];
 		if (cur[0])
 			snprintf(buf_dev, sizeof(buf_dev), "ALSA device · %s", cur);
@@ -2244,6 +2308,7 @@ static void aui_refresh_context_menu_labels(void)
 		snprintf(buf, sizeof(buf), "Text size · %s", g_text_scale_names[g_text_scale]);
 		luna_set_text(g_el_mi_text, buf);
 	}
+	aui_mark_surface_dirty(AUI_MENU);
 }
 
 static void aui_show_context_menu(AuiSurface *from, double lx, double ly)
@@ -2275,10 +2340,14 @@ static void aui_apply_prepared_skin_to_ui(void)
 		luna_parse_css(WINAMP_CSS);
 		luna_parse_css(image_css);
 	}
-	pthread_mutex_lock(&g_gui.lock);
+	/* CSS reload restyles the whole tree; re-bind handlers and keep the
+	 * current text-size class so controls stay clickable and readable. */
+	luna_wire_onclick_handlers();
+	aui_apply_text_scale();
+	pthread_mutex_lock(&g_gui_lock);
 	snprintf(g_gui.note, sizeof(g_gui.note), "Skin: %s", g_skin.source);
-	g_gui.version++;
-	pthread_mutex_unlock(&g_gui.lock);
+	gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+	pthread_mutex_unlock(&g_gui_lock);
 }
 
 static int aui_load_skin_path(const char *path, int is_builtin)
@@ -2310,12 +2379,52 @@ static void aui_process_pending_skin(void)
 static int g_el_title = -1, g_el_subtitle = -1, g_el_device = -1;
 static int g_el_badge_codec = -1, g_el_badge_rate = -1, g_el_badge_state = -1;
 static int g_el_progress_fill = -1, g_el_time_cur = -1, g_el_time_total = -1, g_el_track_count = -1;
-static int g_el_playbtn = -1, g_el_vol_fill = -1, g_el_vol_value = -1, g_el_note = -1;
+static int g_el_vol_fill = -1, g_el_vol_value = -1, g_el_note = -1;
 static int g_el_surface_main = -1, g_el_surface_equalizer = -1, g_el_surface_playlist = -1;
 static int g_el_surface_menu = -1, g_el_surface_dev_cards = -1, g_el_surface_dev_pcms = -1;
 static int g_el_surface_about = -1;
 static int g_el_playlist_thumb = -1;
 static int g_el_playlist_rows[13];
+
+/* Playlist row heights follow #app.ts-* CSS (12/13/14/15px). Prefer live
+ * layout boxes so text-size changes cannot desync click mapping. */
+static float aui_playlist_row_height(void)
+{
+	static const float heights[AUI_TEXT_SCALE_COUNT] = {12.0f, 13.0f, 14.0f, 15.0f};
+	int s = g_text_scale;
+	if (s < 0) s = 0;
+	if (s >= AUI_TEXT_SCALE_COUNT) s = AUI_TEXT_SCALE_COUNT - 1;
+	return heights[s];
+}
+
+static int gui_playlist_row_at(double lx, double ly)
+{
+	const float list_top = 23.0f;
+	const float list_left = 12.0f;
+	const float list_right = 255.0f;
+	const float list_bottom = list_top + 168.0f;
+	if (lx < list_left || lx >= list_right || ly < list_top || ly >= list_bottom)
+		return -1;
+
+	/* Prefer laid-out element geometry (document space = playlist origin + local). */
+	float origin_x = g_surfaces[AUI_PLAYLIST].origin_x;
+	float origin_y = g_surfaces[AUI_PLAYLIST].origin_y;
+	double doc_x = lx + origin_x;
+	double doc_y = ly + origin_y;
+	for (int i = 0; i < 13; i++) {
+		if (g_el_playlist_rows[i] < 0) continue;
+		LunaElement *e = luna_element_at(g_el_playlist_rows[i]);
+		if (!e || e->w <= 0.0f || e->h <= 0.0f) continue;
+		if (doc_x >= e->x && doc_x < e->x + e->w &&
+		    doc_y >= e->y && doc_y < e->y + e->h)
+			return i;
+	}
+
+	float rh = aui_playlist_row_height();
+	if (rh < 1.0f) rh = 12.0f;
+	int row = (int)((ly - list_top) / rh);
+	return (row >= 0 && row < 13) ? row : -1;
+}
 
 /* GLFW removes the native title bar for this window, so retain the familiar
  * Winamp behaviour: the 14 px skin title bar (rendered at 2x) drags the OS
@@ -2356,7 +2465,6 @@ static void gui_cache_elements(void)
 	g_el_time_cur      = luna_get_element_by_id("time-cur");
 	g_el_time_total    = luna_get_element_by_id("time-total");
 	g_el_track_count   = luna_get_element_by_id("track-count");
-	g_el_playbtn       = luna_get_element_by_id("playbtn");
 	g_el_vol_fill      = luna_get_element_by_id("vol-fill");
 	g_el_vol_value     = luna_get_element_by_id("vol-value");
 	g_el_note          = luna_get_element_by_id("note");
@@ -2392,122 +2500,191 @@ static void gui_set_width_pct(int idx, double pct)
 	if (pct > 100) pct = 100;
 	LunaElement *e = luna_element_at(idx);
 	if (!e) return;
-	snprintf(e->inline_style, sizeof(e->inline_style), "width:%.2f%%;", pct);
+	char style[64];
+	snprintf(style, sizeof(style), "width:%.2f%%;", pct);
+	if (e->has_inline_style && !strcmp(e->inline_style, style)) return;
+	snprintf(e->inline_style, sizeof(e->inline_style), "%s", style);
 	e->has_inline_style = 1;
 	luna_update_element_style(idx);
 }
 
 static void gui_apply_state(void)
 {
-	static unsigned last_version = 0xFFFFFFFFu;
+	static int last_cur_second = -1;
+	static int last_total_second = -1;
+	unsigned dirty;
+	char filename[PATH_MAX], dir[PATH_MAX], codec[32], device[64], note[128];
+	char playlist_lines[13][256];
+	int rate = 0, bits = 0, channels = 0;
+	double cur = 0.0, total = 0.0;
+	float volume = 0.0f;
+	int paused = 0, track_index = 0, track_total = 0;
+	int playlist_first = 0, playlist_count = 0;
+	int playlist_selected = -1, device_picker = 0, device_selected = -1;
 
-	pthread_mutex_lock(&g_gui.lock);
-	if (g_gui.version == last_version) {
-		pthread_mutex_unlock(&g_gui.lock);
+	pthread_mutex_lock(&g_gui_lock);
+	dirty = g_gui.dirty;
+	if (!dirty) {
+		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
-	GuiState snap = g_gui;
-	int playlist_selected = g_playlist_selected;
-	int device_picker = __atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST);
-	int device_selected = g_device_picker_selected;
-	last_version = g_gui.version;
-	pthread_mutex_unlock(&g_gui.lock);
+	g_gui.dirty = 0;
+
+	if (dirty & GUI_DIRTY_META) {
+		snprintf(filename, sizeof(filename), "%s", g_gui.filename);
+		snprintf(dir, sizeof(dir), "%s", g_gui.dir);
+		snprintf(codec, sizeof(codec), "%s", g_gui.codec);
+		snprintf(device, sizeof(device), "%s", g_gui.device);
+		rate = g_gui.rate;
+		bits = g_gui.bits;
+		channels = g_gui.channels;
+	}
+	if (dirty & GUI_DIRTY_STATE) {
+		paused = g_gui.paused;
+		track_index = g_gui.track_index;
+		track_total = g_gui.track_total;
+	}
+	if (dirty & GUI_DIRTY_TIME) {
+		cur = g_gui.cur;
+		total = g_gui.total;
+	}
+	if (dirty & GUI_DIRTY_VOLUME) volume = g_gui.volume;
+	if (dirty & GUI_DIRTY_NOTE) snprintf(note, sizeof(note), "%s", g_gui.note);
+	if (dirty & (GUI_DIRTY_PLAYLIST_ROWS | GUI_DIRTY_PLAYLIST_STYLE)) {
+		playlist_first = g_gui.playlist_first;
+		playlist_count = g_gui.playlist_count;
+		track_index = g_gui.track_index;
+		snprintf(device, sizeof(device), "%s", g_gui.device);
+		playlist_selected = g_playlist_selected;
+		device_picker = __atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST);
+		device_selected = g_device_picker_selected;
+	}
+	if (dirty & GUI_DIRTY_PLAYLIST_ROWS) {
+		for (int i = 0; i < 13; i++)
+			snprintf(playlist_lines[i], sizeof(playlist_lines[i]), "%s", g_gui.playlist_lines[i]);
+	}
+	pthread_mutex_unlock(&g_gui_lock);
 
 	char buf[192];
 
-	luna_set_text(g_el_title, snap.filename[0] ? snap.filename : "No track loaded");
-	luna_set_text(g_el_subtitle, snap.dir[0] ? snap.dir : (snap.device[0] ? snap.device : "-"));
-	luna_set_text(g_el_device, snap.device);
-
-	luna_set_text(g_el_badge_codec, snap.codec[0] ? snap.codec : "-");
-	if (snap.rate > 0) {
-		snprintf(buf, sizeof(buf), "%.1fkHz / %dbit / %dch", snap.rate / 1000.0, snap.bits, snap.channels);
-	} else {
-		snprintf(buf, sizeof(buf), "-");
+	if (dirty & GUI_DIRTY_META) {
+		luna_set_text(g_el_title, filename[0] ? filename : "No track loaded");
+		luna_set_text(g_el_subtitle, dir[0] ? dir : (device[0] ? device : "-"));
+		luna_set_text(g_el_device, device);
+		luna_set_text(g_el_badge_codec, codec[0] ? codec : "-");
+		if (rate > 0)
+			snprintf(buf, sizeof(buf), "%.1fkHz / %dbit / %dch", rate / 1000.0, bits, channels);
+		else
+			snprintf(buf, sizeof(buf), "-");
+		luna_set_text(g_el_badge_rate, buf);
+		aui_mark_surface_dirty(AUI_MAIN);
+		aui_mark_surface_dirty(AUI_PLAYLIST);
 	}
-	luna_set_text(g_el_badge_rate, buf);
-	luna_set_text(g_el_badge_state, snap.paused ? "PAUSED" : "PLAYING");
 
-	double pct = snap.total > 0.0 ? (snap.cur / snap.total) * 100.0 : 0.0;
-	gui_set_width_pct(g_el_progress_fill, pct);
-	gui_format_time(buf, sizeof(buf), snap.cur);
-	luna_set_text(g_el_time_cur, buf);
-	gui_format_time(buf, sizeof(buf), snap.total);
-	luna_set_text(g_el_time_total, buf);
-	if (snap.track_total > 0) {
-		snprintf(buf, sizeof(buf), "%d/%d", snap.track_index, snap.track_total);
-	} else {
-		buf[0] = '\0';
+	if (dirty & GUI_DIRTY_STATE) {
+		luna_set_text(g_el_badge_state, paused ? "PAUSED" : "PLAYING");
+		if (track_total > 0)
+			snprintf(buf, sizeof(buf), "%d/%d", track_index, track_total);
+		else
+			buf[0] = '\0';
+		luna_set_text(g_el_track_count, buf);
+		aui_mark_surface_dirty(AUI_MAIN);
+
+		if (track_index > 0) {
+			if (g_skin_last_track > 0 && track_index != g_skin_last_track &&
+			    g_skin_random && g_skin_pack_count > 0) {
+				const char *pick = skin_pack_pick(1);
+				if (pick) aui_request_skin_path(pick);
+			}
+			g_skin_last_track = track_index;
+		}
 	}
-	luna_set_text(g_el_track_count, buf);
-	for (int i = 0; i < 13; i++) {
-		int absolute = snap.playlist_first + i;
-		if (device_picker) {
-			if (snap.playlist_lines[i][0]) {
-				snprintf(buf, sizeof(buf), "%d. %s", absolute + 1, snap.playlist_lines[i]);
+
+	if (dirty & GUI_DIRTY_TIME) {
+		double pct = total > 0.0 ? (cur / total) * 100.0 : 0.0;
+		gui_set_width_pct(g_el_progress_fill, pct);
+		int cur_second = (int)(cur < 0.0 ? 0.0 : cur + 0.5);
+		int total_second = (int)(total < 0.0 ? 0.0 : total + 0.5);
+		if (cur_second != last_cur_second) {
+			gui_format_time(buf, sizeof(buf), cur);
+			luna_set_text(g_el_time_cur, buf);
+			last_cur_second = cur_second;
+		}
+		if (total_second != last_total_second) {
+			gui_format_time(buf, sizeof(buf), total);
+			luna_set_text(g_el_time_total, buf);
+			last_total_second = total_second;
+		}
+		aui_mark_surface_dirty(AUI_MAIN);
+	}
+
+	if (dirty & GUI_DIRTY_VOLUME) {
+		gui_set_width_pct(g_el_vol_fill, volume * 100.0);
+		snprintf(buf, sizeof(buf), "%d%%", (int)(volume * 100.0f + 0.5f));
+		luna_set_text(g_el_vol_value, buf);
+		aui_mark_surface_dirty(AUI_MAIN);
+	}
+
+	if (dirty & GUI_DIRTY_NOTE) {
+		luna_set_text(g_el_note, note[0] ? note : "\xC2\xA0");
+		aui_mark_surface_dirty(AUI_PLAYLIST);
+	}
+
+	if (dirty & GUI_DIRTY_PLAYLIST_ROWS) {
+		for (int i = 0; i < 13; i++) {
+			int absolute = playlist_first + i;
+			if (playlist_lines[i][0]) {
+				snprintf(buf, sizeof(buf), "%d. %s", absolute + 1, playlist_lines[i]);
 				luna_set_text(g_el_playlist_rows[i], buf);
 			} else {
 				luna_set_text(g_el_playlist_rows[i], "");
 			}
-			const char *dev_name = aplay_device_name(absolute);
-			int is_current = dev_name && snap.device[0] && !strcmp(dev_name, snap.device);
-			if (is_current)
-				luna_add_class(g_el_playlist_rows[i], "current");
-			else
-				luna_remove_class(g_el_playlist_rows[i], "current");
-			if (absolute == device_selected)
-				luna_add_class(g_el_playlist_rows[i], "selected");
-			else
-				luna_remove_class(g_el_playlist_rows[i], "selected");
-		} else if (snap.playlist_lines[i][0]) {
-			snprintf(buf, sizeof(buf), "%d. %s", absolute + 1, snap.playlist_lines[i]);
-			luna_set_text(g_el_playlist_rows[i], buf);
-			if (snap.track_index > 0 && absolute == snap.track_index - 1)
-				luna_add_class(g_el_playlist_rows[i], "current");
-			else
-				luna_remove_class(g_el_playlist_rows[i], "current");
-			if (absolute == playlist_selected)
-				luna_add_class(g_el_playlist_rows[i], "selected");
-			else
-				luna_remove_class(g_el_playlist_rows[i], "selected");
-		} else {
-			luna_set_text(g_el_playlist_rows[i], "");
-			luna_remove_class(g_el_playlist_rows[i], "current");
-			luna_remove_class(g_el_playlist_rows[i], "selected");
 		}
-	}
-	if (g_el_playlist_thumb >= 0) {
-		int thumb_h = snap.playlist_count > 0 ? (168 * 13) / snap.playlist_count : 168;
-		if (thumb_h < 12) thumb_h = 12;
-		if (thumb_h > 168) thumb_h = 168;
-		int max_first = snap.playlist_count > 13 ? snap.playlist_count - 13 : 0;
-		int thumb_y = max_first > 0 ? (168 - thumb_h) * snap.playlist_first / max_first : 0;
-		LunaElement *thumb = luna_element_at(g_el_playlist_thumb);
-		if (thumb) {
-			snprintf(thumb->inline_style, sizeof(thumb->inline_style), "top:%dpx;height:%dpx;", thumb_y, thumb_h);
-			thumb->has_inline_style = 1;
-			luna_update_element_style(g_el_playlist_thumb);
+		if (g_el_playlist_thumb >= 0) {
+			int thumb_h = playlist_count > 0 ? (168 * 13) / playlist_count : 168;
+			if (thumb_h < 12) thumb_h = 12;
+			if (thumb_h > 168) thumb_h = 168;
+			int max_first = playlist_count > 13 ? playlist_count - 13 : 0;
+			int thumb_y = max_first > 0 ? (168 - thumb_h) * playlist_first / max_first : 0;
+			LunaElement *thumb = luna_element_at(g_el_playlist_thumb);
+			if (thumb) {
+				char style[64];
+				snprintf(style, sizeof(style), "top:%dpx;height:%dpx;", thumb_y, thumb_h);
+				if (!thumb->has_inline_style || strcmp(thumb->inline_style, style)) {
+					snprintf(thumb->inline_style, sizeof(thumb->inline_style), "%s", style);
+					thumb->has_inline_style = 1;
+					luna_update_element_style(g_el_playlist_thumb);
+				}
+			}
 		}
+		aui_mark_surface_dirty(AUI_PLAYLIST);
 	}
 
-	luna_set_text(g_el_playbtn, "");
-	gui_set_width_pct(g_el_vol_fill, snap.volume * 100.0);
-	snprintf(buf, sizeof(buf), "%d%%", (int)(snap.volume * 100.0f + 0.5f));
-	luna_set_text(g_el_vol_value, buf);
+	if (dirty & (GUI_DIRTY_PLAYLIST_ROWS | GUI_DIRTY_PLAYLIST_STYLE)) {
+		for (int i = 0; i < 13; i++) {
+			int absolute = playlist_first + i;
+			int has_row = (dirty & GUI_DIRTY_PLAYLIST_ROWS) ?
+				playlist_lines[i][0] != '\0' : absolute < playlist_count;
+			int is_current = 0;
+			if (has_row) {
+				if (device_picker) {
+					const char *dev_name = aplay_device_name(absolute);
+					is_current = dev_name && device[0] && !strcmp(dev_name, device);
+				} else {
+					is_current = track_index > 0 && absolute == track_index - 1;
+				}
+			}
+			if (is_current) luna_add_class(g_el_playlist_rows[i], "current");
+			else luna_remove_class(g_el_playlist_rows[i], "current");
+			int is_selected = has_row && absolute == (device_picker ? device_selected : playlist_selected);
+			if (is_selected) luna_add_class(g_el_playlist_rows[i], "selected");
+			else luna_remove_class(g_el_playlist_rows[i], "selected");
+		}
+		aui_mark_surface_dirty(AUI_PLAYLIST);
+	}
 
-	luna_set_text(g_el_note, snap.note[0] ? snap.note : "\xC2\xA0");
-
-	if (g_surfaces[AUI_MENU].visible)
+	if ((dirty & GUI_DIRTY_MENU) && g_surfaces[AUI_MENU].visible)
 		aui_refresh_context_menu_labels();
-
-	if (snap.track_index > 0) {
-		if (g_skin_last_track > 0 && snap.track_index != g_skin_last_track &&
-		    g_skin_random && g_skin_pack_count > 0) {
-			const char *pick = skin_pack_pick(1);
-			if (pick) aui_request_skin_path(pick);
-		}
-		g_skin_last_track = snap.track_index;
-	}
 }
 
 static void aui_logical_cursor(AuiSurface *surface, double x, double y,
@@ -2576,6 +2753,7 @@ static void aui_cursor_pos_cb(GLFWwindow *w, double x, double y)
 {
 	AuiSurface *surface = glfwGetWindowUserPointer(w);
 	if (!surface) return;
+	aui_mark_surface_dirty(surface->kind);
 	g_luna_glfw_window = w;
 	if (surface->resizing) {
 		int wx, wy;
@@ -2630,6 +2808,7 @@ static void aui_mouse_button_cb(GLFWwindow *w, int button, int action, int mods)
 {
 	AuiSurface *surface = glfwGetWindowUserPointer(w);
 	if (!surface) return;
+	aui_mark_surface_dirty(surface->kind);
 	g_luna_glfw_window = w;
 	double x, y;
 	glfwGetCursorPos(w, &x, &y);
@@ -2696,6 +2875,7 @@ static void aui_scroll_cb(GLFWwindow *w, double xo, double yo)
 {
 	AuiSurface *surface = glfwGetWindowUserPointer(w);
 	if (!surface) return;
+	aui_mark_surface_dirty(surface->kind);
 	if (surface->kind == AUI_PLAYLIST && yo != 0.0)
 		gui_scroll_playlist(yo > 0.0 ? -3 : 3);
 	luna_context_scroll(surface->context, xo, yo);
@@ -2703,18 +2883,19 @@ static void aui_scroll_cb(GLFWwindow *w, double xo, double yo)
 static void aui_key_cb(GLFWwindow *w, int key, int sc, int act, int mods)
 {
 	AuiSurface *surface = glfwGetWindowUserPointer(w);
+	if (surface) aui_mark_surface_dirty(surface->kind);
 	luna_key(key, sc, act, mods);
 	if (act != GLFW_PRESS && act != GLFW_REPEAT) return;
 	if (surface && surface->kind == AUI_PLAYLIST) {
 		int picker = __atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST);
 		int current = picker ? g_device_picker_selected : g_playlist_selected;
 		if (current < 0) {
-			pthread_mutex_lock(&g_gui.lock);
+			pthread_mutex_lock(&g_gui_lock);
 			if (picker)
 				current = g_gui.playlist_first;
 			else
 				current = g_gui.track_index > 0 ? g_gui.track_index - 1 : g_gui.playlist_first;
-			pthread_mutex_unlock(&g_gui.lock);
+			pthread_mutex_unlock(&g_gui_lock);
 		}
 		int last = picker ? aplay_device_count() - 1 : g_playlist_name_count - 1;
 		switch (key) {
@@ -2753,6 +2934,11 @@ static void aui_key_cb(GLFWwindow *w, int key, int sc, int act, int mods)
 	case GLFW_KEY_T:
 		g_text_scale = (g_text_scale + 1) % AUI_TEXT_SCALE_COUNT;
 		aui_apply_text_scale();
+		pthread_mutex_lock(&g_gui_lock);
+		snprintf(g_gui.note, sizeof(g_gui.note), "Text size · %s",
+			g_text_scale_names[g_text_scale]);
+		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+		pthread_mutex_unlock(&g_gui_lock);
 		if (g_surfaces[AUI_MENU].visible)
 			aui_refresh_context_menu_labels();
 		break;
@@ -2781,9 +2967,25 @@ static void aui_key_cb(GLFWwindow *w, int key, int sc, int act, int mods)
 	default: break;
 	}
 }
-static void aui_char_cb(GLFWwindow *w, unsigned int cp)             { (void)w; luna_char(cp); }
-static void aui_fbsize_cb(GLFWwindow *w, int width, int height)     { (void)w; (void)width; (void)height; luna_framebuffer_resized(); }
-static void aui_winsize_cb(GLFWwindow *w, int width, int height)    { (void)w; (void)width; (void)height; }
+static void aui_char_cb(GLFWwindow *w, unsigned int cp)
+{
+	AuiSurface *surface = glfwGetWindowUserPointer(w);
+	if (surface) aui_mark_surface_dirty(surface->kind);
+	luna_char(cp);
+}
+static void aui_fbsize_cb(GLFWwindow *w, int width, int height)
+{
+	(void)width; (void)height;
+	AuiSurface *surface = glfwGetWindowUserPointer(w);
+	if (surface) aui_mark_surface_dirty(surface->kind);
+	luna_framebuffer_resized();
+}
+static void aui_winsize_cb(GLFWwindow *w, int width, int height)
+{
+	(void)width; (void)height;
+	AuiSurface *surface = glfwGetWindowUserPointer(w);
+	if (surface) aui_mark_surface_dirty(surface->kind);
+}
 static void aui_glfw_error_cb(int error, const char *description)   { fprintf(stderr, "aplay+ui: GLFW error %d: %s\n", error, description); }
 
 static void gui_run(void)
@@ -2833,13 +3035,13 @@ static void gui_run(void)
 #endif
 
 	memset(g_surfaces, 0, sizeof(g_surfaces));
-	g_surfaces[AUI_MAIN] = (AuiSurface){ .kind=AUI_MAIN, .width=275, .height=116, .origin_x=0, .origin_y=0, .visible=1 };
-	g_surfaces[AUI_EQUALIZER] = (AuiSurface){ .kind=AUI_EQUALIZER, .width=275, .height=116, .origin_x=300, .origin_y=0, .visible=1 };
-	g_surfaces[AUI_PLAYLIST] = (AuiSurface){ .kind=AUI_PLAYLIST, .width=275, .height=232, .origin_x=600, .origin_y=0, .visible=1 };
-	g_surfaces[AUI_MENU] = (AuiSurface){ .kind=AUI_MENU, .width=AUI_MENU_W, .height=AUI_MENU_H, .origin_x=0, .origin_y=250, .visible=0 };
-	g_surfaces[AUI_DEV_CARDS] = (AuiSurface){ .kind=AUI_DEV_CARDS, .width=240, .height=280, .origin_x=302, .origin_y=250, .visible=0 };
-	g_surfaces[AUI_DEV_PCMS] = (AuiSurface){ .kind=AUI_DEV_PCMS, .width=240, .height=280, .origin_x=552, .origin_y=250, .visible=0 };
-	g_surfaces[AUI_ABOUT] = (AuiSurface){ .kind=AUI_ABOUT, .width=340, .height=380, .origin_x=520, .origin_y=680, .visible=0 };
+	g_surfaces[AUI_MAIN] = (AuiSurface){ .kind=AUI_MAIN, .width=275, .height=116, .origin_x=0, .origin_y=0, .visible=1, .dirty=1 };
+	g_surfaces[AUI_EQUALIZER] = (AuiSurface){ .kind=AUI_EQUALIZER, .width=275, .height=116, .origin_x=300, .origin_y=0, .visible=1, .dirty=1 };
+	g_surfaces[AUI_PLAYLIST] = (AuiSurface){ .kind=AUI_PLAYLIST, .width=275, .height=232, .origin_x=600, .origin_y=0, .visible=1, .dirty=1 };
+	g_surfaces[AUI_MENU] = (AuiSurface){ .kind=AUI_MENU, .width=AUI_MENU_W, .height=AUI_MENU_H, .origin_x=0, .origin_y=250, .visible=0, .dirty=1 };
+	g_surfaces[AUI_DEV_CARDS] = (AuiSurface){ .kind=AUI_DEV_CARDS, .width=240, .height=280, .origin_x=302, .origin_y=250, .visible=0, .dirty=1 };
+	g_surfaces[AUI_DEV_PCMS] = (AuiSurface){ .kind=AUI_DEV_PCMS, .width=240, .height=280, .origin_x=552, .origin_y=250, .visible=0, .dirty=1 };
+	g_surfaces[AUI_ABOUT] = (AuiSurface){ .kind=AUI_ABOUT, .width=340, .height=380, .origin_x=520, .origin_y=680, .visible=0, .dirty=1 };
 	const char *titles[AUI_SURFACE_COUNT] = {
 		"aplay+ — player",
 		"aplay+ — equalizer",
@@ -2982,6 +3184,7 @@ static void gui_run(void)
 	luna_inject_body_background();
 	luna_wire_onclick_handlers();
 	gui_cache_elements();
+	aui_apply_text_scale();
 	const int roots[AUI_SURFACE_COUNT] = {
 		g_el_surface_main, g_el_surface_equalizer, g_el_surface_playlist,
 		g_el_surface_menu, g_el_surface_dev_cards, g_el_surface_dev_pcms,
@@ -3023,7 +3226,9 @@ static void gui_run(void)
 
 	double last_time = glfwGetTime();
 	while (!__atomic_load_n(&g_gui_should_close, __ATOMIC_SEQ_CST)) {
-		glfwPollEvents();
+		/* Audio-state changes are picked up within one frame while idle CPU usage
+		 * stays low. GUI callbacks still wake this immediately for real events. */
+		glfwWaitEventsTimeout(1.0 / 60.0);
 		if (glfwWindowShouldClose(g_surfaces[AUI_MAIN].window)) {
 			gui_request_close();
 			break;
@@ -3043,7 +3248,8 @@ static void gui_run(void)
 
 		for (int i = 0; i < AUI_SURFACE_COUNT; i++) {
 			AuiSurface *surface = &g_surfaces[i];
-			if (!surface->visible || !surface->context) continue;
+			if (!surface->visible || !surface->context || !surface->dirty) continue;
+			surface->dirty = 0;
 			g_luna_glfw_window = surface->window;
 			glfwMakeContextCurrent(surface->window);
 			int fbw, fbh;

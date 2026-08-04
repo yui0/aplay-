@@ -53,12 +53,20 @@
 #define USE_SUPER_RES  2048
 
 // ---- Audio render constants ----
-#define FRAMES               32
-#define MAX_DELAY_SAMPLES    16
-#define SEEK_SECONDS         10
-#define VOLUME_STEP          0.05f
-#define XTC_ATTEN_STEP       0.05f
-#define KEY_POLL_INTERVAL_US 4000  // gate kbhit() to ≤250 calls/sec
+/*
+ * Normal PCM blocks are deliberately larger than the fixed DSD encoder block.
+ * 512 frames keeps interactive latency low (about 11.6 ms at 44.1 kHz) while
+ * greatly reducing decoder, ALSA, key-poll and UI-loop overhead.
+ */
+#define FRAMES                 512
+#define DSD_ENC_INPUT_CHUNK     32
+#define AUDIO_SCRATCH_FRAMES  8192
+#define UI_REFRESH_INTERVAL_NS 50000000ULL  /* 20 Hz */
+#define MAX_DELAY_SAMPLES       16
+#define SEEK_SECONDS            10
+#define VOLUME_STEP             0.05f
+#define XTC_ATTEN_STEP          0.05f
+#define KEY_POLL_INTERVAL_US  4000  // gate kbhit() to ≤250 calls/sec
 
 // ---- Synthetic key codes (above ASCII range, never clash with real bytes) ----
 #define KEY_UP    1001
@@ -214,6 +222,25 @@ static int g_device_count = 0;
 /* Set in outr_init / cleared in outr_close; typed after OutRouter is defined. */
 static void *g_active_router_ptr = NULL;
 
+static uint64_t aplay_monotonic_ns(void)
+{
+	struct timespec ts;
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* Limit routine progress redraws; control/status changes still render at once. */
+static void aplay_render_throttled(tui_state_t *ts, uint64_t *last_render_ns)
+{
+	uint64_t now;
+	if (!ts || !last_render_ns) return;
+	now = aplay_monotonic_ns();
+	if (now != 0 && *last_render_ns != 0 &&
+	    now - *last_render_ns < UI_REFRESH_INTERVAL_NS) return;
+	*last_render_ns = now;
+	tui_render(ts);
+}
+
 // ============================================================
 // PCM -> DSD (DoP) real-time output sink
 //
@@ -226,269 +253,404 @@ static void *g_active_router_ptr = NULL;
 #define SND_PCM_FORMAT_S24_LE 6
 #endif
 
-#define DSD_ENC_OSR         64
-#define DSD_ENC_INPUT_CHUNK FRAMES
-#define DSD_ENC_DSD_BYTES_PER_CH (DSD_ENC_INPUT_CHUNK * DSD_ENC_OSR / 8 + 2)
-#define DSD_ENC_DOP_FRAMES  (DSD_ENC_INPUT_CHUNK * DSD_ENC_OSR / 16)
+#define DSD_ENC_OSR 64
+#define DSD_ENC_DSD_BYTES_PER_CH \
+	(DSD_ENC_INPUT_CHUNK * DSD_ENC_OSR / 8 + 2)
+#define DSD_ENC_DOP_FRAMES \
+	(DSD_ENC_INPUT_CHUNK * DSD_ENC_OSR / 16)
+#define DSD_ENC_DSD_BYTES_PER_CH_EXACT \
+	(DSD_ENC_INPUT_CHUNK * DSD_ENC_OSR / 8)
+#define MON_ACCUM_BLOCKS 8
 
 typedef struct {
 	DSDEncoder *enc;
 	AUDIO a;
 	int channels;
 	uint8_t *dsd_buf;
-	int32_t *dop_buf;
 
-	// Fallback for hardware that can't open DoP's high ALSA rate
-	// (pcm_rate*OSR/16): feed the DSD bits we just made straight back through
-	// dsd.h's decoder (the same filter/AGC/limiter pipeline used for real
-	// DSD files) and play the result as ordinary PCM (PCM -> DSD -> PCM).
+	/*
+	 * Fallback for hardware that cannot open the DoP rate. The generated DSD
+	 * is decoded back to PCM and written directly into mon_a.buffer, avoiding
+	 * the former intermediate PCM and accumulation buffers.
+	 */
 	int monitor_mode;
 	AUDIO mon_a;
 	DSDDecoder *mon_decoder;
 	uint8_t *mon_block_buf;
-	float *mon_pcm_buf;
 	size_t mon_frames_per_block;
-
-	// Writing to ALSA every single block leaves FIR interpolation + delta-sigma
-	// + 4-stage IIR decode too little slack and underruns easily, so
-	// MON_ACCUM_BLOCKS blocks are batched per write.
-	float *mon_accum_buf;
 	size_t mon_accum_fill;
 	size_t mon_accum_period;
 } DsdSink;
 
-#define MON_ACCUM_BLOCKS 8
-#define DSD_ENC_DSD_BYTES_PER_CH_EXACT (DSD_ENC_INPUT_CHUNK * DSD_ENC_OSR / 8)
+static void dsdsink_close(DsdSink *sink);
 
-int dsdsink_open(DsdSink *sink, const char *dev, int pcm_rate, int channels)
+static int dsdsink_open(DsdSink *sink, const char *dev_name,
+                        int pcm_rate, int channels)
 {
 	memset(sink, 0, sizeof(*sink));
 	sink->channels = channels;
 
-	sink->enc = dsd_encoder_init(channels, pcm_rate, pcm_rate * DSD_ENC_OSR);
+	sink->enc = dsd_encoder_init(channels, pcm_rate,
+	                             pcm_rate * DSD_ENC_OSR);
 	if (!sink->enc) {
-		fprintf(stderr, "DSD encoder init failed (channels=%d, rate=%d)\n", channels, pcm_rate);
+		fprintf(stderr,
+		        "DSD encoder init failed (channels=%d, rate=%d)\n",
+		        channels, pcm_rate);
 		return -1;
 	}
 
-	sink->dsd_buf = (uint8_t*)malloc(DSD_ENC_DSD_BYTES_PER_CH * channels);
-	sink->dop_buf = (int32_t*)malloc((size_t)DSD_ENC_DOP_FRAMES * channels * sizeof(int32_t));
-	if (!sink->dsd_buf || !sink->dop_buf) {
-		goto fail_enc;
-	}
+	sink->dsd_buf = (uint8_t *)malloc(
+		(size_t)DSD_ENC_DSD_BYTES_PER_CH * (size_t)channels);
+	if (!sink->dsd_buf) goto fail;
 
-	int dop_rate = pcm_rate * DSD_ENC_OSR / 16;
-	if (AUDIO_init(&sink->a, (char*)dev, dop_rate, channels, DSD_ENC_DOP_FRAMES, 1, SND_PCM_FORMAT_S24_LE) == 0) {
-		if (sink->a.freq == (unsigned int)dop_rate) {
-			printf("DSD encode (DoP) output: %d Hz PCM -> DSD64 @ %d Hz DoP / S24_LE / %dch\n",
-			       pcm_rate, dop_rate, channels);
-			return 0;
+	{
+		int dop_rate = pcm_rate * DSD_ENC_OSR / 16;
+		if (AUDIO_init(&sink->a, (char *)dev_name, dop_rate, channels,
+		               DSD_ENC_DOP_FRAMES, 1,
+		               SND_PCM_FORMAT_S24_LE) == 0) {
+			if (sink->a.freq == (unsigned int)dop_rate) {
+				printf("DSD encode (DoP) output: %d Hz PCM -> "
+				       "DSD64 @ %d Hz DoP / S24_LE / %dch\n",
+				       pcm_rate, dop_rate, channels);
+				return 0;
+			}
+			fprintf(stderr,
+			        "DoP: rejected ALSA rate remap %d -> %u Hz\n",
+			        dop_rate, sink->a.freq);
+			if (sink->a.handle) AUDIO_close(&sink->a);
+			memset(&sink->a, 0, sizeof(sink->a));
 		}
-		fprintf(stderr, "DoP: rejected ALSA rate remap %d -> %u Hz\n", dop_rate, sink->a.freq);
-		AUDIO_close(&sink->a);
-		memset(&sink->a, 0, sizeof(sink->a));
+
+		fprintf(stderr,
+		        "DoP output unavailable at %d Hz, falling back to "
+		        "PCM->DSD->PCM monitor mode\n", dop_rate);
 	}
 
-	fprintf(stderr, "DoP output unavailable at %d Hz, falling back to PCM->DSD->PCM monitor mode\n", dop_rate);
+	{
+		int dsd_rate = pcm_rate * DSD_ENC_OSR;
+		static const int mon_rate_prefs[] = {
+			384000, 352800, 192000, 176400,
+			96000, 88200, 48000, 44100
+		};
+		int cands[1 + (int)(sizeof(mon_rate_prefs) /
+		                           sizeof(mon_rate_prefs[0]))];
+		int ncands = 0;
+		int mon_rate = 0;
 
-	int dsd_rate = pcm_rate * DSD_ENC_OSR;
-	sink->mon_decoder = dsd_decoder_init_raw(channels, dsd_rate, DSD_ENC_DSD_BYTES_PER_CH_EXACT);
-	if (!sink->mon_decoder) {
-		fprintf(stderr, "Failed to init monitor-mode DSD decoder\n");
-		goto fail_enc;
-	}
-
-	static const int mon_rate_prefs[] = {
-		384000, 352800, 192000, 176400, 96000, 88200, 48000, 44100
-	};
-	int cands[1 + (int)(sizeof(mon_rate_prefs) / sizeof(mon_rate_prefs[0]))];
-	int ncands = 0;
-	for (size_t i = 0; i < sizeof(mon_rate_prefs) / sizeof(mon_rate_prefs[0]); ++i) {
-		int r = mon_rate_prefs[i];
-		if (r == pcm_rate || dsd_rate % r != 0) continue;
-		int dec = dsd_rate / r;
-		if (dec < 8 || dec > 512) continue;
-		cands[ncands++] = r;
-	}
-	cands[ncands++] = pcm_rate;
-
-	int mon_rate = 0;
-	for (int i = 0; i < ncands && !mon_rate; ++i) {
-		if (dsd_decoder_set_pcm_rate(sink->mon_decoder, cands[i]) != 0) continue;
-		sink->mon_frames_per_block = dsd_decoder_frames_per_block(sink->mon_decoder);
-		if (sink->mon_frames_per_block == 0) continue;
-		sink->mon_accum_period = sink->mon_frames_per_block * MON_ACCUM_BLOCKS;
-		if (AUDIO_init(&sink->mon_a, (char*)dev, (unsigned int)cands[i], channels,
-		               (int)sink->mon_accum_period, 4, SND_PCM_FORMAT_FLOAT_LE) != 0) continue;
-		if (sink->mon_a.freq != (unsigned int)cands[i]) {
-			fprintf(stderr, "monitor: rejected ALSA rate remap %d -> %u Hz\n", cands[i], sink->mon_a.freq);
-			AUDIO_close(&sink->mon_a);
-			memset(&sink->mon_a, 0, sizeof(sink->mon_a));
-			continue;
+		sink->mon_decoder = dsd_decoder_init_raw(
+			channels, dsd_rate, DSD_ENC_DSD_BYTES_PER_CH_EXACT);
+		if (!sink->mon_decoder) {
+			fprintf(stderr,
+			        "Failed to init monitor-mode DSD decoder\n");
+			goto fail;
 		}
-		mon_rate = cands[i];
-	}
-	if (!mon_rate) {
-		fprintf(stderr, "Failed to open ALSA device for monitor-mode PCM output (tried source %d Hz and fallbacks)\n", pcm_rate);
-		dsd_decoder_free(sink->mon_decoder);
-		goto fail_enc;
+
+		for (size_t i = 0;
+		     i < sizeof(mon_rate_prefs) / sizeof(mon_rate_prefs[0]);
+		     ++i) {
+			int r = mon_rate_prefs[i];
+			int dec;
+			if (r == pcm_rate || dsd_rate % r != 0) continue;
+			dec = dsd_rate / r;
+			if (dec < 8 || dec > 512) continue;
+			cands[ncands++] = r;
+		}
+		cands[ncands++] = pcm_rate;
+
+		for (int i = 0; i < ncands && !mon_rate; ++i) {
+			if (dsd_decoder_set_pcm_rate(
+				    sink->mon_decoder, cands[i]) != 0) continue;
+
+			sink->mon_frames_per_block =
+				dsd_decoder_frames_per_block(sink->mon_decoder);
+			if (sink->mon_frames_per_block == 0) continue;
+
+			sink->mon_accum_period =
+				sink->mon_frames_per_block * MON_ACCUM_BLOCKS;
+
+			if (AUDIO_init(&sink->mon_a, (char *)dev_name,
+			               (unsigned int)cands[i], channels,
+			               (int)sink->mon_accum_period, 4,
+			               SND_PCM_FORMAT_FLOAT_LE) != 0) continue;
+
+			if (sink->mon_a.freq != (unsigned int)cands[i]) {
+				fprintf(stderr,
+				        "monitor: rejected ALSA rate remap "
+				        "%d -> %u Hz\n",
+				        cands[i], sink->mon_a.freq);
+				if (sink->mon_a.handle)
+					AUDIO_close(&sink->mon_a);
+				memset(&sink->mon_a, 0,
+				       sizeof(sink->mon_a));
+				continue;
+			}
+			mon_rate = cands[i];
+		}
+
+		if (!mon_rate) {
+			fprintf(stderr,
+			        "Failed to open ALSA device for monitor-mode "
+			        "PCM output (source %d Hz and fallbacks)\n",
+			        pcm_rate);
+			goto fail;
+		}
+
+		sink->mon_block_buf = (uint8_t *)malloc(
+			(size_t)DSD_ENC_DSD_BYTES_PER_CH_EXACT *
+			(size_t)channels);
+		if (!sink->mon_block_buf) goto fail;
+
+		sink->mon_accum_fill = 0;
+		sink->monitor_mode = 1;
+		printf("DSD encode (monitor) output: %d Hz PCM -> DSD64 "
+		       "-> %d Hz PCM via dsd.h / %dch\n",
+		       pcm_rate, mon_rate, channels);
+		return 0;
 	}
 
-	sink->mon_block_buf = (uint8_t*)malloc((size_t)DSD_ENC_DSD_BYTES_PER_CH_EXACT * channels);
-	sink->mon_pcm_buf = (float*)malloc(sink->mon_frames_per_block * (size_t)channels * sizeof(float));
-	sink->mon_accum_buf = (float*)malloc(sink->mon_accum_period * (size_t)channels * sizeof(float));
-	sink->mon_accum_fill = 0;
-	if (!sink->mon_block_buf || !sink->mon_pcm_buf || !sink->mon_accum_buf) {
-		AUDIO_close(&sink->mon_a);
-		dsd_decoder_free(sink->mon_decoder);
-		free(sink->mon_block_buf);
-		free(sink->mon_pcm_buf);
-		free(sink->mon_accum_buf);
-		goto fail_enc;
-	}
-
-	sink->monitor_mode = 1;
-	printf("DSD encode (monitor) output: %d Hz PCM -> DSD64 -> %d Hz PCM via dsd.h (DoP hardware unavailable) / %dch\n",
-	       pcm_rate, mon_rate, channels);
-	return 0;
-
-fail_enc:
-	dsd_encoder_free(sink->enc);
-	free(sink->dsd_buf);
-	free(sink->dop_buf);
+fail:
+	dsdsink_close(sink);
 	return -1;
 }
 
-void dsdsink_write(DsdSink *sink, const float *pcm, size_t frames)
+static void dsdsink_write(DsdSink *sink,
+                          const float *pcm, size_t frames)
 {
 	size_t bytes_per_ch = 0;
-	if (dsd_encoder_process_raw(sink->enc, pcm, frames, sink->dsd_buf,
-	                             DSD_ENC_DSD_BYTES_PER_CH * sink->channels,
-	                             &bytes_per_ch) != 0) {
-		return;
-	}
-
 	const uint8_t *ch_ptrs[DSDENC_MAX_CHANNELS];
-	for (int ch = 0; ch < sink->channels; ch++) {
-		ch_ptrs[ch] = sink->dsd_buf + (size_t)ch * DSD_ENC_DSD_BYTES_PER_CH;
+
+	if (!sink || !sink->enc || !pcm ||
+	    frames != DSD_ENC_INPUT_CHUNK) return;
+
+	if (dsd_encoder_process_raw(
+		    sink->enc, pcm, frames, sink->dsd_buf,
+		    DSD_ENC_DSD_BYTES_PER_CH * sink->channels,
+		    &bytes_per_ch) != 0) return;
+
+	for (int ch = 0; ch < sink->channels; ++ch) {
+		ch_ptrs[ch] = sink->dsd_buf +
+			(size_t)ch * DSD_ENC_DSD_BYTES_PER_CH;
 	}
 
 	if (g_dsd_raw_file) {
-		for (int ch = 0; ch < sink->channels; ch++) {
-			fwrite(ch_ptrs[ch], 1, bytes_per_ch, g_dsd_raw_file);
-		}
+		for (int ch = 0; ch < sink->channels; ++ch)
+			(void)fwrite(ch_ptrs[ch], 1, bytes_per_ch,
+			             g_dsd_raw_file);
 	}
 
 	if (sink->monitor_mode) {
-		for (int ch = 0; ch < sink->channels; ch++) {
-			memcpy(sink->mon_block_buf + (size_t)ch * DSD_ENC_DSD_BYTES_PER_CH_EXACT,
-			       ch_ptrs[ch], DSD_ENC_DSD_BYTES_PER_CH_EXACT);
+		for (int ch = 0; ch < sink->channels; ++ch) {
+			memcpy(sink->mon_block_buf +
+			       (size_t)ch *
+			       DSD_ENC_DSD_BYTES_PER_CH_EXACT,
+			       ch_ptrs[ch],
+			       DSD_ENC_DSD_BYTES_PER_CH_EXACT);
 		}
-		dsd_decoder_feed_block(sink->mon_decoder, sink->mon_block_buf);
-		size_t out_frames = dsd_decoder_read_pcm_frames(sink->mon_decoder,
-		                                                 sink->mon_frames_per_block,
-		                                                 sink->mon_pcm_buf,
-		                                                 SND_PCM_FORMAT_FLOAT_LE);
-		if (out_frames > 0) {
-			memcpy(sink->mon_accum_buf + sink->mon_accum_fill * (size_t)sink->channels,
-			       sink->mon_pcm_buf, out_frames * (size_t)sink->channels * sizeof(float));
+
+		dsd_decoder_feed_block(sink->mon_decoder,
+		                       sink->mon_block_buf);
+
+		for (;;) {
+			size_t room = sink->mon_accum_period -
+			              sink->mon_accum_fill;
+			size_t out_frames;
+			float *dst;
+
+			if (room == 0) {
+				AUDIO_play0(&sink->mon_a);
+				AUDIO_wait(&sink->mon_a, 100);
+				sink->mon_accum_fill = 0;
+				room = sink->mon_accum_period;
+			}
+
+			dst = (float *)sink->mon_a.buffer +
+			      sink->mon_accum_fill *
+			      (size_t)sink->channels;
+			out_frames = dsd_decoder_read_pcm_frames(
+				sink->mon_decoder, room, dst,
+				SND_PCM_FORMAT_FLOAT_LE);
+			if (out_frames == 0) break;
+
 			sink->mon_accum_fill += out_frames;
-		}
-		if (sink->mon_accum_fill >= sink->mon_accum_period) {
-			memcpy(sink->mon_a.buffer, sink->mon_accum_buf, sink->mon_accum_period * (size_t)sink->channels * sizeof(float));
-			AUDIO_play0(&sink->mon_a);
-			AUDIO_wait(&sink->mon_a, 100);
-			sink->mon_accum_fill = 0;
+			if (sink->mon_accum_fill >=
+			    sink->mon_accum_period) {
+				AUDIO_play0(&sink->mon_a);
+				AUDIO_wait(&sink->mon_a, 100);
+				sink->mon_accum_fill = 0;
+			}
+
+			if (out_frames < room) break;
 		}
 		return;
 	}
 
-	size_t dop_frames = 0;
-	size_t even_bytes = bytes_per_ch & ~((size_t)1);
-	dsd_encoder_pack_dop(sink->enc, ch_ptrs, even_bytes, sink->dop_buf, &dop_frames);
-
-	memcpy(sink->a.buffer, sink->dop_buf, dop_frames * sink->channels * sizeof(int32_t));
-	AUDIO_play0(&sink->a);
-	AUDIO_wait(&sink->a, 100);
-}
-
-void dsdsink_close(DsdSink *sink)
-{
-	if (sink->monitor_mode) {
-		if (sink->mon_accum_fill > 0 && sink->mon_accum_buf) {
-			size_t remain = sink->mon_accum_period - sink->mon_accum_fill;
-			memset(sink->mon_accum_buf + sink->mon_accum_fill * (size_t)sink->channels,
-			       0, remain * (size_t)sink->channels * sizeof(float));
-			memcpy(sink->mon_a.buffer, sink->mon_accum_buf, sink->mon_accum_period * (size_t)sink->channels * sizeof(float));
-			AUDIO_play0(&sink->mon_a);
-			AUDIO_wait(&sink->mon_a, 100);
-		}
-		AUDIO_close(&sink->mon_a);
-		dsd_decoder_free(sink->mon_decoder);
-		free(sink->mon_block_buf);
-		free(sink->mon_accum_buf);
-	} else {
-		AUDIO_close(&sink->a);
+	{
+		size_t dop_frames = 0;
+		size_t even_bytes = bytes_per_ch & ~((size_t)1);
+		/*
+		 * Pack directly into ALSA's buffer. This removes dop_buf and
+		 * one full copy for every DSD block.
+		 */
+		dsd_encoder_pack_dop(
+			sink->enc, ch_ptrs, even_bytes,
+			(int32_t *)sink->a.buffer, &dop_frames);
+		AUDIO_play0(&sink->a);
+		AUDIO_wait(&sink->a, 100);
 	}
-	dsd_encoder_free(sink->enc);
+}
+
+static void dsdsink_close(DsdSink *sink)
+{
+	if (!sink) return;
+
+	if (sink->monitor_mode &&
+	    sink->mon_accum_fill > 0 &&
+	    sink->mon_a.handle && sink->mon_a.buffer) {
+		size_t remain = sink->mon_accum_period -
+		                sink->mon_accum_fill;
+		memset((float *)sink->mon_a.buffer +
+		       sink->mon_accum_fill *
+		       (size_t)sink->channels,
+		       0,
+		       remain * (size_t)sink->channels *
+		       sizeof(float));
+		AUDIO_play0(&sink->mon_a);
+		AUDIO_wait(&sink->mon_a, 100);
+	}
+	if (sink->mon_a.handle) AUDIO_close(&sink->mon_a);
+	if (sink->a.handle) AUDIO_close(&sink->a);
+
+	if (sink->mon_decoder)
+		dsd_decoder_free(sink->mon_decoder);
+	if (sink->enc)
+		dsd_encoder_free(sink->enc);
+	free(sink->mon_block_buf);
 	free(sink->dsd_buf);
-	free(sink->dop_buf);
-	free(sink->mon_pcm_buf);
+	memset(sink, 0, sizeof(*sink));
 }
 
 // ============================================================
-// DsdAccum: fixed-FRAMES staging buffer between variable-size decoders and
-// the DSD encoder that needs exactly FRAMES per call.
+// DsdAccum: keeps only a partial 32-frame DSD block.
+//
+// Full float blocks are sent to the encoder directly. Therefore large decoder
+// blocks no longer pass through an 8192-frame buffer or require memmove().
 // ============================================================
-#define DSD_ACCUM_CAPACITY 8192
-
 typedef struct {
 	float *buf;
 	size_t fill;
-	size_t capacity;
 	int channels;
 } DsdAccum;
 
-void dsdaccum_init(DsdAccum *ac, int channels, size_t capacity_frames)
+static void dsdaccum_init(DsdAccum *ac, int channels)
 {
+	memset(ac, 0, sizeof(*ac));
 	ac->channels = channels;
-	ac->capacity = capacity_frames;
-	ac->buf = (float*)malloc(capacity_frames * (size_t)channels * sizeof(float));
-	ac->fill = 0;
 }
-void dsdaccum_free(DsdAccum *ac) { free(ac->buf); ac->buf = NULL; }
 
-void dsdaccum_push_s16(DsdAccum *ac, const int16_t *src, size_t frames)
+static int dsdaccum_reserve(DsdAccum *ac)
 {
-	if (ac->fill + frames > ac->capacity) frames = ac->capacity - ac->fill;
-	size_t off = ac->fill * (size_t)ac->channels;
-	size_t n = frames * (size_t)ac->channels;
-	for (size_t i = 0; i < n; i++) ac->buf[off + i] = src[i] / 32768.0f;
-	ac->fill += frames;
+	if (ac->buf) return 0;
+	ac->buf = (float *)malloc(
+		(size_t)DSD_ENC_INPUT_CHUNK *
+		(size_t)ac->channels * sizeof(float));
+	return ac->buf ? 0 : -1;
 }
-void dsdaccum_push_f32(DsdAccum *ac, const float *src, size_t frames)
+
+static void dsdaccum_reset(DsdAccum *ac)
 {
-	if (ac->fill + frames > ac->capacity) frames = ac->capacity - ac->fill;
-	memcpy(ac->buf + ac->fill * (size_t)ac->channels, src, frames * (size_t)ac->channels * sizeof(float));
-	ac->fill += frames;
+	if (ac) ac->fill = 0;
 }
-void dsdaccum_drain(DsdAccum *ac, DsdSink *sink)
+
+static void dsdaccum_free(DsdAccum *ac)
 {
-	size_t off = 0;
-	while (ac->fill - off >= DSD_ENC_INPUT_CHUNK) {
-		dsdsink_write(sink, ac->buf + off * (size_t)ac->channels, DSD_ENC_INPUT_CHUNK);
-		off += DSD_ENC_INPUT_CHUNK;
+	if (!ac) return;
+	free(ac->buf);
+	memset(ac, 0, sizeof(*ac));
+}
+
+static void dsdaccum_feed_f32(DsdAccum *ac, DsdSink *sink,
+                              const float *src, size_t frames)
+{
+	const size_t chunk = DSD_ENC_INPUT_CHUNK;
+	const size_t channels = (size_t)ac->channels;
+
+	if (!src || frames == 0 || dsdaccum_reserve(ac) != 0) return;
+
+	if (ac->fill > 0) {
+		size_t take = chunk - ac->fill;
+		if (take > frames) take = frames;
+		memcpy(ac->buf + ac->fill * channels, src,
+		       take * channels * sizeof(float));
+		ac->fill += take;
+		src += take * channels;
+		frames -= take;
+		if (ac->fill == chunk) {
+			dsdsink_write(sink, ac->buf, chunk);
+			ac->fill = 0;
+		}
 	}
-	size_t remain = ac->fill - off;
-	if (remain > 0 && off > 0) {
-		memmove(ac->buf, ac->buf + off * (size_t)ac->channels, remain * (size_t)ac->channels * sizeof(float));
+
+	while (frames >= chunk) {
+		dsdsink_write(sink, src, chunk);
+		src += chunk * channels;
+		frames -= chunk;
 	}
-	ac->fill = remain;
+
+	if (frames > 0) {
+		memcpy(ac->buf, src,
+		       frames * channels * sizeof(float));
+		ac->fill = frames;
+	}
+}
+
+static void dsdaccum_feed_s16(DsdAccum *ac, DsdSink *sink,
+                              const int16_t *src, size_t frames)
+{
+	const size_t chunk = DSD_ENC_INPUT_CHUNK;
+	const size_t channels = (size_t)ac->channels;
+
+	if (!src || frames == 0 || dsdaccum_reserve(ac) != 0) return;
+
+	while (frames > 0) {
+		size_t room = chunk - ac->fill;
+		size_t take = frames < room ? frames : room;
+		size_t dst_off = ac->fill * channels;
+		size_t samples = take * channels;
+
+		for (size_t i = 0; i < samples; ++i)
+			ac->buf[dst_off + i] =
+				src[i] * (1.0f / 32768.0f);
+
+		ac->fill += take;
+		src += samples;
+		frames -= take;
+
+		if (ac->fill == chunk) {
+			dsdsink_write(sink, ac->buf, chunk);
+			ac->fill = 0;
+		}
+	}
+}
+
+static void dsdaccum_flush(DsdAccum *ac, DsdSink *sink)
+{
+	size_t channels;
+	size_t remain;
+
+	if (!ac || !ac->buf || ac->fill == 0 ||
+	    !sink || !sink->enc) return;
+
+	channels = (size_t)ac->channels;
+	remain = DSD_ENC_INPUT_CHUNK - ac->fill;
+	memset(ac->buf + ac->fill * channels, 0,
+	       remain * channels * sizeof(float));
+	dsdsink_write(sink, ac->buf, DSD_ENC_INPUT_CHUNK);
+	ac->fill = 0;
 }
 
 // ============================================================
-// OutRouter: routes decoded audio to either normal PCM or DSD(DoP) output,
-// switchable live during playback with the 'e' key.
+// OutRouter: routes decoded audio to normal PCM or DSD(DoP), with live
+// switching. Conversion and DSP buffers are allocated only when required.
 // ============================================================
 typedef struct {
 	int use_dsd;
@@ -503,8 +665,8 @@ typedef struct {
 
 	DsdSink dsd;
 	int dsd_open;
-
 	DsdAccum accum;
+
 	int16_t *i16_scratch;
 	float *s16_f32;
 	float *sr_scratch;
@@ -512,54 +674,130 @@ typedef struct {
 	int sr_have_prev;
 } OutRouter;
 
-void outr_open_pcm(OutRouter *r)
+static int outr_ensure_i16_scratch(OutRouter *r)
+{
+	if (r->i16_scratch) return 0;
+	r->i16_scratch = (int16_t *)malloc(
+		(size_t)AUDIO_SCRATCH_FRAMES *
+		(size_t)r->channels * sizeof(int16_t));
+	return r->i16_scratch ? 0 : -1;
+}
+
+static int outr_ensure_s16_f32(OutRouter *r)
+{
+	if (r->s16_f32) return 0;
+	r->s16_f32 = (float *)malloc(
+		(size_t)AUDIO_SCRATCH_FRAMES *
+		(size_t)r->channels * sizeof(float));
+	return r->s16_f32 ? 0 : -1;
+}
+
+static int outr_ensure_super_res(OutRouter *r)
+{
+	if (!r->sr_scratch) {
+		r->sr_scratch = (float *)malloc(
+			(size_t)AUDIO_SCRATCH_FRAMES *
+			(size_t)r->channels * sizeof(float));
+	}
+	if (!r->sr_prev) {
+		r->sr_prev = (float *)calloc(
+			(size_t)r->channels, sizeof(float));
+	}
+	if (!r->sr_scratch || !r->sr_prev) {
+		free(r->sr_scratch);
+		free(r->sr_prev);
+		r->sr_scratch = NULL;
+		r->sr_prev = NULL;
+		return -1;
+	}
+	return 0;
+}
+
+static void outr_close_dsd(OutRouter *r, int flush)
+{
+	if (!r->dsd_open) return;
+	if (flush) dsdaccum_flush(&r->accum, &r->dsd);
+	dsdsink_close(&r->dsd);
+	r->dsd_open = 0;
+	dsdaccum_reset(&r->accum);
+}
+
+static void outr_open_pcm(OutRouter *r)
 {
 	if (r->pcm_open) return;
-	if (r->dsd_open) { dsdsink_close(&r->dsd); r->dsd_open = 0; }
-	if (AUDIO_init(&r->pcm, r->dev_buf, r->sample_rate, r->channels, FRAMES, 1, r->format) == 0) {
+	if (r->dsd_open) outr_close_dsd(r, 1);
+	if (AUDIO_init(&r->pcm, r->dev_buf, r->sample_rate,
+	               r->channels, FRAMES, 1, r->format) == 0)
 		r->pcm_open = 1;
-	}
 }
-void outr_open_dsd(OutRouter *r)
+
+static void outr_open_dsd(OutRouter *r)
 {
 	if (r->dsd_open) return;
-	if (r->pcm_open) { AUDIO_close(&r->pcm); r->pcm_open = 0; }
-	if (dsdsink_open(&r->dsd, r->dev_buf, r->sample_rate, r->channels) == 0) {
-		r->dsd_open = 1;
-		r->accum.fill = 0;
-	} else {
-		fprintf(stderr, "DSD output unavailable (DoP and monitor mode both failed), falling back to normal PCM\n");
+
+	if (dsdaccum_reserve(&r->accum) != 0) {
+		fprintf(stderr,
+		        "Failed to allocate DSD staging buffer; "
+		        "falling back to normal PCM\n");
 		r->use_dsd = 0;
 		outr_open_pcm(r);
+		return;
 	}
+
+	if (r->pcm_open) {
+		AUDIO_close(&r->pcm);
+		r->pcm_open = 0;
+	}
+
+	if (dsdsink_open(&r->dsd, r->dev_buf,
+	                 r->sample_rate, r->channels) == 0) {
+		r->dsd_open = 1;
+		dsdaccum_reset(&r->accum);
+		return;
+	}
+
+	fprintf(stderr,
+	        "DSD output unavailable; falling back to normal PCM\n");
+	r->use_dsd = 0;
+	outr_open_pcm(r);
 }
-const char *outr_status_note(OutRouter *r)
+
+static const char *outr_status_note(OutRouter *r)
 {
 	if (!r->use_dsd) return "PCM output";
 	if (!r->dsd_open) return "DSD (pending device)";
-	return r->dsd.monitor_mode ? "DSD monitor (PCM->DSD->PCM, no DoP hw)" : "DSD(DoP)output";
+	return r->dsd.monitor_mode
+		? "DSD monitor (PCM->DSD->PCM, no DoP hw)"
+		: "DSD(DoP) output";
 }
-/* Open the ALSA device now if it is not already open. Returns 0 on success. */
-int outr_ensure_open(OutRouter *r)
+
+/* Open the ALSA device now if it is not already open. */
+static int outr_ensure_open(OutRouter *r)
 {
 	if (!r) return -1;
-	/* Hard-stop (Tab) releases the handle without clearing pcm_open. */
-	if (r->pcm_open && !r->pcm.handle) r->pcm_open = 0;
+
+	/* Hard-stop (Tab) may release the underlying handle. */
+	if (r->pcm_open && !r->pcm.handle)
+		r->pcm_open = 0;
+
 	if (r->dsd_open) {
-		AUDIO *da = r->dsd.monitor_mode ? &r->dsd.mon_a : &r->dsd.a;
-		if (!da->handle) r->dsd_open = 0;
+		AUDIO *da = r->dsd.monitor_mode
+			? &r->dsd.mon_a : &r->dsd.a;
+		if (!da->handle)
+			outr_close_dsd(r, 0);
 	}
+
 	if (r->pcm_open || r->dsd_open) return 0;
-	if (r->use_dsd) outr_open_dsd(r); else outr_open_pcm(r);
+	if (r->use_dsd) outr_open_dsd(r);
+	else outr_open_pcm(r);
 	return (r->pcm_open || r->dsd_open) ? 0 : -1;
 }
-/* Keep trying to open the device until it succeeds or the user aborts with a
- * playlist/quit command. Used when the card is busy at track start — the UI
- * stays up and waits instead of racing through the playlist. Returns 0 if
- * open, -1 if aborted (cmd already set for play_dir). */
-int outr_wait_open(OutRouter *r, tui_state_t *ts)
+
+/* Wait for a busy playback device while keeping controls responsive. */
+static int outr_wait_open(OutRouter *r, tui_state_t *ts)
 {
 	int announced = 0;
+
 	for (;;) {
 		if (outr_ensure_open(r) == 0) {
 			apply_alsa_volume();
@@ -570,34 +808,46 @@ int outr_wait_open(OutRouter *r, tui_state_t *ts)
 			}
 			return 0;
 		}
+
 		if (!announced) {
-			fprintf(stderr, "aplay+: device '%s' busy — waiting (will play when free)\n",
-				r->dev_buf);
+			fprintf(stderr,
+			        "aplay+: device '%s' busy — waiting "
+			        "(will play when free)\n", r->dev_buf);
 			announced = 1;
 		}
+
 		if (ts) {
 			ts->paused = 1;
 			ts->note = "Device busy — waiting";
 			ts->device = r->dev_buf;
 			tui_render(ts);
 		}
-		int k = key(NULL, ts);
-		if (k == 'q' || k == 0x1b || k == 'n' || k == 'b' || k == 'p' ||
-		    k == '\\' || k == 'd' || k == 'A') {
-			cmd = k;
-			return -1;
+
+		{
+			int k = key(NULL, ts);
+			if (k == 'q' || k == 0x1b ||
+			    k == 'n' || k == 'b' || k == 'p' ||
+			    k == '\\' || k == 'd' || k == 'A') {
+				cmd = k;
+				return -1;
+			}
 		}
 		usleep(200000);
 	}
 }
-/* Same wait/retry loop for paths that open AUDIO directly (DSD, test tone). */
-static int audio_wait_init(AUDIO *a, char *devname, unsigned int freq, int ch,
-                           int frames, int flag, int format, tui_state_t *ts)
+
+/* Same retry loop for paths that open AUDIO directly. */
+static int audio_wait_init(AUDIO *a, char *devname,
+                           unsigned int freq, int ch,
+                           int frames, int flag, int format,
+                           tui_state_t *ts)
 {
 	int announced = 0;
 	memset(a, 0, sizeof(*a));
+
 	for (;;) {
-		if (AUDIO_init(a, devname, freq, ch, frames, flag, format) == 0) {
+		if (AUDIO_init(a, devname, freq, ch,
+		               frames, flag, format) == 0) {
 			apply_alsa_volume();
 			if (ts) {
 				ts->paused = 0;
@@ -605,158 +855,263 @@ static int audio_wait_init(AUDIO *a, char *devname, unsigned int freq, int ch,
 			}
 			return 0;
 		}
+
 		if (!announced) {
-			fprintf(stderr, "aplay+: device '%s' busy — waiting (will play when free)\n",
-				devname ? devname : "?");
+			fprintf(stderr,
+			        "aplay+: device '%s' busy — waiting "
+			        "(will play when free)\n",
+			        devname ? devname : "?");
 			announced = 1;
 		}
+
 		if (ts) {
 			ts->paused = 1;
 			ts->note = "Device busy — waiting";
 			ts->device = devname;
 			tui_render(ts);
 		}
-		int k = key(NULL, ts);
-		if (k == 'q' || k == 0x1b || k == 'n' || k == 'b' || k == 'p' ||
-		    k == '\\' || k == 'd' || k == 'A') {
-			cmd = k;
-			return -1;
+
+		{
+			int k = key(NULL, ts);
+			if (k == 'q' || k == 0x1b ||
+			    k == 'n' || k == 'b' || k == 'p' ||
+			    k == '\\' || k == 'd' || k == 'A') {
+				cmd = k;
+				return -1;
+			}
 		}
 		usleep(200000);
 	}
 }
-int outr_init(OutRouter *r, const char *dev_name, int sample_rate, int channels, int format,
-              int start_with_dsd, int start_with_super_res)
+
+static int outr_init(OutRouter *r, const char *dev_name,
+                     int sample_rate, int channels, int format,
+                     int start_with_dsd,
+                     int start_with_super_res)
 {
+	if (!r || !dev_name || channels <= 0 ||
+	    sample_rate <= 0) return -1;
+
 	memset(r, 0, sizeof(*r));
 	r->sample_rate = sample_rate;
 	r->channels = channels;
 	r->format = format;
 	snprintf(r->dev_buf, sizeof(r->dev_buf), "%s", dev_name);
-	dsdaccum_init(&r->accum, channels, DSD_ACCUM_CAPACITY);
-	r->i16_scratch = (int16_t*)malloc(DSD_ACCUM_CAPACITY * (size_t)channels * sizeof(int16_t));
-	r->s16_f32 = (float*)malloc(DSD_ACCUM_CAPACITY * (size_t)channels * sizeof(float));
-	r->sr_scratch = (float*)malloc(DSD_ACCUM_CAPACITY * (size_t)channels * sizeof(float));
-	r->sr_prev = (float*)calloc((size_t)channels, sizeof(float));
-	if (!r->i16_scratch || !r->s16_f32 || !r->sr_scratch || !r->sr_prev) {
-		free(r->i16_scratch); free(r->s16_f32); free(r->sr_scratch); free(r->sr_prev);
-		dsdaccum_free(&r->accum);
-		memset(r, 0, sizeof(*r));
-		return -1;
-	}
+	dsdaccum_init(&r->accum, channels);
 	r->use_dsd = start_with_dsd ? 1 : 0;
 	r->use_super_res = start_with_super_res ? 1 : 0;
-	/* Defer ALSA open until outr_wait_open / first feed — so a busy card
-	 * does not fail track setup or tear down the UI. */
+
+	if (r->use_super_res &&
+	    outr_ensure_super_res(r) != 0) {
+		fprintf(stderr,
+		        "Super-resolution buffer allocation failed; "
+		        "feature disabled\n");
+		r->use_super_res = 0;
+	}
+
+	/* ALSA open remains deferred so a busy card does not tear down the UI. */
 	g_active_router_ptr = r;
 	return 0;
 }
-void outr_toggle(OutRouter *r)
+
+static void outr_toggle(OutRouter *r)
 {
 	r->use_dsd = !r->use_dsd;
-	if (r->use_dsd) outr_open_dsd(r); else outr_open_pcm(r);
+	if (r->use_dsd) outr_open_dsd(r);
+	else outr_open_pcm(r);
 }
-void outr_toggle_super_res(OutRouter *r)
+
+static void outr_toggle_super_res(OutRouter *r)
 {
 	r->use_super_res = !r->use_super_res;
 	r->sr_have_prev = 0;
+
+	if (r->use_super_res &&
+	    outr_ensure_super_res(r) != 0) {
+		fprintf(stderr,
+		        "Super-resolution buffer allocation failed; "
+		        "feature disabled\n");
+		r->use_super_res = 0;
+	}
 }
-AUDIO *outr_audio(OutRouter *r)
+
+static AUDIO *outr_audio(OutRouter *r)
 {
 	if (!r->use_dsd) return &r->pcm;
 	return r->dsd.monitor_mode ? &r->dsd.mon_a : &r->dsd.a;
 }
-int outr_output_rate(OutRouter *r)
+
+static int outr_output_rate(OutRouter *r)
 {
-	if (!r->use_dsd) return r->sample_rate;
-	if (!r->dsd_open) return r->sample_rate;
+	if (!r->use_dsd || !r->dsd_open) return r->sample_rate;
 	if (r->dsd.monitor_mode) return (int)r->dsd.mon_a.freq;
 	return (int)r->dsd.a.freq;
 }
-void outr_close(OutRouter *r)
+
+static void outr_close(OutRouter *r)
 {
+	if (!r) return;
 	if (g_active_router_ptr == r) g_active_router_ptr = NULL;
-	if (r->pcm_open) AUDIO_close(&r->pcm);
-	if (r->dsd_open) dsdsink_close(&r->dsd);
+	if (r->pcm_open && r->pcm.handle) AUDIO_close(&r->pcm);
+	outr_close_dsd(r, 1);
 	dsdaccum_free(&r->accum);
 	free(r->i16_scratch);
 	free(r->s16_f32);
 	free(r->sr_scratch);
 	free(r->sr_prev);
+	memset(r, 0, sizeof(*r));
 }
 
-/* Live-switch the ALSA device while keeping the current PCM/DSD mode.
- * Returns 0 on success, -1 if the new device could not be opened (previous
- * device is restored when possible). */
-int outr_set_device(OutRouter *r, const char *name)
+/* Live-switch the ALSA device while preserving PCM/DSD mode. */
+static int outr_set_device(OutRouter *r, const char *name)
 {
-	if (!r || !name || !name[0]) return -1;
 	char prev[sizeof(r->dev_buf)];
+	int was_dsd;
+
+	if (!r || !name || !name[0]) return -1;
 	snprintf(prev, sizeof(prev), "%s", r->dev_buf);
-	int was_dsd = r->use_dsd;
+	was_dsd = r->use_dsd;
 	snprintf(r->dev_buf, sizeof(r->dev_buf), "%s", name);
-	if (r->pcm_open) { AUDIO_close(&r->pcm); r->pcm_open = 0; }
-	if (r->dsd_open) { dsdsink_close(&r->dsd); r->dsd_open = 0; }
+
+	if (r->pcm_open) {
+		if (r->pcm.handle) AUDIO_close(&r->pcm);
+		r->pcm_open = 0;
+	}
+	outr_close_dsd(r, 1);
+
 	r->use_dsd = was_dsd;
-	if (was_dsd) outr_open_dsd(r); else outr_open_pcm(r);
+	if (was_dsd) outr_open_dsd(r);
+	else outr_open_pcm(r);
+
 	if (!r->pcm_open && !r->dsd_open) {
 		snprintf(r->dev_buf, sizeof(r->dev_buf), "%s", prev);
 		r->use_dsd = was_dsd;
-		if (was_dsd) outr_open_dsd(r); else outr_open_pcm(r);
+		if (was_dsd) outr_open_dsd(r);
+		else outr_open_pcm(r);
 		return -1;
 	}
+
 	apply_alsa_volume();
 	return 0;
 }
-void outr_feed_float(OutRouter *r, const float *pcm, size_t frames)
+
+static float aplay_clampf(float v)
 {
-	if (outr_ensure_open(r) < 0) return;
-	/* wave-super-resolution's detail reconstruction at unity rate:
-	 * y[n] = x[n] + x[n] - (x[n-1] + x[n+1]) / 2.  Keep one frame of
-	 * history so block boundaries behave like a continuous stream. */
-	if (r->use_super_res && frames > 0 && frames <= DSD_ACCUM_CAPACITY) {
-		size_t samples = frames * (size_t)r->channels;
-		memcpy(r->sr_scratch, pcm, samples * sizeof(float));
-		for (size_t i = 0; i < frames; ++i) {
-			for (int ch = 0; ch < r->channels; ++ch) {
-				size_t p = i * (size_t)r->channels + (size_t)ch;
-				float cur = pcm[p];
-				float prev = (i > 0) ? pcm[p - r->channels]
-				                         : (r->sr_have_prev ? r->sr_prev[ch] : cur);
-				float next = (i + 1 < frames) ? pcm[p + r->channels] : cur;
-				float v = cur + cur - 0.5f * (prev + next);
-				r->sr_scratch[p] = fmaxf(-1.0f, fminf(1.0f, v));
-			}
-		}
-		memcpy(r->sr_prev, pcm + (frames - 1) * (size_t)r->channels,
-		       (size_t)r->channels * sizeof(float));
-		r->sr_have_prev = 1;
-		pcm = r->sr_scratch;
-	}
-	if (r->use_dsd) {
-		dsdaccum_push_f32(&r->accum, pcm, frames);
-		dsdaccum_drain(&r->accum, &r->dsd);
-	} else {
-		if (r->format == SND_PCM_FORMAT_FLOAT_LE) {
-			AUDIO_play(&r->pcm, (char*)pcm, (int)frames);
-		} else {
-			size_t n = frames * (size_t)r->channels;
-			for (size_t i = 0; i < n; i++) {
-				float v = pcm[i] * 32767.0f;
-				if (v > 32767.0f) v = 32767.0f;
-				if (v < -32768.0f) v = -32768.0f;
-				r->i16_scratch[i] = (int16_t)v;
-			}
-			AUDIO_play(&r->pcm, (char*)r->i16_scratch, (int)frames);
-		}
-		AUDIO_wait(&r->pcm, 100);
-	}
+	if (v > 1.0f) return 1.0f;
+	if (v < -1.0f) return -1.0f;
+	return v;
 }
-void outr_feed_s16(OutRouter *r, const int16_t *pcm, size_t frames)
+
+static void outr_feed_float(OutRouter *r,
+                            const float *pcm, size_t frames)
 {
-	if (frames > DSD_ACCUM_CAPACITY) frames = DSD_ACCUM_CAPACITY;
-	size_t n = frames * (size_t)r->channels;
-	for (size_t i = 0; i < n; ++i) r->s16_f32[i] = pcm[i] / 32768.0f;
+	if (!r || !pcm || frames == 0) return;
+
+	while (frames > AUDIO_SCRATCH_FRAMES) {
+		outr_feed_float(r, pcm, AUDIO_SCRATCH_FRAMES);
+		pcm += (size_t)AUDIO_SCRATCH_FRAMES *
+		       (size_t)r->channels;
+		frames -= AUDIO_SCRATCH_FRAMES;
+	}
+
+	if (outr_ensure_open(r) < 0) return;
+
+	if (r->use_super_res) {
+		if (outr_ensure_super_res(r) != 0) {
+			r->use_super_res = 0;
+			r->sr_have_prev = 0;
+		} else {
+			for (size_t i = 0; i < frames; ++i) {
+				for (int ch = 0; ch < r->channels; ++ch) {
+					size_t p =
+						i * (size_t)r->channels +
+						(size_t)ch;
+					float cur = pcm[p];
+					float prev = i > 0
+						? pcm[p - (size_t)r->channels]
+						: (r->sr_have_prev
+						   ? r->sr_prev[ch] : cur);
+					float next = i + 1 < frames
+						? pcm[p + (size_t)r->channels]
+						: cur;
+					r->sr_scratch[p] = aplay_clampf(
+						cur + cur -
+						0.5f * (prev + next));
+				}
+			}
+			memcpy(r->sr_prev,
+			       pcm + (frames - 1) *
+			       (size_t)r->channels,
+			       (size_t)r->channels *
+			       sizeof(float));
+			r->sr_have_prev = 1;
+			pcm = r->sr_scratch;
+		}
+	}
+
+	if (r->use_dsd) {
+		dsdaccum_feed_f32(&r->accum, &r->dsd,
+		                  pcm, frames);
+		return;
+	}
+
+	if (r->format == SND_PCM_FORMAT_FLOAT_LE) {
+		AUDIO_play(&r->pcm, (char *)pcm, (int)frames);
+	} else {
+		size_t samples = frames * (size_t)r->channels;
+		if (outr_ensure_i16_scratch(r) != 0) return;
+		for (size_t i = 0; i < samples; ++i) {
+			float v = pcm[i] * 32768.0f;
+			if (v >= 32767.0f) r->i16_scratch[i] = 32767;
+			else if (v <= -32768.0f)
+				r->i16_scratch[i] = -32768;
+			else r->i16_scratch[i] = (int16_t)v;
+		}
+		AUDIO_play(&r->pcm, (char *)r->i16_scratch,
+		           (int)frames);
+	}
+	AUDIO_wait(&r->pcm, 100);
+}
+
+static void outr_feed_s16(OutRouter *r,
+                          const int16_t *pcm, size_t frames)
+{
+	if (!r || !pcm || frames == 0) return;
+
+	while (frames > AUDIO_SCRATCH_FRAMES) {
+		outr_feed_s16(r, pcm, AUDIO_SCRATCH_FRAMES);
+		pcm += (size_t)AUDIO_SCRATCH_FRAMES *
+		       (size_t)r->channels;
+		frames -= AUDIO_SCRATCH_FRAMES;
+	}
+
+	if (outr_ensure_open(r) < 0) return;
+
+	/*
+	 * Fast path: decoded S16 goes directly to ALSA. This avoids the former
+	 * S16 -> float -> S16 round trip for OGG/WMA/AAC/minimp3.
+	 */
+	if (!r->use_dsd && !r->use_super_res &&
+	    r->format != SND_PCM_FORMAT_FLOAT_LE) {
+		AUDIO_play(&r->pcm, (char *)pcm, (int)frames);
+		AUDIO_wait(&r->pcm, 100);
+		return;
+	}
+
+	/* DSD without float DSP converts only the encoder's 32-frame block. */
+	if (r->use_dsd && !r->use_super_res) {
+		dsdaccum_feed_s16(&r->accum, &r->dsd,
+		                  pcm, frames);
+		return;
+	}
+
+	if (outr_ensure_s16_f32(r) != 0) return;
+	{
+		size_t samples = frames * (size_t)r->channels;
+		for (size_t i = 0; i < samples; ++i)
+			r->s16_f32[i] =
+				pcm[i] * (1.0f / 32768.0f);
+	}
 	outr_feed_float(r, r->s16_f32, frames);
 }
 
@@ -771,72 +1126,107 @@ typedef struct {
 	int delay_index;
 } CrosstalkCancel;
 
-void init_crosstalk_cancellation(CrosstalkCancel *xtc, int sample_rate, int channels)
+static void init_crosstalk_cancellation(
+	CrosstalkCancel *xtc, int sample_rate, int channels)
 {
-	if (channels != 2) return;
-	// 音速343m/sを基準に、スピーカー間距離から遅延を計算
-	xtc->delay_samples = (int)(sample_rate * (speaker_distance_m / 343.0));
-	xtc->attenuation = xtc_attenuation;
+	if (!xtc) return;
+	memset(xtc, 0, sizeof(*xtc));
+
+	if (channels != 2 || sample_rate <= 0) return;
+
+	/* Sound speed: approximately 343 m/s. Allocate lazily on first use. */
+	xtc->delay_samples =
+		(int)(sample_rate * (speaker_distance_m / 343.0f));
+	if (xtc->delay_samples < 1) xtc->delay_samples = 1;
 	xtc->delay_buffer_size = xtc->delay_samples * 2;
-	if (xtc->delay_buffer_size < 2) xtc->delay_buffer_size = 2;
-	xtc->delay_buffer = (float*)calloc(xtc->delay_buffer_size, sizeof(float));
+	xtc->attenuation = xtc_attenuation;
+}
+
+static int ensure_crosstalk_buffer(CrosstalkCancel *xtc)
+{
+	if (!xtc || xtc->delay_buffer_size < 2) return -1;
+	if (xtc->delay_buffer) return 0;
+
+	xtc->delay_buffer = (float *)calloc(
+		(size_t)xtc->delay_buffer_size, sizeof(float));
 	xtc->delay_index = 0;
+	return xtc->delay_buffer ? 0 : -1;
 }
 
-void free_crosstalk_cancellation(CrosstalkCancel *xtc)
+static void free_crosstalk_cancellation(CrosstalkCancel *xtc)
 {
-	if (xtc->delay_buffer) {
-		free(xtc->delay_buffer);
-		xtc->delay_buffer = NULL;
-	}
+	if (!xtc) return;
+	free(xtc->delay_buffer);
+	memset(xtc, 0, sizeof(*xtc));
 }
 
-void apply_crosstalk_cancellation(CrosstalkCancel *xtc, void *buffer, int frames, int channels, int format)
+static int16_t aplay_float_to_s16(float v)
 {
-	if (channels != 2) return;
+	v = aplay_clampf(v);
+	if (v >= 32767.0f / 32768.0f) return 32767;
+	if (v <= -1.0f) return -32768;
+	return (int16_t)(v * 32768.0f);
+}
+
+static void apply_crosstalk_cancellation(
+	CrosstalkCancel *xtc, void *buffer,
+	int frames, int channels, int format)
+{
+	if (!xtc || !buffer || frames <= 0 || channels != 2) return;
+	if (ensure_crosstalk_buffer(xtc) != 0) return;
+
 	xtc->attenuation = xtc_attenuation;
 
 	if (format == SND_PCM_FORMAT_FLOAT_LE) {
-		float *data = (float*)buffer;
-		float temp[frames * 2];
-		memcpy(temp, data, frames * 2 * sizeof(float));
+		float *data = (float *)buffer;
 
-		for (int i = 0; i < frames; i++) {
+		for (int i = 0; i < frames; ++i) {
 			int idx = i * 2;
-			int delay_idx = (xtc->delay_index - xtc->delay_samples * 2 + xtc->delay_buffer_size) % xtc->delay_buffer_size;
+			float left = data[idx];
+			float right = data[idx + 1];
+			float delayed_left =
+				xtc->delay_buffer[xtc->delay_index];
+			float delayed_right =
+				xtc->delay_buffer[xtc->delay_index + 1];
 
-			xtc->delay_buffer[xtc->delay_index]     = temp[idx];
-			xtc->delay_buffer[xtc->delay_index + 1] = temp[idx + 1];
-			xtc->delay_index = (xtc->delay_index + 2) % xtc->delay_buffer_size;
+			/*
+			 * Read the delayed frame before overwriting it. The old code
+			 * wrote first and therefore often cancelled with the current
+			 * sample instead of the delayed sample.
+			 */
+			xtc->delay_buffer[xtc->delay_index] = left;
+			xtc->delay_buffer[xtc->delay_index + 1] = right;
+			xtc->delay_index += 2;
+			if (xtc->delay_index >= xtc->delay_buffer_size)
+				xtc->delay_index = 0;
 
-			float delayed_left  = xtc->delay_buffer[delay_idx];
-			float delayed_right = xtc->delay_buffer[delay_idx + 1];
-
-			data[idx]     = fmaxf(fminf(temp[idx]     - xtc->attenuation * delayed_right, 1.0f), -1.0f);
-			data[idx + 1] = fmaxf(fminf(temp[idx + 1] - xtc->attenuation * delayed_left,  1.0f), -1.0f);
+			data[idx] = aplay_clampf(
+				left - xtc->attenuation * delayed_right);
+			data[idx + 1] = aplay_clampf(
+				right - xtc->attenuation * delayed_left);
 		}
 	} else {
-		int16_t *data = (int16_t*)buffer;
-		float temp[frames * 2];
-		for (int i = 0; i < frames * 2; i++) temp[i] = data[i] / 32768.0f;
+		int16_t *data = (int16_t *)buffer;
 
-		for (int i = 0; i < frames; i++) {
+		for (int i = 0; i < frames; ++i) {
 			int idx = i * 2;
-			int delay_idx = (xtc->delay_index - xtc->delay_samples * 2 + xtc->delay_buffer_size) % xtc->delay_buffer_size;
+			float left = data[idx] * (1.0f / 32768.0f);
+			float right = data[idx + 1] * (1.0f / 32768.0f);
+			float delayed_left =
+				xtc->delay_buffer[xtc->delay_index];
+			float delayed_right =
+				xtc->delay_buffer[xtc->delay_index + 1];
 
-			xtc->delay_buffer[xtc->delay_index]     = temp[idx];
-			xtc->delay_buffer[xtc->delay_index + 1] = temp[idx + 1];
-			xtc->delay_index = (xtc->delay_index + 2) % xtc->delay_buffer_size;
+			xtc->delay_buffer[xtc->delay_index] = left;
+			xtc->delay_buffer[xtc->delay_index + 1] = right;
+			xtc->delay_index += 2;
+			if (xtc->delay_index >= xtc->delay_buffer_size)
+				xtc->delay_index = 0;
 
-			float delayed_left  = xtc->delay_buffer[delay_idx];
-			float delayed_right = xtc->delay_buffer[delay_idx + 1];
-
-			temp[idx]     -= xtc->attenuation * delayed_right;
-			temp[idx + 1] -= xtc->attenuation * delayed_left;
-		}
-
-		for (int i = 0; i < frames * 2; i++) {
-			data[i] = (int16_t)fmaxf(fminf(temp[i] * 32767.0f, 32767.0f), -32768.0f);
+			data[idx] = aplay_float_to_s16(
+				left - xtc->attenuation * delayed_right);
+			data[idx + 1] = aplay_float_to_s16(
+				right - xtc->attenuation * delayed_left);
 		}
 	}
 }
@@ -973,8 +1363,9 @@ void play_test_mode(int format, int flag)
 				right_amplitude = 0.5 * pan;
 			}
 
-			double left  = left_amplitude  * sin(2.0 * M_PI * frequency * t);
-			double right = right_amplitude * sin(2.0 * M_PI * frequency * t);
+			double wave = sin(2.0 * M_PI * frequency * t);
+			double left  = left_amplitude * wave;
+			double right = right_amplitude * wave;
 
 			if (format == SND_PCM_FORMAT_FLOAT_LE) {
 				buffer_f32[i * 2]     = (float)left;
@@ -1025,7 +1416,14 @@ void play_wav(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, wav.sampleRate, wav.channels);
 
-	float *pcm_buf = (float*)malloc(FRAMES * wav.channels * sizeof(float));
+	float *pcm_buf = (float *)malloc(
+		(size_t)FRAMES * wav.channels * sizeof(float));
+	if (!pcm_buf) {
+		outr_close(&router);
+		drwav_uninit(&wav);
+		free_crosstalk_cancellation(&xtc);
+		return;
+	}
 
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
@@ -1046,6 +1444,7 @@ void play_wav(char *name, int format, int flag)
 	ts.format_filter = fmt_filter;
 
 	uint64_t c = 0;
+	uint64_t last_render_ns = 0;
 	tui_open();
 	if (outr_wait_open(&router, &ts) < 0) {
 		free(pcm_buf);
@@ -1100,7 +1499,7 @@ void play_wav(char *name, int format, int flag)
 		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
 		ts.xtc_atten = xtc_attenuation;
 		ts.note = (n != FRAMES) ? "! short read" : NULL;
-		tui_render(&ts);
+		aplay_render_throttled(&ts, &last_render_ns);
 	}
 	tui_close();
 
@@ -1115,219 +1514,401 @@ void play_wav(char *name, int format, int flag)
 #define FX_IN_BUF_SIZE  8192
 #define FX_OUT_SAMPLES  (FLAC_SUBSET_MAX_BLOCK_SIZE * FLAC_MAX_CHANNEL_COUNT)
 
-static int fx_seek_to_frame(FILE *f, fx_flac_t *flac, uint64_t target_frame, uint32_t channels)
+static size_t fx_fill_input(FILE *f, uint8_t *in_buf,
+                            uint32_t *in_pos, uint32_t *in_fill)
 {
-	rewind(f);
-	fx_flac_reset(flac);
-
-	uint8_t in_buf[FX_IN_BUF_SIZE];
-	uint32_t in_fill = 0;
-	int32_t *out_buf = malloc(FX_OUT_SAMPLES * sizeof(int32_t));
-	if (!out_buf) return 0;
-
-	uint64_t discarded = 0;
-	uint64_t target_samples = target_frame * channels;
-	fx_flac_state_t state = FLAC_INIT;
-
-	while (discarded < target_samples) {
-		if (in_fill < FX_IN_BUF_SIZE && !feof(f)) {
-			size_t rd = fread(in_buf + in_fill, 1, FX_IN_BUF_SIZE - in_fill, f);
-			in_fill += (uint32_t)rd;
-		}
-		if (in_fill == 0) break;
-
-		uint32_t in_len = in_fill;
-		uint32_t out_len = FX_OUT_SAMPLES;
-		state = fx_flac_process(flac, in_buf, &in_len, out_buf, &out_len);
-		memmove(in_buf, in_buf + in_len, in_fill - in_len);
-		in_fill -= in_len;
-
-		if (state == FLAC_ERR) break;
-		discarded += out_len;
-		if (in_len == 0 && out_len == 0) break;
+	if (*in_pos == *in_fill) {
+		*in_pos = 0;
+		*in_fill = 0;
+	} else if (*in_fill == FX_IN_BUF_SIZE && *in_pos > 0) {
+		uint32_t remain = *in_fill - *in_pos;
+		memmove(in_buf, in_buf + *in_pos, remain);
+		*in_pos = 0;
+		*in_fill = remain;
 	}
 
-	free(out_buf);
-	return state != FLAC_ERR;
+	if (*in_fill < FX_IN_BUF_SIZE && !feof(f)) {
+		size_t rd = fread(in_buf + *in_fill, 1,
+		                  FX_IN_BUF_SIZE - *in_fill, f);
+		*in_fill += (uint32_t)rd;
+	}
+	return (size_t)(*in_fill - *in_pos);
+}
+
+/*
+ * Rewind and decode up to target_frame. Any samples decoded beyond the exact
+ * target are retained in pcm_acc, and unconsumed compressed bytes remain in
+ * in_buf. This avoids both repeated buffer shifting and seek read-ahead loss.
+ */
+static int fx_seek_to_frame(
+	FILE *f, fx_flac_t *flac, uint64_t target_frame,
+	uint32_t channels, uint8_t *in_buf,
+	uint32_t *in_pos, uint32_t *in_fill,
+	int32_t *out_buf, int32_t *pcm_acc,
+	size_t pcm_capacity, size_t *acc_pos, size_t *acc_fill)
+{
+	uint64_t target_samples = target_frame * channels;
+	uint64_t discarded = 0;
+	fx_flac_state_t state = FLAC_INIT;
+
+	rewind(f);
+	clearerr(f);
+	fx_flac_reset(flac);
+	*in_pos = 0;
+	*in_fill = 0;
+	*acc_pos = 0;
+	*acc_fill = 0;
+
+	while (discarded < target_samples) {
+		uint32_t available;
+		uint32_t consumed;
+		uint32_t out_len = FX_OUT_SAMPLES;
+
+		if (fx_fill_input(f, in_buf, in_pos, in_fill) == 0)
+			break;
+
+		available = *in_fill - *in_pos;
+		consumed = available;
+		state = fx_flac_process(
+			flac, in_buf + *in_pos, &consumed,
+			out_buf, &out_len);
+		*in_pos += consumed;
+		if (*in_pos == *in_fill) {
+			*in_pos = 0;
+			*in_fill = 0;
+		}
+
+		if (state == FLAC_ERR) return 0;
+
+		if (out_len > 0) {
+			if (discarded + out_len <= target_samples) {
+				discarded += out_len;
+			} else {
+				size_t skip =
+					(size_t)(target_samples - discarded);
+				size_t remain = (size_t)out_len - skip;
+				if (remain > pcm_capacity) return 0;
+				memcpy(pcm_acc, out_buf + skip,
+				       remain * sizeof(int32_t));
+				*acc_fill = remain;
+				discarded = target_samples;
+			}
+		}
+
+		if (consumed == 0 && out_len == 0) break;
+	}
+
+	return state != FLAC_ERR && discarded >= target_samples;
 }
 
 void play_flac(char *name, int format, int flag)
 {
-	FILE *f = fopen(name, "rb");
+	FILE *f = NULL;
+	fx_flac_t *flac = NULL;
+	int32_t *out_buf = NULL;
+	int32_t *pcm_acc = NULL;
+	float *pcm_f32 = NULL;
+	OutRouter router;
+	CrosstalkCancel xtc;
+	int router_inited = 0;
+	int xtc_inited = 0;
+	int tui_is_open = 0;
+
+	uint8_t in_buf[FX_IN_BUF_SIZE];
+	uint32_t in_pos = 0;
+	uint32_t in_fill = 0;
+	fx_flac_state_t state = FLAC_INIT;
+
+	f = fopen(name, "rb");
 	if (!f) {
 		fprintf(stderr, "Failed to open FLAC: %s\n", name);
 		return;
 	}
 
-	fx_flac_t *flac = FX_FLAC_ALLOC_DEFAULT();
-	if (!flac) { fclose(f); return; }
+	flac = FX_FLAC_ALLOC_DEFAULT();
+	if (!flac) goto done;
 	fx_flac_reset(flac);
 
-	int32_t *out_buf = malloc(FX_OUT_SAMPLES * sizeof(int32_t));
-	if (!out_buf) { free(flac); fclose(f); return; }
+	out_buf = (int32_t *)malloc(
+		(size_t)FX_OUT_SAMPLES * sizeof(int32_t));
+	if (!out_buf) goto done;
 
-	uint8_t in_buf[FX_IN_BUF_SIZE];
-	uint32_t in_fill = 0;
-
-	fx_flac_state_t state = FLAC_INIT;
+	/* Parse metadata without moving the remaining compressed bytes. */
 	while (state < FLAC_END_OF_METADATA) {
-		if (in_fill < FX_IN_BUF_SIZE) {
-			size_t rd = fread(in_buf + in_fill, 1, FX_IN_BUF_SIZE - in_fill, f);
-			in_fill += (uint32_t)rd;
-		}
-		if (in_fill == 0) {
+		uint32_t available;
+		uint32_t consumed;
+		uint32_t out_len = FX_OUT_SAMPLES;
+
+		if (fx_fill_input(f, in_buf, &in_pos, &in_fill) == 0) {
 			fprintf(stderr, "FLAC: EOF before metadata: %s\n", name);
 			goto done;
 		}
-		uint32_t in_len = in_fill;
-		uint32_t out_len = FX_OUT_SAMPLES;
-		state = fx_flac_process(flac, in_buf, &in_len, out_buf, &out_len);
-		memmove(in_buf, in_buf + in_len, in_fill - in_len);
-		in_fill -= in_len;
+
+		available = in_fill - in_pos;
+		consumed = available;
+		state = fx_flac_process(
+			flac, in_buf + in_pos, &consumed,
+			out_buf, &out_len);
+		in_pos += consumed;
+		if (in_pos == in_fill) in_pos = in_fill = 0;
+
 		if (state == FLAC_ERR) {
 			fprintf(stderr, "FLAC: metadata error: %s\n", name);
+			goto done;
+		}
+		if (consumed == 0 && out_len == 0) {
+			fprintf(stderr, "FLAC: decoder stalled: %s\n", name);
 			goto done;
 		}
 	}
 
 	{
-	uint32_t sample_rate = (uint32_t)fx_flac_get_streaminfo(flac, FLAC_KEY_SAMPLE_RATE);
-	uint32_t channels    = (uint32_t)fx_flac_get_streaminfo(flac, FLAC_KEY_N_CHANNELS);
-	uint32_t bits        = (uint32_t)fx_flac_get_streaminfo(flac, FLAC_KEY_SAMPLE_SIZE);
-	int64_t  n_samples   = fx_flac_get_streaminfo(flac, FLAC_KEY_N_SAMPLES);
+		uint32_t sample_rate = (uint32_t)fx_flac_get_streaminfo(
+			flac, FLAC_KEY_SAMPLE_RATE);
+		uint32_t channels = (uint32_t)fx_flac_get_streaminfo(
+			flac, FLAC_KEY_N_CHANNELS);
+		uint32_t bits = (uint32_t)fx_flac_get_streaminfo(
+			flac, FLAC_KEY_SAMPLE_SIZE);
+		int64_t n_samples = fx_flac_get_streaminfo(
+			flac, FLAC_KEY_N_SAMPLES);
+		size_t frames_ch = (size_t)FRAMES * channels;
+		size_t pcm_capacity =
+			(size_t)FX_OUT_SAMPLES + frames_ch;
+		size_t acc_pos = 0;
+		size_t acc_fill = 0;
+		int eof = 0;
+		uint64_t frame_pos = 0;
+		uint64_t last_render_ns = 0;
+		tui_state_t ts = {0};
 
-	OutRouter router;
-	if (outr_init(&router, dev, sample_rate, channels, format,
-	              (flag & USE_DSD_ENCODE) ? 1 : 0, (flag & USE_SUPER_RES) ? 1 : 0)) goto done;
-
-	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, sample_rate, channels);
-
-	tui_state_t ts = {0};
-	ts.track_index = track_index;
-	ts.track_total = track_total;
-	ts.filename = get_basename(name);
-	char dirbuf[PATH_MAX];
-	get_dirpart(name, dirbuf, sizeof(dirbuf));
-	ts.dir = dirbuf;
-	ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)") : "FLAC";
-	ts.rate = outr_output_rate(&router);
-	ts.bits = format ? 32 : bits;
-	ts.channels = channels;
-	ts.device = dev;
-	ts.use_time = 1;
-	ts.total = n_samples > 0 ? (double)n_samples / sample_rate : 0.0;
-	ts.volume = volume;
-	ts.loop_mode = loop_mode;
-	ts.format_filter = fmt_filter;
-
-	int32_t *pcm_acc = malloc(FX_OUT_SAMPLES * sizeof(int32_t));
-	float *pcm_f32 = malloc(FRAMES * channels * sizeof(float));
-	if (!pcm_acc || !pcm_f32) {
-		outr_close(&router); free_crosstalk_cancellation(&xtc);
-		free(pcm_acc); free(pcm_f32); goto done;
-	}
-	uint32_t acc_fill = 0;
-	int eof = 0;
-	uint64_t frame_pos = 0;
-	uint32_t frames_ch = FRAMES * channels;
-
-	tui_open();
-	if (outr_wait_open(&router, &ts) < 0) {
-		outr_close(&router); free_crosstalk_cancellation(&xtc);
-		free(pcm_acc); free(pcm_f32); tui_close(); goto done;
-	}
-	for (;;) {
-		while (!eof && acc_fill < frames_ch) {
-			if (in_fill < FX_IN_BUF_SIZE && !feof(f)) {
-				size_t rd = fread(in_buf + in_fill, 1, FX_IN_BUF_SIZE - in_fill, f);
-				in_fill += (uint32_t)rd;
-			}
-			if (in_fill == 0) { eof = 1; break; }
-
-			uint32_t in_len = in_fill;
-			uint32_t out_len = FX_OUT_SAMPLES;
-			state = fx_flac_process(flac, in_buf, &in_len, out_buf, &out_len);
-			memmove(in_buf, in_buf + in_len, in_fill - in_len);
-			in_fill -= in_len;
-
-			if (state == FLAC_ERR) { eof = 1; break; }
-			if (out_len > 0) {
-				uint32_t space = FX_OUT_SAMPLES - acc_fill;
-				if (out_len > space) out_len = space;
-				memcpy(pcm_acc + acc_fill, out_buf, out_len * sizeof(int32_t));
-				acc_fill += out_len;
-			}
-			if (in_len == 0 && out_len == 0) {
-				if (feof(f) && in_fill == 0) eof = 1;
-				break;
-			}
+		if (sample_rate == 0 || channels == 0) {
+			fprintf(stderr, "FLAC: invalid stream info: %s\n", name);
+			goto done;
 		}
 
-		if (acc_fill < frames_ch) break;
+		if (outr_init(&router, dev, (int)sample_rate,
+		              (int)channels, format,
+		              (flag & USE_DSD_ENCODE) != 0,
+		              (flag & USE_SUPER_RES) != 0) != 0)
+			goto done;
+		router_inited = 1;
 
-		for (uint32_t i = 0; i < frames_ch; i++)
-			pcm_f32[i] = (float)pcm_acc[i] * (1.0f / 2147483648.0f);
+		init_crosstalk_cancellation(
+			&xtc, (int)sample_rate, (int)channels);
+		xtc_inited = 1;
 
-		memmove(pcm_acc, pcm_acc + frames_ch, (acc_fill - frames_ch) * sizeof(int32_t));
-		acc_fill -= frames_ch;
+		pcm_acc = (int32_t *)malloc(
+			pcm_capacity * sizeof(int32_t));
+		pcm_f32 = (float *)malloc(
+			frames_ch * sizeof(float));
+		if (!pcm_acc || !pcm_f32) goto done;
 
-		if (flag & USE_CROSSTALK)
-			apply_crosstalk_cancellation(&xtc, pcm_f32, FRAMES, channels, SND_PCM_FORMAT_FLOAT_LE);
+		ts.track_index = track_index;
+		ts.track_total = track_total;
+		ts.filename = get_basename(name);
+		char dirbuf[PATH_MAX];
+		get_dirpart(name, dirbuf, sizeof(dirbuf));
+		ts.dir = dirbuf;
+		ts.codec = router.use_dsd
+			? "FLAC->DSD(DoP)" : "FLAC";
+		ts.rate = outr_output_rate(&router);
+		ts.bits = format ? 32 : (int)bits;
+		ts.channels = (int)channels;
+		ts.device = dev;
+		ts.use_time = 1;
+		ts.total = n_samples > 0
+			? (double)n_samples / sample_rate : 0.0;
+		ts.volume = volume;
+		ts.loop_mode = loop_mode;
+		ts.format_filter = fmt_filter;
 
-		outr_feed_float(&router, pcm_f32, FRAMES);
+		tui_open();
+		tui_is_open = 1;
+		if (outr_wait_open(&router, &ts) < 0) goto done;
+		ts.codec = router.use_dsd
+			? (router.dsd.monitor_mode
+			   ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)")
+			: "FLAC";
 
-		frame_pos += FRAMES;
-		ts.cur = (double)frame_pos / sample_rate;
-		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
-		ts.xtc_atten = xtc_attenuation;
-		tui_render(&ts);
+		for (;;) {
+			size_t available_samples;
 
-		int k = key(outr_audio(&router), &ts);
-		if (k == 'c') {
-			flag ^= USE_CROSSTALK;
-			g_flag_diff ^= USE_CROSSTALK;
-		} else if (k == 's') {
-			outr_toggle_super_res(&router);
-			flag ^= USE_SUPER_RES; g_flag_diff ^= USE_SUPER_RES;
-			ts.note = router.use_super_res ? "Super resolution on" : "Super resolution off";
-			tui_render(&ts);
-		} else if (k == 'e') {
-			outr_toggle(&router);
-			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE;
-			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)") : "FLAC";
-			ts.rate = outr_output_rate(&router);
-			ts.note = outr_status_note(&router);
-			tui_render(&ts);
-		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
-			int64_t delta = (int64_t)SEEK_SECONDS * sample_rate * (k == KEY_RIGHT ? 1 : -1);
-			int64_t target = (int64_t)frame_pos + delta;
-			if (target < 0) target = 0;
-			if (n_samples > 0 && target > n_samples) target = n_samples;
-			if (fx_seek_to_frame(f, flac, (uint64_t)target, channels)) {
-				frame_pos = (uint64_t)target;
-				acc_fill = 0;
-				in_fill = 0;
-				eof = 0;
+			while (!eof &&
+			       acc_fill - acc_pos < frames_ch) {
+				uint32_t available;
+				uint32_t consumed;
+				uint32_t out_len = FX_OUT_SAMPLES;
+
+				if (fx_fill_input(
+					    f, in_buf, &in_pos, &in_fill) == 0) {
+					eof = 1;
+					break;
+				}
+
+				available = in_fill - in_pos;
+				consumed = available;
+				state = fx_flac_process(
+					flac, in_buf + in_pos, &consumed,
+					out_buf, &out_len);
+				in_pos += consumed;
+				if (in_pos == in_fill)
+					in_pos = in_fill = 0;
+
+				if (state == FLAC_ERR) {
+					eof = 1;
+					break;
+				}
+
+				if (out_len > 0) {
+					size_t used = acc_fill - acc_pos;
+					if (pcm_capacity - acc_fill <
+					    (size_t)out_len) {
+						if (acc_pos > 0) {
+							memmove(
+								pcm_acc,
+								pcm_acc + acc_pos,
+								used *
+								sizeof(int32_t));
+							acc_pos = 0;
+							acc_fill = used;
+						}
+					}
+					if (pcm_capacity - acc_fill <
+					    (size_t)out_len) {
+						fprintf(stderr,
+						        "FLAC: PCM accumulator "
+						        "overflow\n");
+						eof = 1;
+						break;
+					}
+					memcpy(pcm_acc + acc_fill, out_buf,
+					       (size_t)out_len *
+					       sizeof(int32_t));
+					acc_fill += out_len;
+				}
+
+				if (consumed == 0 && out_len == 0) {
+					if (feof(f)) eof = 1;
+					break;
+				}
+			}
+
+			available_samples = acc_fill - acc_pos;
+			if (available_samples < channels) {
+				if (eof) break;
+				continue;
+			}
+
+			{
+				size_t frames_now =
+					available_samples / channels;
+				size_t samples_now;
+				int k;
+
+				if (frames_now > FRAMES)
+					frames_now = FRAMES;
+				samples_now = frames_now * channels;
+
+				for (size_t i = 0; i < samples_now; ++i)
+					pcm_f32[i] =
+						(float)pcm_acc[acc_pos + i] *
+						(1.0f / 2147483648.0f);
+
+				acc_pos += samples_now;
+				if (acc_pos == acc_fill)
+					acc_pos = acc_fill = 0;
+
+				if (flag & USE_CROSSTALK)
+					apply_crosstalk_cancellation(
+						&xtc, pcm_f32,
+						(int)frames_now,
+						(int)channels,
+						SND_PCM_FORMAT_FLOAT_LE);
+
+				outr_feed_float(
+					&router, pcm_f32, frames_now);
+
+				k = key(outr_audio(&router), &ts);
+				if (k == 'c') {
+					flag ^= USE_CROSSTALK;
+					g_flag_diff ^= USE_CROSSTALK;
+				} else if (k == 's') {
+					outr_toggle_super_res(&router);
+					flag ^= USE_SUPER_RES;
+					g_flag_diff ^= USE_SUPER_RES;
+					ts.note = router.use_super_res
+						? "Super resolution on"
+						: "Super resolution off";
+					tui_render(&ts);
+				} else if (k == 'e') {
+					outr_toggle(&router);
+					flag ^= USE_DSD_ENCODE;
+					g_flag_diff ^= USE_DSD_ENCODE;
+					ts.codec = router.use_dsd
+						? (router.dsd.monitor_mode
+						   ? "FLAC->DSD(mon)"
+						   : "FLAC->DSD(DoP)")
+						: "FLAC";
+					ts.rate = outr_output_rate(&router);
+					ts.note = outr_status_note(&router);
+					tui_render(&ts);
+				} else if (k == KEY_LEFT ||
+				           k == KEY_RIGHT) {
+					int64_t delta =
+						(int64_t)SEEK_SECONDS *
+						sample_rate *
+						(k == KEY_RIGHT ? 1 : -1);
+					int64_t target =
+						(int64_t)frame_pos + delta;
+					if (target < 0) target = 0;
+					if (n_samples > 0 &&
+					    target > n_samples)
+						target = n_samples;
+
+					if (fx_seek_to_frame(
+						    f, flac,
+						    (uint64_t)target,
+						    channels, in_buf,
+						    &in_pos, &in_fill,
+						    out_buf, pcm_acc,
+						    pcm_capacity,
+						    &acc_pos, &acc_fill)) {
+						frame_pos =
+							(uint64_t)target;
+						eof = 0;
+						ts.cur =
+							(double)frame_pos /
+							sample_rate;
+						ts.note =
+							k == KEY_RIGHT
+							? ">> +10s"
+							: "<< -10s";
+						tui_render(&ts);
+					}
+				} else if (k) {
+					break;
+				}
+
+				frame_pos += frames_now;
 				ts.cur = (double)frame_pos / sample_rate;
-				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
-				tui_render(&ts);
+				ts.xtc_on =
+					(flag & USE_CROSSTALK) != 0;
+				ts.xtc_atten = xtc_attenuation;
+				aplay_render_throttled(
+					&ts, &last_render_ns);
 			}
-		} else if (k) {
-			break;
 		}
 	}
-	tui_close();
 
-	outr_close(&router);
-	free_crosstalk_cancellation(&xtc);
+done:
+	if (tui_is_open) tui_close();
 	free(pcm_acc);
 	free(pcm_f32);
-	}
-done:
+	if (router_inited) outr_close(&router);
+	if (xtc_inited) free_crosstalk_cancellation(&xtc);
 	free(out_buf);
 	free(flac);
-	fclose(f);
+	if (f) fclose(f);
 }
 
 #else  /* !USE_FOXEN_FLAC — use dr_flac */
@@ -1350,7 +1931,14 @@ void play_flac(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, flac->sampleRate, flac->channels);
 
-	float *pcm_buf = (float*)malloc(FRAMES * flac->channels * sizeof(float));
+	float *pcm_buf = (float *)malloc(
+		(size_t)FRAMES * flac->channels * sizeof(float));
+	if (!pcm_buf) {
+		outr_close(&router);
+		drflac_close(flac);
+		free_crosstalk_cancellation(&xtc);
+		return;
+	}
 
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
@@ -1371,6 +1959,7 @@ void play_flac(char *name, int format, int flag)
 	ts.format_filter = fmt_filter;
 
 	uint64_t c = 0;
+	uint64_t last_render_ns = 0;
 	tui_open();
 	if (outr_wait_open(&router, &ts) < 0) {
 		free(pcm_buf);
@@ -1424,7 +2013,7 @@ void play_flac(char *name, int format, int flag)
 		ts.cur = (double)c / flac->sampleRate;
 		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
 		ts.xtc_atten = xtc_attenuation;
-		tui_render(&ts);
+		aplay_render_throttled(&ts, &last_render_ns);
 	}
 	tui_close();
 
@@ -1477,6 +2066,7 @@ void play_dsf(char *name, int format, int flag)
 	ts.format_filter = fmt_filter;
 
 	uint64_t frames_played = 0;
+	uint64_t last_render_ns = 0;
 	tui_open();
 	if (audio_wait_init(&a, dev, decoder->sample_rate_pcm, decoder->channels, FRAMES, 1, format, &ts) < 0) {
 		free_crosstalk_cancellation(&xtc);
@@ -1510,7 +2100,7 @@ void play_dsf(char *name, int format, int flag)
 		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
 		ts.xtc_atten = xtc_attenuation;
 		ts.note = (n != a.frames) ? "! short read (end of file)" : NULL;
-		tui_render(&ts);
+		aplay_render_throttled(&ts, &last_render_ns);
 	}
 	tui_close();
 
@@ -1539,8 +2129,16 @@ int play_mp3(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, mp3.sampleRate, mp3.channels);
 
-	float *pcm_buf = (float*)malloc(FRAMES * mp3.channels * sizeof(float));
-	drmp3_uint64 totalPCMFrameCount = drmp3_get_pcm_frame_count(&mp3);
+	float *pcm_buf = (float *)malloc(
+		(size_t)FRAMES * mp3.channels * sizeof(float));
+	drmp3_uint64 totalPCMFrameCount;
+	if (!pcm_buf) {
+		outr_close(&router);
+		drmp3_uninit(&mp3);
+		free_crosstalk_cancellation(&xtc);
+		return 1;
+	}
+	totalPCMFrameCount = drmp3_get_pcm_frame_count(&mp3);
 
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
@@ -1561,6 +2159,7 @@ int play_mp3(char *name, int format, int flag)
 	ts.format_filter = fmt_filter;
 
 	uint64_t c = 0;
+	uint64_t last_render_ns = 0;
 	tui_open();
 	if (outr_wait_open(&router, &ts) < 0) {
 		free(pcm_buf);
@@ -1614,7 +2213,7 @@ int play_mp3(char *name, int format, int flag)
 		ts.cur = (double)c / mp3.sampleRate;
 		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
 		ts.xtc_atten = xtc_attenuation;
-		tui_render(&ts);
+		aplay_render_throttled(&ts, &last_render_ns);
 	}
 	tui_close();
 
@@ -1630,8 +2229,14 @@ int play_mp3(char *name, int format, int flag)
 	short sample_buf[MP3_MAX_SAMPLES_PER_FRAME];
 	int len;
 	void *file_data = preload(name, &len);
-	unsigned char *stream_pos = (unsigned char *)file_data;
-	int bytes_left = len - 100;
+	unsigned char *stream_pos;
+	int bytes_left;
+	if (!file_data || file_data == MAP_FAILED || len <= 100) {
+		fprintf(stderr, "Error: cannot preload MP3 file\n");
+		return 1;
+	}
+	stream_pos = (unsigned char *)file_data;
+	bytes_left = len - 100;
 
 	mp3_info_t info;
 	mp3_decoder_t mp3 = mp3_create();
@@ -1667,9 +2272,16 @@ int play_mp3(char *name, int format, int flag)
 	}
 
 	int c = 0;
+	uint64_t last_progress_ns = 0;
 	printf("\e[?25l");
-	while ((bytes_left >= 0) && (frame_size > 0) && !key(outr_audio(&router), NULL)) {
-		printf("\r%d", c);
+	while ((bytes_left >= 0) && (frame_size > 0) &&
+	       !key(outr_audio(&router), NULL)) {
+		uint64_t now = aplay_monotonic_ns();
+		if (last_progress_ns == 0 || now == 0 ||
+		    now - last_progress_ns >= UI_REFRESH_INTERVAL_NS) {
+			printf("\r%d", c);
+			last_progress_ns = now;
+		}
 
 		int n_frames = info.audio_bytes / 2 / info.channels;
 
@@ -1684,7 +2296,7 @@ int play_mp3(char *name, int format, int flag)
 		c += frame_size;
 		frame_size = mp3_decode(mp3, stream_pos, bytes_left, sample_buf, NULL);
 	}
-	printf("\e[?25h");
+	printf("\e[?25h\n");
 
 	outr_close(&router);
 	mp3_free(mp3);
@@ -1696,26 +2308,45 @@ int play_mp3(char *name, int format, int flag)
 }
 #endif
 
+#define OGG_DECODE_FRAMES 4096
+
 void play_ogg(char *name, int flag)
 {
-	int n, error;
-	short outputs[FRAMES*2*100];
-
+	int n;
+	int error;
+	short *outputs = NULL;
 	stb_vorbis *v = stb_vorbis_open_filename(name, &error, NULL);
+
 	if (!v) {
 		printf("Error: cannot open `%s`\n", name);
+		return;
+	}
+	if (v->channels <= 0) {
+		fprintf(stderr, "OGG: invalid channel count\n");
+		stb_vorbis_close(v);
+		return;
+	}
+
+	outputs = (short *)malloc(
+		(size_t)OGG_DECODE_FRAMES *
+		(size_t)v->channels * sizeof(short));
+	if (!outputs) {
+		stb_vorbis_close(v);
 		return;
 	}
 
 	OutRouter router;
 	if (outr_init(&router, dev, v->sample_rate, v->channels, 0,
-	              (flag & USE_DSD_ENCODE) ? 1 : 0, (flag & USE_SUPER_RES) ? 1 : 0)) {
+	              (flag & USE_DSD_ENCODE) != 0,
+	              (flag & USE_SUPER_RES) != 0)) {
+		free(outputs);
 		stb_vorbis_close(v);
 		return;
 	}
 
 	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, v->sample_rate, v->channels);
+	init_crosstalk_cancellation(
+		&xtc, v->sample_rate, v->channels);
 
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
@@ -1724,7 +2355,7 @@ void play_ogg(char *name, int flag)
 	char dirbuf[PATH_MAX];
 	get_dirpart(name, dirbuf, sizeof(dirbuf));
 	ts.dir = dirbuf;
-	ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "OGG->DSD(mon)" : "OGG->DSD(DoP)") : "OGG";
+	ts.codec = router.use_dsd ? "OGG->DSD(DoP)" : "OGG";
 	ts.rate = outr_output_rate(&router);
 	ts.channels = v->channels;
 	ts.device = dev;
@@ -1735,61 +2366,86 @@ void play_ogg(char *name, int flag)
 	ts.format_filter = fmt_filter;
 
 	uint64_t c = 0;
+	uint64_t last_render_ns = 0;
 	tui_open();
 	if (outr_wait_open(&router, &ts) < 0) {
 		outr_close(&router);
 		stb_vorbis_close(v);
 		free_crosstalk_cancellation(&xtc);
+		free(outputs);
 		tui_close();
 		return;
 	}
-	while ((n = stb_vorbis_get_frame_short_interleaved(v, v->channels, outputs, FRAMES*100))) {
+	ts.codec = router.use_dsd
+		? (router.dsd.monitor_mode
+		   ? "OGG->DSD(mon)" : "OGG->DSD(DoP)")
+		: "OGG";
+
+	while ((n = stb_vorbis_get_frame_short_interleaved(
+		        v, v->channels, outputs,
+		        OGG_DECODE_FRAMES * v->channels)) > 0) {
+		int k;
+
 		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, outputs, n, v->channels, 0);
+			apply_crosstalk_cancellation(
+				&xtc, outputs, n, v->channels, 0);
 		}
 
 		outr_feed_s16(&router, outputs, (size_t)n);
 
-		int k = key(outr_audio(&router), &ts);
+		k = key(outr_audio(&router), &ts);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
 			g_flag_diff ^= USE_CROSSTALK;
 		} else if (k == 's') {
 			outr_toggle_super_res(&router);
-			flag ^= USE_SUPER_RES; g_flag_diff ^= USE_SUPER_RES;
-			ts.note = router.use_super_res ? "Super resolution on" : "Super resolution off";
+			flag ^= USE_SUPER_RES;
+			g_flag_diff ^= USE_SUPER_RES;
+			ts.note = router.use_super_res
+				? "Super resolution on"
+				: "Super resolution off";
 			tui_render(&ts);
 		} else if (k == 'e') {
 			outr_toggle(&router);
-			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE;
-			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "OGG->DSD(mon)" : "OGG->DSD(DoP)") : "OGG";
+			flag ^= USE_DSD_ENCODE;
+			g_flag_diff ^= USE_DSD_ENCODE;
+			ts.codec = router.use_dsd
+				? (router.dsd.monitor_mode
+				   ? "OGG->DSD(mon)"
+				   : "OGG->DSD(DoP)")
+				: "OGG";
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
 			tui_render(&ts);
 		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
-			int64_t delta = (int64_t)SEEK_SECONDS * v->sample_rate * (k == KEY_RIGHT ? 1 : -1);
+			int64_t delta =
+				(int64_t)SEEK_SECONDS * v->sample_rate *
+				(k == KEY_RIGHT ? 1 : -1);
 			int64_t target = (int64_t)c + delta;
 			if (target < 0) target = 0;
 			if (stb_vorbis_seek(v, (unsigned int)target)) {
 				c = (uint64_t)target;
 				ts.cur = (double)c / v->sample_rate;
-				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+				ts.note = k == KEY_RIGHT
+					? ">> +10s" : "<< -10s";
 				tui_render(&ts);
 			}
 		} else if (k) {
 			break;
 		}
-		c += n;
+
+		c += (uint64_t)n;
 		ts.cur = (double)c / v->sample_rate;
-		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
+		ts.xtc_on = (flag & USE_CROSSTALK) != 0;
 		ts.xtc_atten = xtc_attenuation;
-		tui_render(&ts);
+		aplay_render_throttled(&ts, &last_render_ns);
 	}
 	tui_close();
 
 	outr_close(&router);
 	stb_vorbis_close(v);
 	free_crosstalk_cancellation(&xtc);
+	free(outputs);
 }
 
 #define MAX_WMA_FRAME_LEN 4096
@@ -1881,6 +2537,7 @@ int play_wma(char *name, int flag)
 	ts.loop_mode = loop_mode;
 	ts.format_filter = fmt_filter;
 
+	uint64_t last_render_ns = 0;
 	tui_open();
 	if (outr_wait_open(&router, &ts) < 0) {
 		outr_close(&router);
@@ -1904,8 +2561,13 @@ int play_wma(char *name, int flag)
 			break;
 		}
 
+		if (cc.channels <= 0) {
+			fprintf(stderr, "Error: invalid channel count %d\n",
+			        cc.channels);
+			break;
+		}
 		int frames = out_size / (sizeof(short) * cc.channels);
-		if (frames <= 0 || frames > MAX_WMA_FRAME_LEN || cc.channels == 0) {
+		if (frames <= 0 || frames > MAX_WMA_FRAME_LEN) {
 			fprintf(stderr, "Error: invalid frame count %d, channels=%d\n", frames, cc.channels);
 			break;
 		}
@@ -1946,7 +2608,7 @@ int play_wma(char *name, int flag)
 		ts.cur_raw = (uint64_t)(len - bytes_left);
 		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
 		ts.xtc_atten = xtc_attenuation;
-		tui_render(&ts);
+		aplay_render_throttled(&ts, &last_render_ns);
 	}
 	tui_close();
 
@@ -1990,6 +2652,12 @@ int play_aac(char *name, int flag)
     info.profile = profile;
 
     HAACDecoder aac = AACInitDecoder();
+    if (!aac) {
+        fprintf(stderr, "Error: failed to initialize AAC decoder\n");
+        free(file_data);
+        close(fd);
+        return 1;
+    }
     AACSetRawBlockParams(aac, 0, &info);
 
     int output_samplerate = samplerate;
@@ -2034,6 +2702,7 @@ int play_aac(char *name, int flag)
     ts.loop_mode = loop_mode;
     ts.format_filter = fmt_filter;
 
+    uint64_t last_render_ns = 0;
     tui_open();
     if (outr_wait_open(&router, &ts) < 0) {
         outr_close(&router);
@@ -2094,7 +2763,7 @@ int play_aac(char *name, int flag)
         ts.cur_raw = (uint64_t)(stream_pos - file_data);
         ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
         ts.xtc_atten = xtc_attenuation;
-        tui_render(&ts);
+        aplay_render_throttled(&ts, &last_render_ns);
     }
     tui_close();
 
@@ -2118,7 +2787,18 @@ void play_dir(char *name, char *type, char *regexp, int flag)
 {
 	char path[1024];
 	char resume_after[PATH_MAX];
+	Reprog *compiled_regexp = NULL;
 	int num, back = 0;
+
+	if (regexp) {
+		const char *error;
+		compiled_regexp = regcomp(regexp, REG_ICASE, &error);
+		if (!compiled_regexp) {
+			fprintf(stderr, "regcomp: %s\n", error);
+			return;
+		}
+	}
+
 	resume_after[0] = '\0';
 	path[0] = '\0';
 
@@ -2157,18 +2837,15 @@ reload_check:
 			char *e = findExt(ls[i].d_name);
 			if (type && !strstr(e, type)) continue;
 			if (fmt_filter && !strstr(e, fmt_filter)) continue;
-			if (regexp) {
-				const char *error;
-				Reprog *p = regcomp(regexp, REG_ICASE, &error);
-				if (!p) { fprintf(stderr, "regcomp: %s\n", error); free(ls); return; }
+			if (compiled_regexp) {
 				Resub m;
-				if (regexec(p, ls[i].d_name, &m, 0)) continue;
+				if (regexec(compiled_regexp,
+				            ls[i].d_name, &m, 0)) continue;
 			}
 
 			track_index = i + 1;
 			track_total = num;
-			snprintf(path, 1024, "%s", ls[i].d_name);
-			if (access(ls[i].d_name, F_OK) < 0) continue;
+			snprintf(path, sizeof(path), "%s", ls[i].d_name);
 
 			struct stat file_stat;
 			if (stat(ls[i].d_name, &file_stat) < 0) { perror("stat"); continue; }
@@ -2229,6 +2906,8 @@ reload_check:
 			continue;
 		}
 	} while (loop_mode);
+
+	free(compiled_regexp);
 }
 
 #include <sched.h>
@@ -2243,11 +2922,20 @@ void set_realtime_priority(void)
 void set_cpu(char *c)
 {
 	char buff[256];
-	for (int i = 0; i < 256; i++) {
-		snprintf(buff, 255, "/sys/devices/system/cpu/cpu%d/cpufreq/scaling_governor", i);
-		FILE *fp = fopen(buff, "w");
+	long cpu_count;
+
+	if (!c || !c[0]) return;
+	cpu_count = sysconf(_SC_NPROCESSORS_CONF);
+	if (cpu_count < 1) cpu_count = 1;
+
+	for (long i = 0; i < cpu_count; ++i) {
+		FILE *fp;
+		snprintf(buff, sizeof(buff),
+		         "/sys/devices/system/cpu/cpu%ld/cpufreq/"
+		         "scaling_governor", i);
+		fp = fopen(buff, "w");
 		if (!fp) continue;
-		fprintf(fp, "%s", c);
+		(void)fprintf(fp, "%s", c);
 		fclose(fp);
 	}
 }

@@ -43,9 +43,14 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	thiz->format = format;
 
 	// Open PCM device.
+	thiz->handle = NULL;
 	int rc = snd_pcm_open(&thiz->handle, dev, flag ? SND_PCM_STREAM_PLAYBACK : SND_PCM_STREAM_CAPTURE, 0);
 	if (rc < 0) {
-		fprintf(stderr, "unable to open pcm device '%s' (%s)\n", dev, snd_strerror(rc));
+		thiz->handle = NULL;
+		/* EBUSY is expected when another player holds the card — callers
+		 * may wait and retry. Keep the log quiet for that case. */
+		if (rc != -EBUSY)
+			fprintf(stderr, "unable to open pcm device '%s' (%s)\n", dev, snd_strerror(rc));
 		return 1;
 	}
 
@@ -61,8 +66,8 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_access(thiz->handle, params, SND_PCM_ACCESS_RW_INTERLEAVED);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set access type (%s)\n", snd_strerror(rc));
-		snd_pcm_drain(thiz->handle);
 		snd_pcm_close(thiz->handle);
+		thiz->handle = NULL;
 		return 1;
 	}
 
@@ -70,8 +75,8 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_format(thiz->handle, params, format ? format : SND_PCM_FORMAT_S16_LE);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set sample format (%s)\n", snd_strerror(rc));
-		snd_pcm_drain(thiz->handle);
 		snd_pcm_close(thiz->handle);
+		thiz->handle = NULL;
 		return 1;
 	}
 
@@ -79,8 +84,8 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_channels(thiz->handle, params, ch);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set channel count (%s)\n", snd_strerror(rc));
-		snd_pcm_drain(thiz->handle);
 		snd_pcm_close(thiz->handle);
+		thiz->handle = NULL;
 		return 1;
 	}
 
@@ -89,8 +94,8 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params_set_rate_near(thiz->handle, params, &freq, &dir);
 	if (rc < 0) {
 		fprintf(stderr, "cannot set sample rate (%s)\n", snd_strerror(rc));
-		snd_pcm_drain(thiz->handle);
 		snd_pcm_close(thiz->handle);
+		thiz->handle = NULL;
 		return 1;
 	}
 	// Persist the rate ALSA actually selected (may differ from the request
@@ -106,8 +111,8 @@ int AUDIO_init(AUDIO *thiz, char *dev, unsigned int freq, int ch, int frames, in
 	rc = snd_pcm_hw_params(thiz->handle, params);
 	if (rc < 0) {
 		fprintf(stderr, "unable to set parameters (%s)\n", snd_strerror(rc));
-		snd_pcm_drain(thiz->handle);
 		snd_pcm_close(thiz->handle);
+		thiz->handle = NULL;
 		return 1;
 	}
 
@@ -137,6 +142,7 @@ int AUDIO_frame(AUDIO *thiz)
 
 int AUDIO_play(AUDIO *thiz, char *data, int frames)
 {
+	if (!thiz || !thiz->handle) return -1;
 	int rc = snd_pcm_writei(thiz->handle, data, frames);
 	if (rc == -EPIPE) {
 		// EPIPE means overrun
@@ -158,14 +164,19 @@ int AUDIO_play0(AUDIO *thiz)
 
 void AUDIO_wait(AUDIO *thiz, int msec)
 {
+	if (!thiz || !thiz->handle) return;
 	snd_pcm_wait(thiz->handle, msec);
 }
 
 void AUDIO_close(AUDIO *thiz)
 {
-	snd_pcm_drain(thiz->handle);
-	snd_pcm_close(thiz->handle);
+	if (thiz->handle) {
+		snd_pcm_drain(thiz->handle);
+		snd_pcm_close(thiz->handle);
+		thiz->handle = NULL;
+	}
 	free(thiz->buffer);
+	thiz->buffer = NULL;
 }
 
 // Fully lets go of the sound card: drains and snd_pcm_close()'s the handle,

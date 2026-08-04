@@ -45,6 +45,34 @@ ALSA（Advanced Linux Sound Architecture）を利用し、BitPerfectな再生を
    make
    ```
 
+### GUI版のビルド
+
+GUI版には ALSA、GLFW、OpenGL が必要です。圧縮された Winamp
+スキン (`.wsz`) の展開には、実行時に `unzip` コマンドを使います。
+
+```bash
+make ui
+```
+
+### Winamp Classic スキン
+
+Winamp Classic の `.wsz` ファイルまたは展開済みスキンディレクトリを
+指定できます。スキンには `MAIN.BMP` と `CBUTTONS.BMP` が必要です
+(大文字・小文字は区別しません)。従来のカード型 UI は削除しました。
+`--skin` を省略した場合やカスタムスキンの読み込みに失敗した場合は、
+内蔵の **aplay+ Graphite** Winamp風スキンを使います。
+
+Graphite のアートワークは `aplay+ui.c` がコードから生成するオリジナルで、
+Winamp の画像を含みません。本プロジェクトの MIT ライセンスで安全に再配布できます。
+
+```bash
+./aplay+ui --skin ~/Skins/MySkin.wsz /Music
+./aplay+ui -S ~/Skins/MySkin/ /Music
+```
+
+Winamp のメインウィンドウと再生ボタン類はスキンの画像を使って表示します。
+XTC、DSD、リピート、フォーマット切替は下部の aplay+ ラックに残しています。
+
 4. **Google Colabでビルド**
    手軽にビルドしたい場合は、以下のリンクをクリック！
    👉 [Build with Colab](リンクを挿入)
@@ -61,6 +89,7 @@ ALSA（Advanced Linux Sound Architecture）を利用し、BitPerfectな再生を
 ### 📋 オプション一覧
 
 - `-h` : ヘルプメッセージを表示 📖
+- `-S <パス>` / `--skin <パス>` : Winamp Classicの `.wsz` または展開済みスキンを使用
 - `-d <デバイス名>` : ALSAデバイスを指定（例: `default`, `hw:0,0`, `plughw:0,0`） 🎚️
 - `-f` : 32ビット浮動小数点再生を有効化 🔢
 - `-r` : ディレクトリを再帰的に検索 🔍

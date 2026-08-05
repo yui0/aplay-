@@ -68,6 +68,8 @@
 #define XTC_ATTEN_STEP          0.05f
 #define KEY_POLL_INTERVAL_US  4000  // gate kbhit() to ≤250 calls/sec
 
+#define APLAY_EQ_BANDS           10  /* ISO-style octave-band equalizer */
+
 // ---- Synthetic key codes (above ASCII range, never clash with real bytes) ----
 #define KEY_UP    1001
 #define KEY_DOWN  1002
@@ -97,6 +99,18 @@ extern char   g_dev_storage[128];
 extern volatile int g_device_select_idx;
 
 #define APLAY_MAX_DEVICES 64
+
+/* Low-overhead 10-band equalizer. Gains are dB; setters clamp to ±12 dB.
+ * Disabled is the default. Disabled or completely flat settings are a true
+ * audio-path bypass: no sample copy, conversion, allocation, or biquad work. */
+void  aplay_equalizer_set_enabled(int enabled);
+int   aplay_equalizer_enabled(void);
+void  aplay_equalizer_set_preamp(float db);
+float aplay_equalizer_preamp(void);
+void  aplay_equalizer_set_band(int band, float db);
+float aplay_equalizer_band(int band);
+float aplay_equalizer_frequency(int band);
+void  aplay_equalizer_reset(void);
 
 // ---- key(): implemented per .c file (TUI-only or GUI-aware) ----
 int key(AUDIO *a, tui_state_t *ts);
@@ -208,6 +222,100 @@ char *fmt_filter = NULL;
 char g_dev_storage[128] = "hw:0,0";  // Placeholder; -d or aplay_auto_select_device() sets real target
 char *dev = g_dev_storage;
 volatile int g_device_select_idx = -1;
+
+/*
+ * UI-facing EQ controls use integer tenths of a decibel. Integer atomics avoid
+ * locks and avoid racing floating-point objects between the GUI and playback
+ * threads. The audio thread only rebuilds coefficients when the revision
+ * changes; the normal block path is two relaxed/acquire integer loads.
+ */
+static int g_eq_enabled = 0;
+static int g_eq_preamp_tenths = 0;
+static int g_eq_band_tenths[APLAY_EQ_BANDS] = {0};
+static unsigned int g_eq_revision = 1;
+static const float g_eq_frequencies[APLAY_EQ_BANDS] = {
+	31.25f, 62.5f, 125.0f, 250.0f, 500.0f,
+	1000.0f, 2000.0f, 4000.0f, 8000.0f, 16000.0f
+};
+
+static int aplay_eq_db_to_tenths(float db)
+{
+	int v;
+	if (db > 12.0f) db = 12.0f;
+	if (db < -12.0f) db = -12.0f;
+	v = (int)lroundf(db * 10.0f);
+	if (v > 120) v = 120;
+	if (v < -120) v = -120;
+	return v;
+}
+
+static void aplay_eq_touch(void)
+{
+	(void)__atomic_add_fetch(&g_eq_revision, 1u, __ATOMIC_RELEASE);
+}
+
+void aplay_equalizer_set_enabled(int enabled)
+{
+	int v = enabled ? 1 : 0;
+	if (__atomic_exchange_n(&g_eq_enabled, v, __ATOMIC_RELAXED) != v)
+		aplay_eq_touch();
+}
+
+int aplay_equalizer_enabled(void)
+{
+	return __atomic_load_n(&g_eq_enabled, __ATOMIC_RELAXED);
+}
+
+void aplay_equalizer_set_preamp(float db)
+{
+	int v = aplay_eq_db_to_tenths(db);
+	if (__atomic_exchange_n(&g_eq_preamp_tenths, v,
+	                        __ATOMIC_RELAXED) != v)
+		aplay_eq_touch();
+}
+
+float aplay_equalizer_preamp(void)
+{
+	return __atomic_load_n(&g_eq_preamp_tenths,
+	                       __ATOMIC_RELAXED) * 0.1f;
+}
+
+void aplay_equalizer_set_band(int band, float db)
+{
+	int v;
+	if (band < 0 || band >= APLAY_EQ_BANDS) return;
+	v = aplay_eq_db_to_tenths(db);
+	if (__atomic_exchange_n(&g_eq_band_tenths[band], v,
+	                        __ATOMIC_RELAXED) != v)
+		aplay_eq_touch();
+}
+
+float aplay_equalizer_band(int band)
+{
+	if (band < 0 || band >= APLAY_EQ_BANDS) return 0.0f;
+	return __atomic_load_n(&g_eq_band_tenths[band],
+	                       __ATOMIC_RELAXED) * 0.1f;
+}
+
+float aplay_equalizer_frequency(int band)
+{
+	if (band < 0 || band >= APLAY_EQ_BANDS) return 0.0f;
+	return g_eq_frequencies[band];
+}
+
+void aplay_equalizer_reset(void)
+{
+	int changed = 0;
+	if (__atomic_exchange_n(&g_eq_preamp_tenths, 0,
+	                        __ATOMIC_RELAXED) != 0)
+		changed = 1;
+	for (int i = 0; i < APLAY_EQ_BANDS; ++i) {
+		if (__atomic_exchange_n(&g_eq_band_tenths[i], 0,
+		                        __ATOMIC_RELAXED) != 0)
+			changed = 1;
+	}
+	if (changed) aplay_eq_touch();
+}
 
 typedef struct {
 	char name[64];       /* e.g. "hw:7,0" */
@@ -672,6 +780,22 @@ typedef struct {
 	float *sr_scratch;
 	float *sr_prev;
 	int sr_have_prev;
+
+	/* Allocated only when the enabled EQ has a non-flat setting. */
+	float *eq_scratch;
+	float *eq_z1;
+	float *eq_z2;
+	float eq_b0[APLAY_EQ_BANDS];
+	float eq_b1[APLAY_EQ_BANDS];
+	float eq_b2[APLAY_EQ_BANDS];
+	float eq_a1[APLAY_EQ_BANDS];
+	float eq_a2[APLAY_EQ_BANDS];
+	float eq_preamp_gain;
+	unsigned int eq_revision;
+	unsigned int eq_active_mask;
+	unsigned char eq_active_idx[APLAY_EQ_BANDS];
+	int eq_active_count;
+	int eq_processing;
 } OutRouter;
 
 static int outr_ensure_i16_scratch(OutRouter *r)
@@ -711,6 +835,168 @@ static int outr_ensure_super_res(OutRouter *r)
 		return -1;
 	}
 	return 0;
+}
+
+
+static float aplay_clampf(float v);
+
+static int outr_ensure_equalizer(OutRouter *r)
+{
+	size_t samples, states;
+	if (!r) return -1;
+	samples = (size_t)AUDIO_SCRATCH_FRAMES * (size_t)r->channels;
+	states = (size_t)APLAY_EQ_BANDS * (size_t)r->channels;
+	if (!r->eq_scratch)
+		r->eq_scratch = (float *)malloc(samples * sizeof(float));
+	if (!r->eq_z1)
+		r->eq_z1 = (float *)calloc(states, sizeof(float));
+	if (!r->eq_z2)
+		r->eq_z2 = (float *)calloc(states, sizeof(float));
+	if (!r->eq_scratch || !r->eq_z1 || !r->eq_z2) {
+		free(r->eq_scratch);
+		free(r->eq_z1);
+		free(r->eq_z2);
+		r->eq_scratch = NULL;
+		r->eq_z1 = NULL;
+		r->eq_z2 = NULL;
+		return -1;
+	}
+	return 0;
+}
+
+/* Refresh only after a GUI-side setting change. Returns whether DSP is needed. */
+static int outr_refresh_equalizer(OutRouter *r)
+{
+	const float q = 1.41421356237f;
+	unsigned int revision;
+	unsigned int old_mask;
+	int old_processing;
+	int enabled;
+	int preamp_tenths;
+	int active_count = 0;
+	unsigned int mask = 0;
+
+	if (!r) return 0;
+	revision = __atomic_load_n(&g_eq_revision, __ATOMIC_ACQUIRE);
+	if (revision == r->eq_revision) return r->eq_processing;
+
+	old_mask = r->eq_active_mask;
+	old_processing = r->eq_processing;
+	enabled = __atomic_load_n(&g_eq_enabled, __ATOMIC_RELAXED);
+	preamp_tenths = __atomic_load_n(&g_eq_preamp_tenths,
+	                                __ATOMIC_RELAXED);
+
+	r->eq_revision = revision;
+	r->eq_preamp_gain = preamp_tenths == 0
+		? 1.0f : powf(10.0f, preamp_tenths * (1.0f / 200.0f));
+
+	for (int band = 0; band < APLAY_EQ_BANDS; ++band) {
+		int gain_tenths = __atomic_load_n(&g_eq_band_tenths[band],
+		                                  __ATOMIC_RELAXED);
+		float frequency = g_eq_frequencies[band];
+		if (!enabled || gain_tenths == 0 ||
+		    frequency >= (float)r->sample_rate * 0.48f)
+			continue;
+
+		float gain_db = gain_tenths * 0.1f;
+		float a = powf(10.0f, gain_db * 0.025f);
+		float w0 = 6.2831853071795864769f * frequency /
+		           (float)r->sample_rate;
+		float cw = cosf(w0);
+		float alpha = sinf(w0) / (2.0f * q);
+		float a0 = 1.0f + alpha / a;
+		float inv_a0 = 1.0f / a0;
+
+		r->eq_b0[band] = (1.0f + alpha * a) * inv_a0;
+		r->eq_b1[band] = (-2.0f * cw) * inv_a0;
+		r->eq_b2[band] = (1.0f - alpha * a) * inv_a0;
+		r->eq_a1[band] = (-2.0f * cw) * inv_a0;
+		r->eq_a2[band] = (1.0f - alpha / a) * inv_a0;
+		r->eq_active_idx[active_count++] = (unsigned char)band;
+		mask |= 1u << band;
+	}
+
+	r->eq_active_count = active_count;
+	r->eq_active_mask = mask;
+	r->eq_processing = enabled &&
+		(preamp_tenths != 0 || active_count > 0);
+
+	if (!r->eq_processing) return 0;
+	if (outr_ensure_equalizer(r) != 0) {
+		fprintf(stderr,
+		        "Equalizer buffer allocation failed; DSP bypassed\n");
+		r->eq_processing = 0;
+		return 0;
+	}
+
+	/* Starting DSP or changing which filters exist must not reuse unrelated
+	 * delay state. Gain-only changes retain state and therefore remain smooth. */
+	if (!old_processing || old_mask != mask) {
+		size_t states = (size_t)APLAY_EQ_BANDS *
+		                (size_t)r->channels;
+		memset(r->eq_z1, 0, states * sizeof(float));
+		memset(r->eq_z2, 0, states * sizeof(float));
+	}
+	return 1;
+}
+
+static int outr_equalizer_active(OutRouter *r)
+{
+	unsigned int revision;
+	if (!r) return 0;
+	revision = __atomic_load_n(&g_eq_revision, __ATOMIC_ACQUIRE);
+	if (revision != r->eq_revision)
+		return outr_refresh_equalizer(r);
+	return r->eq_processing;
+}
+
+static const float *outr_apply_equalizer(OutRouter *r,
+                                         const float *src,
+                                         size_t frames)
+{
+	size_t samples;
+	if (!r || !src || frames == 0) return src;
+	if (!outr_equalizer_active(r)) return src;
+	if (!r->eq_scratch || !r->eq_z1 || !r->eq_z2) return src;
+
+	samples = frames * (size_t)r->channels;
+	if (r->eq_active_count == 0) {
+		for (size_t i = 0; i < samples; ++i)
+			r->eq_scratch[i] =
+				aplay_clampf(src[i] * r->eq_preamp_gain);
+		return r->eq_scratch;
+	}
+
+	for (size_t frame = 0; frame < frames; ++frame) {
+		for (int ch = 0; ch < r->channels; ++ch) {
+			size_t p = frame * (size_t)r->channels + (size_t)ch;
+			float x = src[p] * r->eq_preamp_gain;
+			for (int ai = 0; ai < r->eq_active_count; ++ai) {
+				int band = r->eq_active_idx[ai];
+				size_t s = (size_t)band *
+				           (size_t)r->channels + (size_t)ch;
+				float y = r->eq_b0[band] * x + r->eq_z1[s];
+				r->eq_z1[s] = r->eq_b1[band] * x -
+				              r->eq_a1[band] * y + r->eq_z2[s];
+				r->eq_z2[s] = r->eq_b2[band] * x -
+				              r->eq_a2[band] * y;
+				x = y;
+			}
+			r->eq_scratch[p] = aplay_clampf(x);
+		}
+	}
+
+	/* Flush extremely small state once per block, not inside the hot loop. */
+	for (int ai = 0; ai < r->eq_active_count; ++ai) {
+		int band = r->eq_active_idx[ai];
+		for (int ch = 0; ch < r->channels; ++ch) {
+			size_t s = (size_t)band *
+			           (size_t)r->channels + (size_t)ch;
+			if (fabsf(r->eq_z1[s]) < 1.0e-20f) r->eq_z1[s] = 0.0f;
+			if (fabsf(r->eq_z2[s]) < 1.0e-20f) r->eq_z2[s] = 0.0f;
+		}
+	}
+	return r->eq_scratch;
 }
 
 static void outr_close_dsd(OutRouter *r, int flush)
@@ -959,6 +1245,9 @@ static void outr_close(OutRouter *r)
 	free(r->s16_f32);
 	free(r->sr_scratch);
 	free(r->sr_prev);
+	free(r->eq_scratch);
+	free(r->eq_z1);
+	free(r->eq_z2);
 	memset(r, 0, sizeof(*r));
 }
 
@@ -1015,6 +1304,9 @@ static void outr_feed_float(OutRouter *r,
 	}
 
 	if (outr_ensure_open(r) < 0) return;
+
+	/* Disabled or flat EQ returns the original pointer without copying. */
+	pcm = outr_apply_equalizer(r, pcm, frames);
 
 	if (r->use_super_res) {
 		if (outr_ensure_super_res(r) != 0) {
@@ -1087,11 +1379,13 @@ static void outr_feed_s16(OutRouter *r,
 
 	if (outr_ensure_open(r) < 0) return;
 
+	int eq_active = outr_equalizer_active(r);
+
 	/*
 	 * Fast path: decoded S16 goes directly to ALSA. This avoids the former
 	 * S16 -> float -> S16 round trip for OGG/WMA/AAC/minimp3.
 	 */
-	if (!r->use_dsd && !r->use_super_res &&
+	if (!eq_active && !r->use_dsd && !r->use_super_res &&
 	    r->format != SND_PCM_FORMAT_FLOAT_LE) {
 		AUDIO_play(&r->pcm, (char *)pcm, (int)frames);
 		AUDIO_wait(&r->pcm, 100);
@@ -1099,7 +1393,7 @@ static void outr_feed_s16(OutRouter *r,
 	}
 
 	/* DSD without float DSP converts only the encoder's 32-frame block. */
-	if (r->use_dsd && !r->use_super_res) {
+	if (!eq_active && r->use_dsd && !r->use_super_res) {
 		dsdaccum_feed_s16(&r->accum, &r->dsd,
 		                  pcm, frames);
 		return;
@@ -2040,11 +2334,35 @@ void play_dsf(char *name, int format, int flag)
 		return;
 	}
 
-	AUDIO a;
-	/* Defer ALSA open until after TUI is up so a busy device waits instead of
-	 * failing the track. */
+	OutRouter router;
+	if (outr_init(&router, dev, decoder->sample_rate_pcm,
+	              decoder->channels, format,
+	              (flag & USE_DSD_ENCODE) ? 1 : 0,
+	              (flag & USE_SUPER_RES) ? 1 : 0)) {
+		dsd_decoder_free(decoder);
+		fclose(f);
+		return;
+	}
+
+	size_t sample_bytes = format == SND_PCM_FORMAT_FLOAT_LE
+		? sizeof(float) : sizeof(int16_t);
+	void *pcm_buf = malloc((size_t)FRAMES *
+	                       (size_t)decoder->channels * sample_bytes);
+	if (!pcm_buf) {
+		outr_close(&router);
+		dsd_decoder_free(decoder);
+		fclose(f);
+		return;
+	}
+
 	CrosstalkCancel xtc;
-	init_crosstalk_cancellation(&xtc, decoder->sample_rate_pcm, decoder->channels);
+	init_crosstalk_cancellation(&xtc, decoder->sample_rate_pcm,
+	                            decoder->channels);
+
+	const char *base_codec =
+		(decoder->file_type == DSD_FILE_DFF) ? "DFF" : "DSF";
+	char codecbuf[32];
+	snprintf(codecbuf, sizeof(codecbuf), "%s", base_codec);
 
 	tui_state_t ts = {0};
 	ts.track_index = track_index;
@@ -2053,14 +2371,15 @@ void play_dsf(char *name, int format, int flag)
 	char dirbuf[PATH_MAX];
 	get_dirpart(name, dirbuf, sizeof(dirbuf));
 	ts.dir = dirbuf;
-	ts.codec = (decoder->file_type == DSD_FILE_DFF) ? "DFF" : "DSF";
+	ts.codec = codecbuf;
 	ts.rate = decoder->sample_rate_pcm;
 	ts.bits = format == SND_PCM_FORMAT_FLOAT_LE ? 32 : 16;
 	ts.channels = decoder->channels;
 	ts.device = dev;
 	ts.use_time = 1;
 	ts.total = decoder->totalPCMFrameCount > 0 ?
-	           (double)decoder->totalPCMFrameCount / decoder->sample_rate_pcm : 0.0;
+	           (double)decoder->totalPCMFrameCount /
+	           decoder->sample_rate_pcm : 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
 	ts.format_filter = fmt_filter;
@@ -2068,46 +2387,87 @@ void play_dsf(char *name, int format, int flag)
 	uint64_t frames_played = 0;
 	uint64_t last_render_ns = 0;
 	tui_open();
-	if (audio_wait_init(&a, dev, decoder->sample_rate_pcm, decoder->channels, FRAMES, 1, format, &ts) < 0) {
+	if (outr_wait_open(&router, &ts) < 0) {
 		free_crosstalk_cancellation(&xtc);
+		free(pcm_buf);
+		outr_close(&router);
 		dsd_decoder_free(decoder);
 		fclose(f);
 		tui_close();
 		return;
 	}
+
+	if (router.use_dsd)
+		snprintf(codecbuf, sizeof(codecbuf), "%s->DSD(%s)",
+		         base_codec,
+		         router.dsd.monitor_mode ? "mon" : "DoP");
+	ts.rate = outr_output_rate(&router);
+	tui_render(&ts);
+
 	size_t n;
-	while ((n = dsd_decoder_read_pcm_frames(decoder, a.frames, a.buffer, format)) > 0) {
+	while ((n = dsd_decoder_read_pcm_frames(
+		        decoder, FRAMES, pcm_buf, format)) > 0) {
 		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, a.buffer, n, decoder->channels, format);
+			apply_crosstalk_cancellation(
+				&xtc, pcm_buf, n, decoder->channels, format);
 		}
 
-		AUDIO_play0(&a);
-		AUDIO_wait(&a, 100);
+		if (format == SND_PCM_FORMAT_FLOAT_LE)
+			outr_feed_float(&router, (const float *)pcm_buf, n);
+		else
+			outr_feed_s16(&router, (const int16_t *)pcm_buf, n);
 
-		int k = key(&a, &ts);
+		int k = key(outr_audio(&router), &ts);
 		if (k == 'c') {
 			flag ^= USE_CROSSTALK;
 			g_flag_diff ^= USE_CROSSTALK;
+		} else if (k == 's') {
+			outr_toggle_super_res(&router);
+			flag ^= USE_SUPER_RES;
+			g_flag_diff ^= USE_SUPER_RES;
+			ts.note = router.use_super_res
+				? "Super resolution on"
+				: "Super resolution off";
+			tui_render(&ts);
+		} else if (k == 'e') {
+			outr_toggle(&router);
+			flag ^= USE_DSD_ENCODE;
+			g_flag_diff ^= USE_DSD_ENCODE;
+			if (router.use_dsd)
+				snprintf(codecbuf, sizeof(codecbuf),
+				         "%s->DSD(%s)", base_codec,
+				         router.dsd.monitor_mode ? "mon" : "DoP");
+			else
+				snprintf(codecbuf, sizeof(codecbuf), "%s",
+				         base_codec);
+			ts.rate = outr_output_rate(&router);
+			ts.note = outr_status_note(&router);
+			tui_render(&ts);
 		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
-			ts.note = (decoder->file_type == DSD_FILE_DFF) ? "seek not supported for DFF" : "seek not supported for DSF";
+			ts.note = (decoder->file_type == DSD_FILE_DFF)
+				? "seek not supported for DFF"
+				: "seek not supported for DSF";
 			tui_render(&ts);
 		} else if (k) {
 			break;
 		}
 
 		frames_played += n;
-		ts.cur = (double)frames_played / decoder->sample_rate_pcm;
+		ts.cur = (double)frames_played /
+		         decoder->sample_rate_pcm;
 		ts.xtc_on = (flag & USE_CROSSTALK) ? 1 : 0;
 		ts.xtc_atten = xtc_attenuation;
-		ts.note = (n != a.frames) ? "! short read (end of file)" : NULL;
+		ts.note = (n != FRAMES)
+			? "! short read (end of file)" : NULL;
 		aplay_render_throttled(&ts, &last_render_ns);
 	}
 	tui_close();
 
-	AUDIO_close(&a);
+	free_crosstalk_cancellation(&xtc);
+	free(pcm_buf);
+	outr_close(&router);
 	dsd_decoder_free(decoder);
 	fclose(f);
-	free_crosstalk_cancellation(&xtc);
 }
 
 #ifdef DR_MP3_IMPLEMENTATION

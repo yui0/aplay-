@@ -130,6 +130,9 @@ int  luna_visuals_settling_under(int root_idx);
 int  luna_visuals_settling_mask(const int* roots, int nroots, unsigned* out_mask);
 /* 1 when a CSS @keyframes animation is actually running under root_idx. */
 int  luna_css_anim_running_under(int root_idx);
+/* Forget cached OpenGL bindings before a host/custom renderer hands control
+ * back to Luna UI. Safe to call once at the start of every frame. */
+void luna_invalidate_gl_state(void);
 void luna_render(int fbw, int fbh);
 /* Opt in to per-render damage tracking (off by default).  It costs a hash of
  * each drawn element per render, which only pays for itself on hosts that can
@@ -177,6 +180,9 @@ LunaElement* luna_element_at(int idx);
  * this element's text or style can actually change pixels. */
 int  luna_element_visible(int idx);
 int  luna_get_element_by_id(const char* id);
+/* Currently focused DOM element, or -1. Useful for host keyboard shortcuts. */
+int  luna_focused_element(void);
+void luna_focus_element(int idx);
 void luna_set_text(int idx, const char* text);
 void luna_add_class(int idx, const char* cls);
 void luna_remove_class(int idx, const char* cls);
@@ -189,6 +195,10 @@ void luna_update_element_style(int idx);
 void luna_register_js_handler(const char* name, LunaEventHandler fn);
 void luna_set_on_click(int idx, LunaEventHandler fn);
 void luna_mouse_move(double x, double y);
+/* Forward pointer motion and return 1 only when hover/drag visuals changed.
+ * Hosts can use this to avoid repainting the whole surface for every raw
+ * mouse-motion event. */
+int  luna_mouse_move_changed(double x, double y);
 void luna_mouse_button(int button, int action, int mods, double x, double y);
 void luna_scroll(double xoff, double yoff);
 void luna_key(int key, int scancode, int action, int mods);
@@ -960,7 +970,8 @@ struct LunaElement {
     int has_text_align;
     float font_size;
     int font_bold;
-    /* 0 = normal UI face, 1 = Luna Symbols, 2 = Luna Brands. */
+    /* 0 = normal UI face, 1 = Luna Symbols, 2 = Luna Brands,
+       3 = editor monospace face (LUNA_FONT_MONO / system mono fallback). */
     int font_face;
     float line_height;
     int white_space;    /* 0=normal 1=nowrap */
@@ -1042,6 +1053,10 @@ struct LunaElement {
        shrink-wrapped flex rows such as the shell's window list. */
     int max_width_pct;
     float raw_max_width, raw_max_width_off;
+    /* Percentage max-height is resolved against the containing block.
+       Previously `max-height: 90%` was parsed as 90px, crushing dialogs. */
+    int max_height_pct;
+    float raw_max_height, raw_max_height_off;
 
     int grid_col_count, grid_row_count;
     float grid_col_track[MAX_GRID_TRACKS];
@@ -1237,6 +1252,7 @@ typedef struct {
     int has_max_width; float max_width;
     int max_width_pct; float raw_max_width, raw_max_width_off;
     int has_max_height; float max_height;
+    int max_height_pct; float raw_max_height, raw_max_height_off;
     int has_box_sizing; int box_sizing;
     int has_grid_template_columns;
     float grid_col_track[MAX_GRID_TRACKS];
@@ -1603,6 +1619,7 @@ static int    g_scroll_drag_idx = -1;
 static int    g_scroll_drag_axis = 0; /* 0=vertical 1=horizontal */
 static float  g_scroll_drag_off = 0.0f;
 static int    g_scroll_hover_idx = -1;
+static unsigned g_pointer_visual_revision = 1;
 static int    g_scroll_hover_axis = -1; /* -1=none 0=vertical 1=horizontal */
 static int    g_drag_moved = 0;
 static int    g_drag_mode  = 0;
@@ -1663,6 +1680,10 @@ static int            g_bold_font_info_ok = 0;
 static stbtt_fontinfo g_cjk_font_info;
 static unsigned char* g_cjk_font_ttf = NULL;
 static int            g_cjk_font_info_ok = 0;
+/* Optional monospace face used by code editors and terminals. */
+static stbtt_fontinfo g_mono_font_info;
+static unsigned char* g_mono_font_ttf = NULL;
+static int            g_mono_font_info_ok = 0;
 /* LunaSymbols (Font Awesome–derived) — solid UI icons + brand marks. */
 static stbtt_fontinfo g_icon_font_info;
 static unsigned char* g_icon_font_ttf = NULL;
@@ -1798,6 +1819,29 @@ static int font_path_score(const char* path) {
 }
 
 /* UI sans-serif: match demo.css stack (Inter / system UI), not CJK faces. */
+static int font_path_score_mono(const char* path) {
+    char lower[1024];
+    size_t n = strlen(path);
+    if (n >= sizeof(lower)) n = sizeof(lower) - 1;
+    for (size_t i = 0; i < n; i++) lower[i] = (char)tolower((unsigned char)path[i]);
+    lower[n] = '\0';
+    if (strstr(lower, "emoji") || strstr(lower, "icon") || strstr(lower, "symbol")) return -1000;
+    int score = 0;
+    if (strstr(lower, "jetbrainsmono") || strstr(lower, "jetbrains mono")) score += 600;
+    if (strstr(lower, "sfmono") || strstr(lower, "sf mono")) score += 580;
+    if (strstr(lower, "cascadiacode") || strstr(lower, "cascadia code")) score += 560;
+    if (strstr(lower, "firacode") || strstr(lower, "fira code")) score += 540;
+    if (strstr(lower, "ibmplexmono") || strstr(lower, "ibm plex mono")) score += 520;
+    if (strstr(lower, "sourcecodpro") || strstr(lower, "source code pro")) score += 500;
+    if (strstr(lower, "ubuntumono") || strstr(lower, "ubuntu mono")) score += 480;
+    if (strstr(lower, "dejavusansmono") || strstr(lower, "dejavu sans mono")) score += 460;
+    if (strstr(lower, "liberationmono") || strstr(lower, "liberation mono")) score += 440;
+    if (strstr(lower, "notosansmono") || strstr(lower, "noto sans mono")) score += 420;
+    if (score == 0 && strstr(lower, "mono")) score += 100;
+    if (strstr(lower, "bold") || strstr(lower, "italic") || strstr(lower, "oblique")) score -= 80;
+    return score;
+}
+
 static int font_path_score_ui(const char* path) {
     char lower[1024];
     size_t n = strlen(path);
@@ -1906,10 +1950,12 @@ static stbtt_fontinfo* font_for_codepoint(int cp) {
     int bold_has  = font_has_cp(&g_bold_font_info,  g_bold_font_info_ok,  cp);
     int ui_has    = font_has_cp(&g_font_info,       g_font_info_ok,       cp);
     int cjk_has   = font_has_cp(&g_cjk_font_info,   g_cjk_font_info_ok,   cp);
+    int mono_has  = font_has_cp(&g_mono_font_info,  g_mono_font_info_ok,  cp);
 
     /* CSS font-family must win when both icon faces expose a codepoint. */
     if (g_font_face_hint == 1 && icon_has) return &g_icon_font_info;
     if (g_font_face_hint == 2 && brand_has) return &g_brand_font_info;
+    if (g_font_face_hint == 3 && mono_has) return &g_mono_font_info;
     if (pua) {
         if (icon_has)  return &g_icon_font_info;
         if (brand_has) return &g_brand_font_info;
@@ -1927,6 +1973,7 @@ static stbtt_fontinfo* font_for_codepoint(int cp) {
     if (brand_has) return &g_brand_font_info;
     if (g_font_bold_hint && g_bold_font_info_ok) return &g_bold_font_info;
     if (prefer_cjk && g_cjk_font_info_ok) return &g_cjk_font_info;
+    if (g_font_face_hint == 3 && g_mono_font_info_ok) return &g_mono_font_info;
     if (g_font_info_ok) return &g_font_info;
     if (g_cjk_font_info_ok) return &g_cjk_font_info;
     if (g_icon_font_info_ok) return &g_icon_font_info;
@@ -3397,7 +3444,7 @@ static int parse_cursor_type(const char* val) {
  * stats, sliders, dock, popovers), and each lookup used to strcmp its way down
  * the whole element array.  Element ids are only ever written when an element
  * is appended, so the table just needs extending as elem_count grows. */
-#define LUNA_ID_MAP_SIZE 1024   /* power of two, comfortably > MAX_ELEMENTS */
+#define LUNA_ID_MAP_SIZE 4096   /* power of two, comfortably > MAX_ELEMENTS */
 static int g_id_map[LUNA_ID_MAP_SIZE];
 static int g_id_map_ready = 0;
 static int g_id_map_built = 0;  /* elements already inserted */
@@ -3595,6 +3642,13 @@ static void apply_element_inline_style(LunaElement* e) {
         e->raw_h = rule.raw_h;
         e->raw_h_off = rule.raw_h_off;
         e->css_height = rule.height;
+    }
+    if (rule.has_max_height) {
+        e->has_max_height = 1;
+        e->css_max_height = rule.max_height;
+        e->max_height_pct = rule.max_height_pct;
+        e->raw_max_height = rule.raw_max_height;
+        e->raw_max_height_off = rule.raw_max_height_off;
     }
     if (rule.has_left) {
         e->has_left = 1;
@@ -4716,9 +4770,15 @@ void parse_declarations(char* declarations, StyleRule* rule) {
                 }
             }
             else if (strcmp(key, "max-height") == 0) {
+                /* Keep percentage max-height as a ratio.  Parsing `90%` with
+                 * parse_float_val() produced 90px and collapsed modal panels. */
                 if (strcmp(val, "none") != 0) {
                     rule->has_max_height = 1;
-                    rule->max_height = parse_float_val(val);
+                    parse_length_calc(val, &rule->max_height,
+                                      &rule->max_height_pct,
+                                      &rule->raw_max_height_off);
+                    if (rule->max_height_pct)
+                        rule->raw_max_height = rule->max_height;
                 }
             }
             else if (strcmp(key, "gap") == 0) {
@@ -5645,6 +5705,8 @@ void update_element_style(LunaElement* e) {
     e->has_max_width = e->has_max_height = 0;
     e->max_width_pct = 0;
     e->raw_max_width = e->raw_max_width_off = 0.0f;
+    e->max_height_pct = 0;
+    e->raw_max_height = e->raw_max_height_off = 0.0f;
     e->css_min_width = e->css_min_height = 0.0f;
     e->css_max_width = e->css_max_height = 0.0f;
     e->grid_col_count = e->grid_row_count = 0;
@@ -6002,7 +6064,13 @@ void update_element_style(LunaElement* e) {
             e->raw_max_width = r->raw_max_width;
             e->raw_max_width_off = r->raw_max_width_off;
         }
-        if (r->has_max_height) { e->has_max_height = 1; e->css_max_height = r->max_height; }
+        if (r->has_max_height) {
+            e->has_max_height = 1;
+            e->css_max_height = r->max_height;
+            e->max_height_pct = r->max_height_pct;
+            e->raw_max_height = r->raw_max_height;
+            e->raw_max_height_off = r->raw_max_height_off;
+        }
         if (r->has_box_sizing) e->box_sizing = r->box_sizing;
         if (r->has_overflow_x) e->overflow_x = r->overflow_x;
         if (r->has_overflow_y) e->overflow_y = r->overflow_y;
@@ -6804,6 +6872,14 @@ static float resolved_max_width(const LunaElement* e, float containing_width) {
     return css_outer_width(e, css_w);
 }
 
+static float resolved_max_height(const LunaElement* e, float containing_height) {
+    float css_h = e->max_height_pct
+        ? containing_height * e->raw_max_height + e->raw_max_height_off
+        : e->css_max_height;
+    if (css_h < 0.0f) css_h = 0.0f;
+    return css_outer_height(e, css_h);
+}
+
 /* Outer main-axis size of a flex item in a row container (used while packing
  * wrap lines during intrinsic height).  Mirrors flex_main_size's width path
  * without depending on it — that helper is defined later and calls us. */
@@ -6858,7 +6934,9 @@ static float flow_content_height(LunaElement* e) {
         float min_h = css_outer_height(ch, ch->css_min_height);
         float max_h = css_outer_height(ch, ch->css_max_height);
         if (ch->has_min_height && chh < min_h) chh = min_h;
-        if (ch->has_max_height && chh > max_h) chh = max_h;
+        /* A percentage max-height is indefinite during intrinsic sizing.
+           It is resolved later once the containing block height is known. */
+        if (ch->has_max_height && !ch->max_height_pct && chh > max_h) chh = max_h;
         chh += ch->margin_top + ch->margin_bottom;
         if (chh > maxh) maxh = chh;
         total += chh;
@@ -7066,7 +7144,9 @@ static void layout_block_container(int container_idx) {
     if (cont->display_mode == DISPLAY_NONE) return;
 
     float inner_w = cont->w - cont->pad_l - cont->pad_r - cont->border_width * 2.0f;
+    float inner_h = cont->h - cont->pad_t - cont->pad_b - cont->border_width * 2.0f;
     if (inner_w < 0.0f) inner_w = 0.0f;
+    if (inner_h < 0.0f) inner_h = 0.0f;
     float y = cont->border_width + cont->pad_t;
 
     for (int c = 0; c < elem_count; c++) {
@@ -7092,7 +7172,7 @@ static void layout_block_container(int container_idx) {
             if (ch->h < min_h) ch->h = min_h;
         }
         if (ch->has_max_height) {
-            float max_h = css_outer_height(ch, ch->css_max_height);
+            float max_h = resolved_max_height(ch, inner_h);
             if (ch->h > max_h) ch->h = max_h;
         }
 
@@ -7113,7 +7193,8 @@ static void layout_block_container(int container_idx) {
         cont->h = auto_h;
         if (cont->has_min_height && cont->h < cont->css_min_height)
             cont->h = cont->css_min_height;
-        if (cont->has_max_height && cont->h > cont->css_max_height)
+        if (cont->has_max_height && !cont->max_height_pct &&
+            cont->h > cont->css_max_height)
             cont->h = cont->css_max_height;
     }
 }
@@ -7201,7 +7282,7 @@ void update_layout() {
         float min_w = css_outer_width(e, e->css_min_width);
         float min_h = css_outer_height(e, e->css_min_height);
         float max_w = resolved_max_width(e, parent_w);
-        float max_h = css_outer_height(e, e->css_max_height);
+        float max_h = resolved_max_height(e, parent_h);
         if (e->has_min_width && e->w < min_w) e->w = min_w;
         if (e->has_min_height && e->h < min_h) e->h = min_h;
         if (e->has_max_width && e->w > max_w) e->w = max_w;
@@ -7313,7 +7394,7 @@ static float flex_main_size(LunaElement* ch, int row_mode, float available_main)
         if (ch->has_max_width && size > max_w) size = max_w;
     } else {
         float min_h = css_outer_height(ch, ch->css_min_height);
-        float max_h = css_outer_height(ch, ch->css_max_height);
+        float max_h = resolved_max_height(ch, available_main);
         if (ch->has_min_height && size < min_h) size = min_h;
         if (ch->has_max_height && size > max_h) size = max_h;
     }
@@ -7361,7 +7442,7 @@ static float resolve_flex_cross_len(LunaElement* ch, int row_mode, int align,
             float hh = flow_content_height(ch);
             if (available_cross >= 0.0f && hh > available_cross) hh = available_cross;
             float min_h = css_outer_height(ch, ch->css_min_height);
-            float max_h = css_outer_height(ch, ch->css_max_height);
+            float max_h = resolved_max_height(ch, available_cross);
             if (ch->has_min_height && hh < min_h) hh = min_h;
             if (ch->has_max_height && hh > max_h) hh = max_h;
             ch->h = hh;
@@ -7739,7 +7820,8 @@ static void layout_flex_container(int container_idx) {
         float needed_h = cross_cursor + pad_cross_end;
         if (cont->has_min_height && needed_h < cont->css_min_height)
             needed_h = cont->css_min_height;
-        if (cont->has_max_height && needed_h > cont->css_max_height)
+        if (cont->has_max_height && !cont->max_height_pct &&
+            needed_h > cont->css_max_height)
             needed_h = cont->css_max_height;
         cont->h = needed_h;
     }
@@ -8163,7 +8245,16 @@ static int size_auto_positioned_containers(void) {
         if (e->has_top && e->has_bottom) continue; /* inset stretches these */
         float h = flow_content_height(e);
         if (e->has_min_height && h < e->css_min_height) h = e->css_min_height;
-        if (e->has_max_height && h > e->css_max_height) h = e->css_max_height;
+        if (e->has_max_height) {
+            float basis = window_height;
+            if (!e->position_fixed && e->parent_idx >= 0) {
+                LunaElement* p = &elements[e->parent_idx];
+                basis = p->h - p->pad_t - p->pad_b - p->border_width * 2.0f;
+                if (basis < 0.0f) basis = 0.0f;
+            }
+            float max_h = resolved_max_height(e, basis);
+            if (h > max_h) h = max_h;
+        }
         if (fabsf(e->h - h) > 0.5f) {
             e->h = h;
             changed = 1;
@@ -9461,10 +9552,15 @@ static const CssKeyframe* find_keyframe_anim(const char* name);
  * plus a full-screen compositor recomposite, several times a second, forever.
  * `root_idx < 0` asks about the whole document. */
 int luna_css_anim_running_under(int root_idx) {
-    for (int i = 0; i < elem_count; i++) {
+    /* The registry already contains only live CSS-animation candidates.
+     * Scanning the full DOM once a second caused a small but regular main-loop
+     * spike on large shell layouts. */
+    rebuild_activity_registries();
+    for (int pos = 0; pos < g_css_anim_count; pos++) {
+        int i = g_css_anim_idx[pos];
+        if (i < 0 || i >= elem_count) continue;
         LunaElement* e = &elements[i];
-        if (!e->has_css_animation || !e->anim_name[0] || e->display_none ||
-            e->anim_finished) continue;
+        if (e->display_none || e->anim_finished) continue;
         if (!is_visible(i)) continue;
         if (root_idx >= 0 && !elem_is_self_or_descendant(i, root_idx)) continue;
         if (!find_keyframe_anim(e->anim_name)) continue;
@@ -9964,6 +10060,14 @@ void init_font() {
     }
     if (!g_cjk_font_ttf) g_cjk_font_ttf = try_load_font_list(&reg, font_path_score, &cjk_sz);
 
+    const char* env_mono = getenv("LUNA_FONT_MONO");
+    long mono_sz = 0;
+    if (env_mono && env_mono[0]) {
+        g_mono_font_ttf = read_file_bytes(env_mono, &mono_sz);
+        if (g_mono_font_ttf) fprintf(stderr, "[vespera] Mono font loaded: %s (LUNA_FONT_MONO)\n", env_mono);
+    }
+    if (!g_mono_font_ttf) g_mono_font_ttf = try_load_font_list(&reg, font_path_score_mono, &mono_sz);
+
     if (!reg_buf) fprintf(stderr, "[vespera] Warning: no regular font found under /usr/share/fonts\n");
     else {
         bake_font_set(reg_buf, font_regular);
@@ -9978,6 +10082,11 @@ void init_font() {
         int off = stbtt_GetFontOffsetForIndex(g_cjk_font_ttf, 0);
         if (off < 0) off = 0;
         g_cjk_font_info_ok = stbtt_InitFont(&g_cjk_font_info, g_cjk_font_ttf, off) ? 1 : 0;
+    }
+    if (g_mono_font_ttf) {
+        int off = stbtt_GetFontOffsetForIndex(g_mono_font_ttf, 0);
+        if (off < 0) off = 0;
+        g_mono_font_info_ok = stbtt_InitFont(&g_mono_font_info, g_mono_font_ttf, off) ? 1 : 0;
     }
 
     /* LunaSymbols — env override, then /usr/share/fonts, then source-tree.
@@ -10124,7 +10233,8 @@ static void text_metrics_begin(float css_px, int bold, int face, FontAtlas* atla
     g_text_css_px = css_px > 0.0f ? css_px : 16.0f;
     g_font_face_hint = face;
     g_font_bold_hint = (bold && bold_font_loaded) ? 1 : 0;
-    g_text_dynamic_ascii = fabsf(atlas_nominal_size(atlas) - g_text_css_px) > 0.01f ||
+    g_text_dynamic_ascii = (face == 3) ||
+                           fabsf(atlas_nominal_size(atlas) - g_text_css_px) > 0.01f ||
                            text_device_scale() > 1.01f;
 }
 
@@ -11093,6 +11203,8 @@ static void set_window_cursor(void* window, int cursor_type) {
 }
 
 void recompute_hover(void* window, double xpos, double ypos) {
+    int old_scroll_hover_idx = g_scroll_hover_idx;
+    int old_scroll_hover_axis = g_scroll_hover_axis;
     g_scroll_hover_idx = -1;
     g_scroll_hover_axis = -1;
     for (int si = 0; si < elem_count; si++) {
@@ -11108,6 +11220,10 @@ void recompute_hover(void* window, double xpos, double ypos) {
         }
     }
 
+    if (old_scroll_hover_idx != g_scroll_hover_idx ||
+        old_scroll_hover_axis != g_scroll_hover_axis)
+        g_pointer_visual_revision++;
+
     int hit = hit_test_at(xpos, ypos);
 
     int best_cursor = 0;
@@ -11122,6 +11238,7 @@ void recompute_hover(void* window, double xpos, double ypos) {
         if (should_hover != e->is_hovered) {
             e->is_hovered = should_hover;
             update_element_style(e);
+            g_pointer_visual_revision++;
         }
         if (should_hover && e->cursor_type > best_cursor)
             best_cursor = e->cursor_type;
@@ -11789,6 +11906,8 @@ static void load_gl_functions() {
 int luna_element_count(void) { return elem_count; }
 LunaElement* luna_element_at(int i) { return (i >= 0 && i < elem_count) ? &elements[i] : NULL; }
 int luna_get_element_by_id(const char* id) { return get_element_by_id(id); }
+int luna_focused_element(void) { return g_focused_element_idx; }
+void luna_focus_element(int idx) { if (idx >= 0 && idx < elem_count) focus_element(idx); }
 int luna_element_visible(int idx) { return (idx >= 0 && idx < elem_count) ? is_visible(idx) : 0; }
 void luna_set_text(int i, const char* t) { g_probe_prepared = 0; set_text(i, t); }
 void luna_add_class(int i, const char* c) { g_probe_prepared = 0; if (i >= 0 && i < elem_count) add_class(&elements[i], c); }
@@ -12147,10 +12266,14 @@ int luna_probe_damage(int root_idx, int fbw, int fbh,
     build_render_order();
     rc_build();
     int changed = 0;
-    /* Elements that were drawn last time but are gone now still count. */
+    /* Elements that were drawn last time in this root but are gone now still
+     * count.  Records belonging to another Wayland layer root must be ignored:
+     * treating !in_root as damage made every multi-surface probe report a
+     * change after any other layer had rendered, defeating identical-frame
+     * skipping and reintroducing periodic full-surface redraws. */
     for (int i = 0; i < elem_count; i++) {
-        if (!g_draw_rec[i].drawn) continue;
-        if (!g_rc[i].in_root || !rc_is_rendered(i) || g_rc[i].eff_op <= 0.004f) {
+        if (!g_draw_rec[i].drawn || !g_rc[i].in_root) continue;
+        if (!rc_is_rendered(i) || g_rc[i].eff_op <= 0.004f) {
             changed = 1;
             break;
         }
@@ -12220,7 +12343,26 @@ int luna_probe_damage(int root_idx, int fbw, int fbh,
     return changed;
 }
 
+void luna_invalidate_gl_state(void) {
+    /* A host may paint with its own shaders/VAOs between Luna passes.  The
+     * cached IDs then describe Luna's last request rather than the driver's
+     * current state.  Force the next primitive to bind its real objects. */
+    g_current_program = 0;
+    g_current_vao = 0;
+
+    /* These states are intentionally reasserted instead of cached.  In
+     * particular, a leaked scissor would make the following glClear() or the
+     * first UI boxes affect only the editor rectangle, producing a text-only
+     * frame on the next caret-blink repaint. */
+    glDisable(GL_SCISSOR_TEST);
+    rc_scissor_reset();
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                        GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+}
+
 void luna_render(int fbw, int fbh) {
+    luna_invalidate_gl_state();
     g_luna_fbw = fbw;
     g_luna_fbh = fbh;
     /* The backdrop-blur capture textures are allocated by the first element
@@ -12552,9 +12694,15 @@ static void repaint_stuck_sticky_layers(int fbw, int fbh) {
     }
 }
 
-void luna_mouse_move(double x, double y) {
+int luna_mouse_move_changed(double x, double y) {
+    unsigned before = g_pointer_visual_revision;
+    int dragging = (g_scroll_drag_idx != -1 || drag_target_idx != -1);
     g_luna_mx = x; g_luna_my = y;
     cursor_position_callback(NULL, x, y);
+    return dragging || before != g_pointer_visual_revision;
+}
+void luna_mouse_move(double x, double y) {
+    (void)luna_mouse_move_changed(x, y);
 }
 void luna_mouse_button(int b, int a, int m, double x, double y) {
     g_luna_mx = x; g_luna_my = y;

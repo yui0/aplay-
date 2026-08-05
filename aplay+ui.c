@@ -21,6 +21,7 @@
 // injects commands; it does not read from or render to the terminal.
 // ============================================================
 #include <pthread.h>
+#include <limits.h>
 
 static volatile int g_injected_key = 0;
 static int g_wake_pipe[2] = { -1, -1 };
@@ -119,6 +120,8 @@ static int g_device_picker_scroll = 0;
 static int g_device_picker_selected = -1;
 /* Initial engine flag bitmask; XOR with g_flag_diff gives live DSD/SR/XTC. */
 static int g_start_flag = 0;
+/* >=0 requests an exact entry in fmt_cycle[]; consumed in key(). */
+static volatile int g_format_select_idx = -1;
 
 static int gui_copy_string_if_changed(char *dst, size_t dst_n, const char *src)
 {
@@ -621,6 +624,20 @@ int key(AUDIO *a, tui_state_t *ts)
 		cmd = 0;
 		return 0;
 	}
+
+	int requested_format = __atomic_exchange_n(
+		&g_format_select_idx, -1, __ATOMIC_SEQ_CST);
+	if (requested_format >= 0 && requested_format < fmt_cycle_n) {
+		fmt_filter_idx = requested_format;
+		fmt_filter = (char *)fmt_cycle[fmt_filter_idx];
+		if (ts) {
+			ts->format_filter = fmt_filter;
+			ts->note = fmt_filter ? fmt_filter : "ALL";
+			tui_render(ts);
+		}
+		cmd = 0;
+		return 0;
+	}
 	int requested = __atomic_load_n(&g_playlist_requested_track, __ATOMIC_SEQ_CST);
 	if (requested > 0 && track_index > 0) {
 		/* Newly added folders are merged on reload.  If the click lands past
@@ -754,6 +771,20 @@ void usage(FILE *fp, int argc, char **argv)
 #include <sys/stat.h>
 #include <sys/wait.h>
 
+enum {
+	WINAMP_BTN_PREV = 0,
+	WINAMP_BTN_PLAY,
+	WINAMP_BTN_PAUSE,
+	WINAMP_BTN_STOP,
+	WINAMP_BTN_NEXT,
+	WINAMP_BTN_EJECT,
+	WINAMP_BTN_COUNT
+};
+
+typedef struct {
+	int x, y, w, h;
+} WinampButtonLayout;
+
 typedef struct {
 	int enabled;
 	int owns_extract_dir;
@@ -779,6 +810,7 @@ typedef struct {
 	char playlist_current[8];
 	char playlist_bg[8];
 	char playlist_selected_bg[8];
+	WinampButtonLayout button[WINAMP_BTN_COUNT];
 } WinampSkin;
 
 static const char *g_skin_arg = NULL;
@@ -1058,8 +1090,23 @@ static int create_skin_workspace(const char *source_name)
 	return 1;
 }
 
+static void set_default_skin_button_layout(void)
+{
+	static const int x[WINAMP_BTN_COUNT] = { 16, 39, 62, 85, 108, 136 };
+	static const int y[WINAMP_BTN_COUNT] = { 88, 88, 88, 88, 88, 89 };
+	static const int w[WINAMP_BTN_COUNT] = { 23, 23, 23, 23, 22, 22 };
+	static const int h[WINAMP_BTN_COUNT] = { 18, 18, 18, 18, 18, 16 };
+	for (int i = 0; i < WINAMP_BTN_COUNT; i++) {
+		g_skin.button[i].x = x[i];
+		g_skin.button[i].y = y[i];
+		g_skin.button[i].w = w[i];
+		g_skin.button[i].h = h[i];
+	}
+}
+
 static void set_skin_output_paths(void)
 {
+	set_default_skin_button_layout();
 	snprintf(g_skin.main_png, sizeof(g_skin.main_png), "%s/main.png", g_skin.work_dir);
 	snprintf(g_skin.equalizer_png, sizeof(g_skin.equalizer_png), "%s/equalizer.png", g_skin.work_dir);
 	snprintf(g_skin.playlist_png, sizeof(g_skin.playlist_png), "%s/playlist.png", g_skin.work_dir);
@@ -1081,24 +1128,136 @@ static void set_skin_output_paths(void)
 	snprintf(g_skin.playlist_selected_bg, sizeof(g_skin.playlist_selected_bg), "#5C3A22");
 }
 
+static int skin_rgb_delta(const unsigned char *a, const unsigned char *b)
+{
+	return abs((int)a[0] - (int)b[0]) +
+	       abs((int)a[1] - (int)b[1]) +
+	       abs((int)a[2] - (int)b[2]);
+}
+
+/* Classic Winamp sprites fake transparency by including the MAIN.BMP pixels
+ * around each control. Pixels that are identical in the normal and pressed
+ * states are therefore useful anchors. Match those edge-connected anchors
+ * against MAIN.BMP so non-standard skins can move both the drawn button and
+ * its Luna hit box instead of retaining the base-skin coordinates. */
+static void detect_skin_button_layout(const unsigned char *main_rgba, int mw, int mh,
+	const unsigned char *buttons_rgba, int bw, int bh)
+{
+	static const int sx[WINAMP_BTN_COUNT] = { 0, 23, 46, 69, 92, 114 };
+	static const int sy_down[WINAMP_BTN_COUNT] = { 18, 18, 18, 18, 18, 16 };
+	const int canvas_w = mw < 275 ? mw : 275;
+	const int canvas_h = mh < 116 ? mh : 116;
+
+	for (int bi = 0; bi < WINAMP_BTN_COUNT; bi++) {
+		WinampButtonLayout *layout = &g_skin.button[bi];
+		const int w = layout->w, h = layout->h;
+		const int down_y = sy_down[bi];
+		if (sx[bi] + w > bw || h > bh || down_y + h > bh ||
+		    w > 23 || h > 18 || canvas_w < w || canvas_h < h)
+			continue;
+
+		unsigned char equal[23 * 18] = {0};
+		unsigned char anchor[23 * 18] = {0};
+		int queue[23 * 18], head = 0, tail = 0;
+		for (int yy = 0; yy < h; yy++) {
+			for (int xx = 0; xx < w; xx++) {
+				const unsigned char *up = buttons_rgba +
+					((size_t)yy * bw + sx[bi] + xx) * 4;
+				const unsigned char *dn = buttons_rgba +
+					((size_t)(down_y + yy) * bw + sx[bi] + xx) * 4;
+				int k = yy * w + xx;
+				equal[k] = skin_rgb_delta(up, dn) <= 6;
+				if (equal[k] && (xx == 0 || yy == 0 || xx == w - 1 || yy == h - 1)) {
+					anchor[k] = 1;
+					queue[tail++] = k;
+				}
+			}
+		}
+		while (head < tail) {
+			int k = queue[head++], x = k % w, y = k / w;
+			static const int dx[4] = { -1, 1, 0, 0 };
+			static const int dy[4] = { 0, 0, -1, 1 };
+			for (int d = 0; d < 4; d++) {
+				int nx = x + dx[d], ny = y + dy[d];
+				if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+				int nk = ny * w + nx;
+				if (equal[nk] && !anchor[nk]) {
+					anchor[nk] = 1;
+					queue[tail++] = nk;
+				}
+			}
+		}
+
+		int anchor_n = 0;
+		for (int k = 0; k < w * h; k++) anchor_n += anchor[k] != 0;
+		if (anchor_n < 6) continue;
+
+		long best_score = LONG_MIN, default_score = LONG_MIN;
+		int best_x = layout->x, best_y = layout->y;
+		int best_matches = 0, default_matches = 0;
+		for (int cy = 0; cy <= canvas_h - h; cy++) {
+			for (int cx = 0; cx <= canvas_w - w; cx++) {
+				long error = 0;
+				int matches = 0;
+				for (int yy = 0; yy < h; yy++) {
+					for (int xx = 0; xx < w; xx++) {
+						if (!anchor[yy * w + xx]) continue;
+						const unsigned char *sp = buttons_rgba +
+							((size_t)yy * bw + sx[bi] + xx) * 4;
+						const unsigned char *mp = main_rgba +
+							((size_t)(cy + yy) * mw + cx + xx) * 4;
+						int delta = skin_rgb_delta(sp, mp);
+						if (delta <= 6) matches++;
+						error += delta < 96 ? delta : 96;
+					}
+				}
+				long score = (long)matches * 256 - error;
+				int best_dist = abs(best_x - layout->x) + abs(best_y - layout->y);
+				int this_dist = abs(cx - layout->x) + abs(cy - layout->y);
+				if (score > best_score || (score == best_score && this_dist < best_dist)) {
+					best_score = score;
+					best_matches = matches;
+					best_x = cx;
+					best_y = cy;
+				}
+				if (cx == layout->x && cy == layout->y) {
+					default_score = score;
+					default_matches = matches;
+				}
+			}
+		}
+
+		int minimum_matches = anchor_n / 12;
+		if (minimum_matches < 6) minimum_matches = 6;
+		if (best_matches >= minimum_matches &&
+		    ((best_x == layout->x && best_y == layout->y) ||
+		     (best_matches >= default_matches + 4 && best_score >= default_score + 256))) {
+			layout->x = best_x;
+			layout->y = best_y;
+		}
+	}
+}
+
 static int write_skin_sprites(const unsigned char *main_rgba, int mw, int mh,
 	const unsigned char *buttons_rgba, int bw, int bh)
 {
 	set_skin_output_paths();
+	detect_skin_button_layout(main_rgba, mw, mh, buttons_rgba, bw, bh);
 	int down_y = bh >= 36 ? 18 : 0;
+	int eject_down_y = bh >= 32 ? 16 : 0;
 	int ok = write_skin_crop(main_rgba, mw, mh, 0, 0, 275, 116, g_skin.main_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 0, 0, 23, 18, g_skin.prev_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 23, 0, 23, 18, g_skin.play_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 46, 0, 23, 18, g_skin.pause_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 69, 0, 23, 18, g_skin.stop_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 92, 0, 22, 18, g_skin.next_png) &&
-	         write_skin_crop(buttons_rgba, bw, bh, 114, 0, 22, 18, g_skin.eject_png) &&
+	         write_skin_crop(buttons_rgba, bw, bh, 114, 0, 22, 16, g_skin.eject_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 0, down_y, 23, 18, g_skin.prev_down_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 23, down_y, 23, 18, g_skin.play_down_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 46, down_y, 23, 18, g_skin.pause_down_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 69, down_y, 23, 18, g_skin.stop_down_png) &&
 	         write_skin_crop(buttons_rgba, bw, bh, 92, down_y, 22, 18, g_skin.next_down_png) &&
-	         write_skin_crop(buttons_rgba, bw, bh, 114, down_y, 22, 18, g_skin.eject_down_png);
+	         write_skin_crop(buttons_rgba, bw, bh, 114, eject_down_y, 22, 16, g_skin.eject_down_png);
 	g_skin.enabled = ok;
 	return ok;
 }
@@ -1424,11 +1583,22 @@ static const char *WINAMP_HTML =
     "    <button class=\"skin-panel-toggle skin-toggle-pl\" aria-label=\"Show or hide playlist\" onclick=\"onTogglePlaylist()\">PL</button>"
     "    <button class=\"skin-window-close\" aria-label=\"Quit player\" onclick=\"onQuit()\"></button>"
     "  </div>"
-    "  <div id=\"surface-equalizer\" class=\"skin-surface skin-equalizer\">"
+    "  <div id=\"surface-equalizer\" class=\"skin-surface skin-equalizer eq-bypass\">"
     "    <button class=\"skin-window-close\" aria-label=\"Hide equalizer\" onclick=\"onHideEq()\"></button>"
-    "    <span class=\"eq-status\">EQ DISPLAY</span>"
-    "    <div class=\"eq-analyzer\"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>"
-    "    <div class=\"eq-sliders\"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>"
+    "    <button id=\"eq-power\" class=\"eq-mini eq-power\" onclick=\"onEqPower()\">ON</button>"
+    "    <button id=\"eq-reset\" class=\"eq-mini eq-reset\" onclick=\"onEqReset()\">FLAT</button>"
+    "    <span id=\"eq-status\" class=\"eq-status\">OFF · BYPASS</span>"
+    "    <div class=\"eq-fader eq-pre\" data-eq=\"0\"><i id=\"eqk0\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b0\" data-eq=\"1\"><i id=\"eqk1\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b1\" data-eq=\"2\"><i id=\"eqk2\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b2\" data-eq=\"3\"><i id=\"eqk3\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b3\" data-eq=\"4\"><i id=\"eqk4\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b4\" data-eq=\"5\"><i id=\"eqk5\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b5\" data-eq=\"6\"><i id=\"eqk6\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b6\" data-eq=\"7\"><i id=\"eqk7\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b7\" data-eq=\"8\"><i id=\"eqk8\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b8\" data-eq=\"9\"><i id=\"eqk9\"></i></div>"
+    "    <div class=\"eq-fader eq-band eq-b9\" data-eq=\"10\"><i id=\"eqk10\"></i></div>"
     "  </div>"
     "  <div id=\"surface-playlist\" class=\"skin-surface skin-playlist\">"
     "    <button class=\"skin-window-close\" aria-label=\"Hide playlist\" onclick=\"onHidePlaylist()\"></button>"
@@ -1465,17 +1635,55 @@ static const char *WINAMP_HTML =
     "    <button id=\"mi-dsd\" class=\"ctx-item\" onclick=\"onMenuDsd()\"><span id=\"mi-dsd-lbl\" class=\"ctx-label\">DSD (DoP)</span><span class=\"ctx-kbd\">E</span></button>"
     "    <button id=\"mi-sr\" class=\"ctx-item\" onclick=\"onMenuSr()\"><span id=\"mi-sr-lbl\" class=\"ctx-label\">Super resolution</span><span class=\"ctx-kbd\">S</span></button>"
     "    <button id=\"mi-loop\" class=\"ctx-item\" onclick=\"onMenuLoop()\"><span id=\"mi-loop-lbl\" class=\"ctx-label\">Repeat playlist</span><span class=\"ctx-kbd\">L</span></button>"
-    "    <button id=\"mi-fmt\" class=\"ctx-item\" onclick=\"onMenuFmt()\"><span class=\"ctx-label\">Format filter</span><span class=\"ctx-kbd\">F</span></button>"
+    "    <button id=\"mi-fmt\" class=\"ctx-item ctx-has-sub\" onclick=\"onMenuFmt()\"><span id=\"mi-fmt-lbl\" class=\"ctx-label\">Format filter</span><span class=\"ctx-kbd\">F</span><span class=\"ctx-sub\">\xe2\x96\xb8</span></button>"
     "    <button id=\"mi-dev\" class=\"ctx-item ctx-has-sub\" onclick=\"onMenuDevice()\"><span id=\"mi-dev-lbl\" class=\"ctx-label\">ALSA device</span><span class=\"ctx-kbd\">D</span><span class=\"ctx-sub\">\xe2\x96\xb8</span></button>"
-    "    <div class=\"ctx-sep\"></div>"
     "    <button id=\"mi-skin-rand\" class=\"ctx-item\" onclick=\"onSkinRandom()\"><span id=\"mi-skin-rand-lbl\" class=\"ctx-label\">Random skin / track</span></button>"
-    "    <button id=\"mi-skin-next\" class=\"ctx-item\" onclick=\"onSkinNext()\"><span class=\"ctx-label\">Next skin</span></button>"
+    "    <button id=\"mi-skin-next\" class=\"ctx-item ctx-has-sub\" onclick=\"onMenuSkins()\"><span id=\"mi-skin-next-lbl\" class=\"ctx-label\">Next skin</span><span class=\"ctx-sub\">\xe2\x96\xb8</span></button>"
     "    <button id=\"mi-skin-folder\" class=\"ctx-item\" onclick=\"onSkinFolder()\"><span class=\"ctx-label\">Skin folder...</span></button>"
     "    <button id=\"mi-skin-builtin\" class=\"ctx-item\" onclick=\"onSkinBuiltin()\"><span class=\"ctx-label\">Built-in Ember skin</span></button>"
     "    <div class=\"ctx-sep\"></div>"
     "    <button id=\"mi-text\" class=\"ctx-item\" onclick=\"onMenuTextSize()\"><span id=\"mi-text-lbl\" class=\"ctx-label\">Text size</span><span class=\"ctx-kbd\">T</span></button>"
     "    <button id=\"mi-about\" class=\"ctx-item\" onclick=\"onAbout()\"><span class=\"ctx-label\">About aplay+</span></button>"
     "    <button id=\"mi-exit\" class=\"ctx-item ctx-danger\" onclick=\"onMenuQuit()\"><span class=\"ctx-label\">Exit</span><span class=\"ctx-kbd\">Q</span></button>"
+    "  </div>"
+    "  <div id=\"surface-formats\" class=\"ctx-menu ctx-submenu ctx-submenu-formats\">"
+    "    <div class=\"ctx-heading\">Format filter</div>"
+    "    <button id=\"fm0\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm0-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"fm1\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm1-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"fm2\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm2-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"fm3\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm3-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"fm4\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm4-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"fm5\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm5-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"fm6\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm6-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"fm7\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm7-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"fm8\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm8-lbl\" class=\"ctx-label\"></span></button>"
+    "  </div>"
+    "  <div id=\"surface-skins\" class=\"ctx-menu ctx-submenu ctx-submenu-skins\">"
+    "    <div id=\"skins-heading\" class=\"ctx-heading\">Next skin</div>"
+    "    <button id=\"sk0\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk0-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk1\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk1-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk2\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk2-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk3\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk3-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk4\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk4-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk5\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk5-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk6\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk6-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk7\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk7-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk8\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk8-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk9\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk9-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk10\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk10-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk11\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk11-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk12\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk12-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk13\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk13-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk14\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk14-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk15\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk15-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk16\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk16-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk17\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk17-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk18\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk18-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk19\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk19-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk20\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk20-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk21\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk21-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk22\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk22-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"sk23\" class=\"ctx-item ctx-slot\" onclick=\"onSkinItem()\"><span id=\"sk23-lbl\" class=\"ctx-label\"></span></button>"
     "  </div>"
     "  <div id=\"surface-dev-cards\" class=\"ctx-menu ctx-submenu ctx-submenu-cards\">"
     "    <div class=\"ctx-heading\">Sound cards</div>"
@@ -1563,9 +1771,12 @@ static const char *WINAMP_CSS =
     ".skin-window-close{position:absolute;z-index:5;left:264px;top:3px;width:9px;height:9px;padding:0;border:0;background:transparent;cursor:pointer;}"
     ".skin-btn:focus-visible,.skin-panel-toggle:focus-visible,.skin-window-close:focus-visible,.ctx-item:focus-visible,.about-ok:focus-visible,.about-close:focus-visible{outline:1px solid var(--skin-focus);outline-offset:0;}"
     ".skin-equalizer{left:300px;top:0;height:116px;background-size:275px 116px;}"
-    ".eq-status{position:absolute;left:14px;top:20px;color:var(--skin-main-ink);font:700 7px var(--skin-font);text-shadow:0 1px var(--skin-main-shadow)}"
-    ".eq-analyzer{position:absolute;left:15px;top:34px;width:52px;height:58px;display:flex;align-items:flex-end;gap:2px;overflow:hidden}.eq-analyzer i{display:block;width:2px;background:var(--skin-main-data);opacity:.75}.eq-analyzer i:nth-child(3n+1){height:72%}.eq-analyzer i:nth-child(3n+2){height:45%}.eq-analyzer i:nth-child(3n){height:86%}"
-    ".eq-sliders{position:absolute;left:78px;top:38px;width:178px;height:60px;display:flex;justify-content:space-between}.eq-sliders i{position:relative;display:block;width:7px;height:60px}.eq-sliders i:before{content:'';position:absolute;left:3px;top:0;width:1px;height:60px;background:var(--skin-meter-bg)}.eq-sliders i:after{content:'';position:absolute;left:0;top:27px;width:7px;height:5px;background:var(--skin-main-data);box-shadow:0 1px var(--skin-main-shadow)}"
+    ".eq-mini{position:absolute;top:18px;height:10px;padding:0 2px;border:1px solid rgba(232,168,104,.45);border-radius:1px;background:rgba(0,0,0,.42);color:var(--skin-main-muted);font:700 6px/8px var(--skin-font);cursor:pointer;z-index:4}.eq-mini:hover,.eq-mini.on{color:var(--skin-focus);border-color:var(--skin-main-data)}"
+    ".eq-power{left:14px;width:24px}.eq-reset{left:42px;width:31px}"
+    ".eq-status{position:absolute;left:78px;top:19px;width:177px;color:var(--skin-main-ink);font:700 7px var(--skin-font);text-align:right;text-shadow:0 1px var(--skin-main-shadow);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
+    ".eq-fader{position:absolute;top:37px;width:11px;height:64px;cursor:ns-resize;z-index:3}.eq-fader:before{content:'';position:absolute;left:5px;top:1px;width:1px;height:60px;background:var(--skin-meter-bg)}.eq-fader i{position:absolute;left:2px;top:28px;width:7px;height:5px;background:var(--skin-main-data);box-shadow:0 1px var(--skin-main-shadow);pointer-events:none}"
+    ".eq-pre{left:18px}.eq-b0{left:75px}.eq-b1{left:93px}.eq-b2{left:111px}.eq-b3{left:129px}.eq-b4{left:147px}.eq-b5{left:165px}.eq-b6{left:183px}.eq-b7{left:201px}.eq-b8{left:219px}.eq-b9{left:237px}"
+    ".skin-equalizer .eq-fader{opacity:1}.skin-equalizer.eq-bypass .eq-fader{opacity:.42}"
     ".skin-playlist{left:600px;top:0;height:232px;background-size:275px 232px;}"
     ".skin-list{position:absolute;left:12px;top:23px;width:243px;height:168px;overflow:hidden;}"
     ".skin-list-row{width:239px;height:12px;padding:0 2px;font-family:var(--skin-font);font-size:10px;font-weight:700;line-height:12px;color:var(--playlist-normal);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;}"
@@ -1575,9 +1786,9 @@ static const char *WINAMP_CSS =
     ".skin-scroll-track{position:absolute;left:257px;top:23px;width:8px;height:168px;cursor:ns-resize}.skin-scroll-thumb{position:absolute;left:0;top:0;width:8px;min-height:12px;background:var(--skin-main-data);opacity:.72;cursor:ns-resize}"
     ".skin-device,.skin-note{position:absolute;top:217px;height:10px;font-family:var(--skin-font);font-size:6px;font-weight:700;line-height:9px;color:var(--playlist-normal);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
     ".skin-device{left:14px;width:100px;cursor:pointer}.skin-note{left:120px;width:141px;text-align:right;}"
-    ".ctx-menu{position:absolute;left:0;top:250px;width:292px;height:440px;padding:4px 0;background:#1a1612;border:1px solid #5c3a22;box-shadow:2px 2px 0 rgba(0,0,0,.45);z-index:50;}"
+    ".ctx-menu{position:absolute;left:0;top:250px;width:292px;height:432px;padding:4px 0;box-sizing:border-box;background:#1a1612;border:1px solid #5c3a22;box-shadow:2px 2px 0 rgba(0,0,0,.45);z-index:50;}"
     /* Compact native popup: flex rows with kbd chips on the trailing edge. */
-    ".ctx-item{display:flex;flex-direction:row;align-items:center;justify-content:flex-start;gap:8px;width:100%;height:15px;padding:0 10px;border:0;background:transparent;color:#E4D6C5;font:11px/15px 'DejaVu Sans',sans-serif;text-align:left;cursor:pointer;white-space:nowrap;overflow:hidden;}"
+    ".ctx-item{display:flex;flex-direction:row;box-sizing:border-box;align-items:center;justify-content:flex-start;gap:8px;width:100%;height:15px;padding:0 10px;border:0;background:transparent;color:#E4D6C5;font:11px/15px 'DejaVu Sans',sans-serif;text-align:left;cursor:pointer;white-space:nowrap;overflow:hidden;}"
     ".ctx-item:hover{background:#5C3A22;color:#FFE6B8;}"
     ".ctx-item:hover .ctx-kbd{border-color:#e8a868;color:#FFE6B8;background:rgba(232,168,104,.14);}"
     ".ctx-item.checked{color:#FFE6B8;}"
@@ -1590,6 +1801,8 @@ static const char *WINAMP_CSS =
     ".ctx-danger .ctx-kbd{color:#e8a0a0;border-color:#6a3a3a;}"
     ".ctx-sep{height:1px;margin:2px 10px;background:#5c3a22;opacity:.85;}"
     ".ctx-submenu{z-index:55;}"
+    ".ctx-submenu-formats{left:302px;top:550px;width:220px;height:164px;}"
+    ".ctx-submenu-skins{left:532px;top:550px;width:300px;height:390px;}"
     ".ctx-submenu-cards{left:302px;top:250px;width:240px;height:280px;}"
     ".ctx-submenu-pcms{left:552px;top:250px;width:240px;height:280px;}"
     ".ctx-heading{height:18px;padding:0 10px;color:#9a7f66;font:700 9px/18px 'DejaVu Sans',sans-serif;letter-spacing:0.06em;text-transform:uppercase;}"
@@ -1635,11 +1848,27 @@ static void build_winamp_image_css(char *out, size_t out_n)
 	snprintf(out, out_n,
 		":root{--playlist-normal:%s;--playlist-current:%s;--playlist-bg:%s;--playlist-selected-bg:%s;}"
 		".skin-main{background-image:url(%s);}.skin-equalizer{background-image:url(%s);}.skin-playlist{background-color:var(--playlist-bg);background-image:url(%s);}"
-		".skin-prev{background-image:url(%s);}.skin-play{background-image:url(%s);}.skin-pause{background-image:url(%s);}.skin-stop{background-image:url(%s);}.skin-next{background-image:url(%s);}.skin-eject{background-image:url(%s);}"
+		".skin-prev{left:%dpx;top:%dpx;width:%dpx;height:%dpx;background-image:url(%s);}"
+		".skin-play{left:%dpx;top:%dpx;width:%dpx;height:%dpx;background-image:url(%s);}"
+		".skin-pause{left:%dpx;top:%dpx;width:%dpx;height:%dpx;background-image:url(%s);}"
+		".skin-stop{left:%dpx;top:%dpx;width:%dpx;height:%dpx;background-image:url(%s);}"
+		".skin-next{left:%dpx;top:%dpx;width:%dpx;height:%dpx;background-image:url(%s);}"
+		".skin-eject{left:%dpx;top:%dpx;width:%dpx;height:%dpx;background-image:url(%s);}"
 		".skin-prev:active{background-image:url(%s);}.skin-play:active{background-image:url(%s);}.skin-pause:active{background-image:url(%s);}.skin-stop:active{background-image:url(%s);}.skin-next:active{background-image:url(%s);}.skin-eject:active{background-image:url(%s);}",
 		g_skin.playlist_normal, g_skin.playlist_current, g_skin.playlist_bg, g_skin.playlist_selected_bg,
 		g_skin.main_png, g_skin.equalizer_png, g_skin.playlist_png,
-		g_skin.prev_png, g_skin.play_png, g_skin.pause_png, g_skin.stop_png, g_skin.next_png, g_skin.eject_png,
+		g_skin.button[WINAMP_BTN_PREV].x, g_skin.button[WINAMP_BTN_PREV].y,
+		g_skin.button[WINAMP_BTN_PREV].w, g_skin.button[WINAMP_BTN_PREV].h, g_skin.prev_png,
+		g_skin.button[WINAMP_BTN_PLAY].x, g_skin.button[WINAMP_BTN_PLAY].y,
+		g_skin.button[WINAMP_BTN_PLAY].w, g_skin.button[WINAMP_BTN_PLAY].h, g_skin.play_png,
+		g_skin.button[WINAMP_BTN_PAUSE].x, g_skin.button[WINAMP_BTN_PAUSE].y,
+		g_skin.button[WINAMP_BTN_PAUSE].w, g_skin.button[WINAMP_BTN_PAUSE].h, g_skin.pause_png,
+		g_skin.button[WINAMP_BTN_STOP].x, g_skin.button[WINAMP_BTN_STOP].y,
+		g_skin.button[WINAMP_BTN_STOP].w, g_skin.button[WINAMP_BTN_STOP].h, g_skin.stop_png,
+		g_skin.button[WINAMP_BTN_NEXT].x, g_skin.button[WINAMP_BTN_NEXT].y,
+		g_skin.button[WINAMP_BTN_NEXT].w, g_skin.button[WINAMP_BTN_NEXT].h, g_skin.next_png,
+		g_skin.button[WINAMP_BTN_EJECT].x, g_skin.button[WINAMP_BTN_EJECT].y,
+		g_skin.button[WINAMP_BTN_EJECT].w, g_skin.button[WINAMP_BTN_EJECT].h, g_skin.eject_png,
 		g_skin.prev_down_png, g_skin.play_down_png, g_skin.pause_down_png, g_skin.stop_down_png, g_skin.next_down_png, g_skin.eject_down_png);
 }
 
@@ -1697,12 +1926,19 @@ static void onPlaylistItem(LunaElement *e)
 
 enum {
 	AUI_MAIN, AUI_EQUALIZER, AUI_PLAYLIST, AUI_MENU,
-	AUI_DEV_CARDS, AUI_DEV_PCMS, AUI_ABOUT, AUI_SURFACE_COUNT
+	AUI_FORMATS, AUI_SKINS, AUI_DEV_CARDS, AUI_DEV_PCMS,
+	AUI_ABOUT, AUI_SURFACE_COUNT
 };
 #define AUI_MAX_DEV_CARDS 16
 #define AUI_MAX_DEV_PCMS  24
-/* Approximate Y of the "ALSA device" row inside the context menu window. */
-#define AUI_DEV_ITEM_Y 289
+#define AUI_MAX_SKIN_MENU 24
+#define AUI_SKIN_MENU_ROW_H  15
+#define AUI_SKIN_MENU_BASE_H 30
+#define AUI_SKIN_MENU_MAX_H  (AUI_SKIN_MENU_BASE_H + AUI_MAX_SKIN_MENU * AUI_SKIN_MENU_ROW_H)
+/* Approximate row offsets inside the compact context menu window. */
+#define AUI_FMT_ITEM_Y   270
+#define AUI_DEV_ITEM_Y   285
+#define AUI_SKIN_ITEM_Y  315
 #define AUI_MENU_W 292
 #define AUI_MENU_H 432
 #define AUI_TEXT_SCALE_COUNT 4
@@ -1712,6 +1948,7 @@ typedef struct {
 	int kind, width, height;
 	float origin_x, origin_y;
 	int visible, dirty, dragging, resizing, playlist_thumb_dragging;
+	int equalizer_drag_control; /* -1, preamp=0, bands=1..10 */
 	double drag_x, drag_y;
 	double resize_screen_x, resize_screen_y;
 	int resize_width, resize_height;
@@ -1736,10 +1973,23 @@ static int g_dev_pcm_count = 0;
 static int g_dev_menu_card = -1;
 static int g_el_dc[AUI_MAX_DEV_CARDS];
 static int g_el_dp[AUI_MAX_DEV_PCMS];
+static int g_el_fm[9];
+static int g_el_fm_label[9];
+static int g_el_sk[AUI_MAX_SKIN_MENU];
+static int g_el_sk_label[AUI_MAX_SKIN_MENU];
+static int g_el_surface_skins = -1;
 static int g_el_pcm_heading = -1;
+static int g_el_skins_heading = -1;
 static int g_el_mi_dev = -1;
+static int g_el_mi_fmt = -1;
+static int g_el_mi_skin_next = -1;
 static int g_el_app = -1;
 static int g_el_mi_text = -1;
+static int g_skin_menu_first = 0;
+static int g_el_mi_skin_rand = -1;
+static int g_el_eq_power = -1, g_el_eq_status = -1;
+static int g_el_eq_knob[APLAY_EQ_BANDS + 1];
+static int g_el_surface_equalizer_cached = -1;
 static int g_text_scale = 2; /* 0 Classic .. 3 Extra; default Large */
 static const char *const g_text_scale_names[AUI_TEXT_SCALE_COUNT] = {
 	"Classic", "Comfortable", "Large", "Extra"
@@ -1749,8 +1999,14 @@ static const char *const g_text_scale_classes[AUI_TEXT_SCALE_COUNT] = {
 };
 
 static void aui_hide_context_menu(void);
+static void aui_set_menu_check(int idx, int on, const char *label);
 static void aui_hide_device_menus(void);
+static void aui_hide_format_skin_menus(void);
 static void aui_refresh_context_menu_labels(void);
+static void aui_refresh_format_menu(void);
+static void aui_refresh_skin_menu(void);
+static void aui_show_format_menu(void);
+static void aui_show_skin_menu(void);
 static void aui_show_device_card_menu(void);
 static void aui_show_device_pcm_menu(int card);
 static void aui_apply_prepared_skin_to_ui(void);
@@ -1774,6 +2030,130 @@ static void onToggleEq(LunaElement *e)       { (void)e; aui_set_surface_visible(
 static void onTogglePlaylist(LunaElement *e) { (void)e; aui_set_surface_visible(AUI_PLAYLIST, !g_surfaces[AUI_PLAYLIST].visible); }
 static void onHideEq(LunaElement *e)         { (void)e; aui_set_surface_visible(AUI_EQUALIZER, 0); }
 static void onHidePlaylist(LunaElement *e)   { (void)e; aui_set_surface_visible(AUI_PLAYLIST, 0); }
+
+static int aui_equalizer_is_flat(void)
+{
+	if (fabsf(aplay_equalizer_preamp()) > 0.001f) return 0;
+	for (int i = 0; i < APLAY_EQ_BANDS; ++i)
+		if (fabsf(aplay_equalizer_band(i)) > 0.001f) return 0;
+	return 1;
+}
+
+static void aui_set_eq_knob(int idx, float db)
+{
+	if (idx < 0) return;
+	if (db > 12.0f) db = 12.0f;
+	if (db < -12.0f) db = -12.0f;
+	int top = (int)lroundf((12.0f - db) * (55.0f / 24.0f));
+	LunaElement *e = luna_element_at(idx);
+	if (!e) return;
+	char style[32];
+	snprintf(style, sizeof(style), "top:%dpx;", top);
+	if (e->has_inline_style && !strcmp(e->inline_style, style)) return;
+	snprintf(e->inline_style, sizeof(e->inline_style), "%s", style);
+	e->has_inline_style = 1;
+	luna_update_element_style(idx);
+}
+
+static void aui_refresh_equalizer_ui(void)
+{
+	int enabled = aplay_equalizer_enabled();
+	int flat = aui_equalizer_is_flat();
+	if (g_el_eq_power >= 0) {
+		if (enabled) luna_add_class(g_el_eq_power, "on");
+		else luna_remove_class(g_el_eq_power, "on");
+	}
+	if (g_el_surface_equalizer_cached >= 0) {
+		if (!enabled || flat)
+			luna_add_class(g_el_surface_equalizer_cached, "eq-bypass");
+		else
+			luna_remove_class(g_el_surface_equalizer_cached, "eq-bypass");
+	}
+	if (g_el_eq_status >= 0) {
+		luna_set_text(g_el_eq_status,
+			!enabled ? "OFF · CODE BYPASS" :
+			(flat ? "ON · FLAT BYPASS" : "ON · 10-BAND DSP"));
+	}
+	aui_set_eq_knob(g_el_eq_knob[0], aplay_equalizer_preamp());
+	for (int i = 0; i < APLAY_EQ_BANDS; ++i)
+		aui_set_eq_knob(g_el_eq_knob[i + 1],
+		                aplay_equalizer_band(i));
+	aui_mark_surface_dirty(AUI_EQUALIZER);
+	aui_mark_surface_dirty(AUI_MENU);
+}
+
+static void aui_set_equalizer_note(const char *text)
+{
+	pthread_mutex_lock(&g_gui_lock);
+	snprintf(g_gui.note, sizeof(g_gui.note), "%s", text ? text : "");
+	gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+	pthread_mutex_unlock(&g_gui_lock);
+}
+
+static void onEqPower(LunaElement *e)
+{
+	(void)e;
+	int enabled = !aplay_equalizer_enabled();
+	aplay_equalizer_set_enabled(enabled);
+	aui_refresh_equalizer_ui();
+	aui_set_equalizer_note(enabled
+		? (aui_equalizer_is_flat()
+		   ? "Equalizer on · flat DSP bypass"
+		   : "Equalizer on")
+		: "Equalizer off · code bypass");
+}
+
+static void onEqReset(LunaElement *e)
+{
+	(void)e;
+	aplay_equalizer_reset();
+	aui_refresh_equalizer_ui();
+	aui_set_equalizer_note(aplay_equalizer_enabled()
+		? "Equalizer flat · DSP bypass"
+		: "Equalizer reset · off");
+}
+
+static int aui_equalizer_control_at(double lx, double ly)
+{
+	static const int left[APLAY_EQ_BANDS + 1] = {
+		18, 75, 93, 111, 129, 147, 165, 183, 201, 219, 237
+	};
+	if (ly < 35.0 || ly > 104.0) return -1;
+	for (int i = 0; i < APLAY_EQ_BANDS + 1; ++i)
+		if (lx >= left[i] - 2 && lx <= left[i] + 13)
+			return i;
+	return -1;
+}
+
+static void aui_equalizer_set_from_y(int control, double ly)
+{
+	if (control < 0 || control > APLAY_EQ_BANDS) return;
+	double t = (ly - 39.0) / 58.0;
+	if (t < 0.0) t = 0.0;
+	if (t > 1.0) t = 1.0;
+	float db = (float)(12.0 - t * 24.0);
+	db = roundf(db * 2.0f) * 0.5f;
+	if (control == 0) aplay_equalizer_set_preamp(db);
+	else aplay_equalizer_set_band(control - 1, db);
+	aui_refresh_equalizer_ui();
+
+	if (g_el_eq_status >= 0) {
+		char status[64], name[16];
+		if (control == 0) {
+			snprintf(name, sizeof(name), "PRE");
+		} else {
+			float hz = aplay_equalizer_frequency(control - 1);
+			if (hz >= 1000.0f)
+				snprintf(name, sizeof(name), "%.0fK", hz / 1000.0f);
+			else
+				snprintf(name, sizeof(name), "%.0f", hz);
+		}
+		snprintf(status, sizeof(status), "%s · %+.1f dB%s",
+		         name, db,
+		         aplay_equalizer_enabled() ? "" : " · OFF");
+		luna_set_text(g_el_eq_status, status);
+	}
+}
 
 static void aui_menu_run(void (*fn)(LunaElement *), LunaElement *e)
 {
@@ -1812,7 +2192,16 @@ static void onMenuXtcDown(LunaElement *e)
 static void onMenuDsd(LunaElement *e)       { aui_menu_run(onDsd, e); }
 static void onMenuSr(LunaElement *e)        { aui_menu_run(onSr, e); }
 static void onMenuLoop(LunaElement *e)      { aui_menu_run(onLoop, e); }
-static void onMenuFmt(LunaElement *e)       { aui_menu_run(onFmt, e); }
+static void onMenuFmt(LunaElement *e)
+{
+	(void)e;
+	aui_show_format_menu();
+}
+static void onMenuSkins(LunaElement *e)
+{
+	(void)e;
+	aui_show_skin_menu();
+}
 static void onMenuDevice(LunaElement *e)
 {
 	(void)e;
@@ -1848,7 +2237,9 @@ static void onMenuTextSize(LunaElement *e)
 
 static int aui_is_popup_surface(int kind)
 {
-	return kind == AUI_MENU || kind == AUI_DEV_CARDS || kind == AUI_DEV_PCMS || kind == AUI_ABOUT;
+	return kind == AUI_MENU || kind == AUI_FORMATS ||
+	       kind == AUI_SKINS || kind == AUI_DEV_CARDS ||
+	       kind == AUI_DEV_PCMS || kind == AUI_ABOUT;
 }
 
 static void aui_hide_device_menus(void)
@@ -1860,11 +2251,56 @@ static void aui_hide_device_menus(void)
 	g_dev_menu_card = -1;
 }
 
+static void aui_hide_format_skin_menus(void)
+{
+	if (g_surfaces[AUI_FORMATS].window && g_surfaces[AUI_FORMATS].visible)
+		aui_set_surface_visible(AUI_FORMATS, 0);
+	if (g_surfaces[AUI_SKINS].window && g_surfaces[AUI_SKINS].visible)
+		aui_set_surface_visible(AUI_SKINS, 0);
+}
+
 static void aui_set_slot_visible(int idx, int on)
 {
 	if (idx < 0) return;
 	if (on) luna_add_class(idx, "ctx-show");
 	else luna_remove_class(idx, "ctx-show");
+}
+
+/* The skin flyout contains a fixed pool of hidden rows.  Keep both its DOM
+ * box and native GLFW window only as tall as the rows currently in use, so a
+ * small skin pack does not leave a large empty submenu below its contents. */
+static void aui_resize_skin_menu_to_content(void)
+{
+	int rows = g_skin_pack_count;
+	if (rows < 0) rows = 0;
+	if (rows > AUI_MAX_SKIN_MENU) rows = AUI_MAX_SKIN_MENU;
+	int height = AUI_SKIN_MENU_BASE_H + rows * AUI_SKIN_MENU_ROW_H;
+	if (height > AUI_SKIN_MENU_MAX_H) height = AUI_SKIN_MENU_MAX_H;
+
+	if (g_el_surface_skins >= 0) {
+		LunaElement *e = luna_element_at(g_el_surface_skins);
+		if (e) {
+			char style[40];
+			snprintf(style, sizeof(style), "height:%dpx;", height);
+			snprintf(e->inline_style, sizeof(e->inline_style), "%s", style);
+			e->has_inline_style = 1;
+			luna_update_element_style(g_el_surface_skins);
+		}
+	}
+
+	AuiSurface *surface = &g_surfaces[AUI_SKINS];
+	if (surface->height == height) {
+		aui_mark_surface_dirty(AUI_SKINS);
+		return;
+	}
+	surface->height = height;
+	if (surface->window)
+		glfwSetWindowSize(surface->window, surface->width, surface->height);
+	if (surface->context && g_el_surface_skins >= 0)
+		luna_context_set_region(surface->context, g_el_surface_skins,
+			surface->origin_x, surface->origin_y,
+			(float)surface->width, (float)surface->height);
+	aui_mark_surface_dirty(AUI_SKINS);
 }
 
 static void aui_position_flyout(int kind, int anchor_kind, int y_offset)
@@ -1878,6 +2314,137 @@ static void aui_position_flyout(int kind, int anchor_kind, int y_offset)
 	int y = ay + y_offset;
 	if (y < 0) y = 0;
 	glfwSetWindowPos(g_surfaces[kind].window, x, y);
+}
+
+static void aui_refresh_format_menu(void)
+{
+	static const char *const labels[9] = {
+		"All supported files", "FLAC", "MP3", "M4A / AAC",
+		"OGG", "WAV", "WMA", "DSF", "DFF"
+	};
+	int current = fmt_filter_idx;
+	if (current < 0 || current >= fmt_cycle_n) current = 0;
+
+	for (int i = 0; i < 9; ++i) {
+		if (g_el_fm[i] < 0) continue;
+		char shown[64];
+		snprintf(shown, sizeof(shown), "%s%s",
+		         i == current ? "\xE2\x9C\x93 " : "  ", labels[i]);
+		if (g_el_fm_label[i] >= 0)
+			luna_set_text(g_el_fm_label[i], shown);
+		if (i == current) luna_add_class(g_el_fm[i], "checked");
+		else luna_remove_class(g_el_fm[i], "checked");
+	}
+	if (g_el_mi_fmt >= 0) {
+		char parent[72];
+		snprintf(parent, sizeof(parent), "Format filter · %s",
+		         current == 0 ? "ALL" : labels[current]);
+		luna_set_text(g_el_mi_fmt, parent);
+	}
+	aui_mark_surface_dirty(AUI_FORMATS);
+}
+
+static const char *aui_skin_short_name(const char *path)
+{
+	const char *base;
+	if (!path || !path[0]) return "";
+	base = strrchr(path, '/');
+	return base ? base + 1 : path;
+}
+
+static void aui_refresh_skin_menu(void)
+{
+	aui_resize_skin_menu_to_content();
+	int max_first = g_skin_pack_count > AUI_MAX_SKIN_MENU
+		? g_skin_pack_count - AUI_MAX_SKIN_MENU : 0;
+	if (g_skin_menu_first < 0) g_skin_menu_first = 0;
+	if (g_skin_menu_first > max_first) g_skin_menu_first = max_first;
+
+	if (g_el_skins_heading >= 0) {
+		char heading[96];
+		if (g_skin_pack_count > 0) {
+			int last = g_skin_menu_first + AUI_MAX_SKIN_MENU;
+			if (last > g_skin_pack_count) last = g_skin_pack_count;
+			snprintf(heading, sizeof(heading), "Skin files · %d–%d / %d",
+			         g_skin_menu_first + 1, last, g_skin_pack_count);
+		} else {
+			snprintf(heading, sizeof(heading), "Skin files · none");
+		}
+		luna_set_text(g_el_skins_heading, heading);
+	}
+
+	for (int row = 0; row < AUI_MAX_SKIN_MENU; ++row) {
+		int idx = g_skin_menu_first + row;
+		if (idx < g_skin_pack_count) {
+			const char *base = aui_skin_short_name(g_skin_pack[idx]);
+			char shown[PATH_MAX > 320 ? 320 : PATH_MAX];
+			int current = idx == g_skin_pack_idx;
+			snprintf(shown, sizeof(shown), "%s%s",
+			         current ? "\xE2\x9C\x93 " : "  ", base);
+			if (g_el_sk_label[row] >= 0)
+				luna_set_text(g_el_sk_label[row], shown);
+			if (current) luna_add_class(g_el_sk[row], "checked");
+			else luna_remove_class(g_el_sk[row], "checked");
+			aui_set_slot_visible(g_el_sk[row], 1);
+		} else {
+			if (g_el_sk_label[row] >= 0)
+				luna_set_text(g_el_sk_label[row], "");
+			luna_remove_class(g_el_sk[row], "checked");
+			aui_set_slot_visible(g_el_sk[row], 0);
+		}
+	}
+
+	if (g_el_mi_skin_next >= 0) {
+		char parent[128];
+		const char *current;
+		if (g_skin_pack_idx >= 0 &&
+		    g_skin_pack_idx < g_skin_pack_count)
+			current = aui_skin_short_name(
+				g_skin_pack[g_skin_pack_idx]);
+		else if (g_skin.source[0] &&
+		         strstr(g_skin.source, "Ember") == NULL)
+			current = aui_skin_short_name(g_skin.source);
+		else
+			current = "Built-in Ember";
+		snprintf(parent, sizeof(parent), "Next skin · %s", current);
+		luna_set_text(g_el_mi_skin_next, parent);
+	}
+	if (g_el_mi_skin_rand >= 0)
+		aui_set_menu_check(g_el_mi_skin_rand,
+			g_skin_random && g_skin_pack_count > 0,
+			"Random skin / track");
+	aui_mark_surface_dirty(AUI_MENU);
+	aui_mark_surface_dirty(AUI_SKINS);
+}
+
+static void aui_show_format_menu(void)
+{
+	if (g_surfaces[AUI_FORMATS].visible) {
+		aui_set_surface_visible(AUI_FORMATS, 0);
+		return;
+	}
+	aui_hide_device_menus();
+	if (g_surfaces[AUI_SKINS].visible)
+		aui_set_surface_visible(AUI_SKINS, 0);
+	aui_refresh_format_menu();
+	aui_position_flyout(AUI_FORMATS, AUI_MENU, AUI_FMT_ITEM_Y);
+	aui_set_surface_visible(AUI_FORMATS, 1);
+	glfwFocusWindow(g_surfaces[AUI_FORMATS].window);
+}
+
+static void aui_show_skin_menu(void)
+{
+	if (g_surfaces[AUI_SKINS].visible) {
+		aui_set_surface_visible(AUI_SKINS, 0);
+		return;
+	}
+	aui_hide_device_menus();
+	if (g_surfaces[AUI_FORMATS].visible)
+		aui_set_surface_visible(AUI_FORMATS, 0);
+	aui_refresh_skin_menu();
+	aui_position_flyout(AUI_SKINS, AUI_MENU, AUI_SKIN_ITEM_Y);
+	aui_set_surface_visible(AUI_SKINS, 1);
+	glfwFocusWindow(g_surfaces[AUI_SKINS].window);
 }
 
 static void aui_show_device_pcm_menu(int card)
@@ -1943,6 +2510,7 @@ static void aui_show_device_pcm_menu(int card)
 
 static void aui_show_device_card_menu(void)
 {
+	aui_hide_format_skin_menus();
 	aplay_refresh_devices();
 	g_dev_card_count = aplay_device_unique_cards(g_dev_card_ids, AUI_MAX_DEV_CARDS);
 	if (g_dev_card_count <= 0) {
@@ -2044,6 +2612,33 @@ static void aui_request_skin_path(const char *path)
 	g_pending_skin_reload = 1;
 }
 
+static void onFmtItem(LunaElement *e)
+{
+	if (!e || strncmp(e->id, "fm", 2) != 0) return;
+	char *end = NULL;
+	long row = strtol(e->id + 2, &end, 10);
+	if (!end || *end || row < 0 || row >= fmt_cycle_n) return;
+	__atomic_store_n(&g_format_select_idx, (int)row,
+	                 __ATOMIC_SEQ_CST);
+	/* Wake paused playback as well; key() consumes the exact request first. */
+	gui_inject_key('f');
+	aui_hide_context_menu();
+}
+
+static void onSkinItem(LunaElement *e)
+{
+	if (!e || strncmp(e->id, "sk", 2) != 0) return;
+	char *end = NULL;
+	long row = strtol(e->id + 2, &end, 10);
+	if (!end || *end || row < 0 || row >= AUI_MAX_SKIN_MENU) return;
+	int idx = g_skin_menu_first + (int)row;
+	if (idx < 0 || idx >= g_skin_pack_count) return;
+	g_skin_random = 0;
+	g_skin_pack_idx = idx;
+	aui_request_skin_path(g_skin_pack[idx]);
+	aui_hide_context_menu();
+}
+
 static int aui_pick_directory(const char *title, char *out, size_t out_n)
 {
 	if (!out || out_n == 0) return 0;
@@ -2095,25 +2690,12 @@ static void onSkinRandom(LunaElement *e)
 	pthread_mutex_unlock(&g_gui_lock);
 }
 
-static void onSkinNext(LunaElement *e)
-{
-	(void)e;
-	aui_hide_context_menu();
-	const char *pick = skin_pack_pick(1);
-	if (!pick) {
-		pthread_mutex_lock(&g_gui_lock);
-		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "No skins in pack");
-		gui_mark_dirty_locked(GUI_DIRTY_NOTE);
-		pthread_mutex_unlock(&g_gui_lock);
-		return;
-	}
-	aui_request_skin_path(pick);
-}
-
 static void onSkinBuiltin(LunaElement *e)
 {
 	(void)e;
 	aui_hide_context_menu();
+	g_skin_random = 0;
+	g_skin_pack_idx = -1;
 	g_pending_skin_path[0] = '\0';
 	g_pending_skin_reload = 2; /* 2 = builtin */
 }
@@ -2131,6 +2713,7 @@ static void onSkinFolder(LunaElement *e)
 		pthread_mutex_unlock(&g_gui_lock);
 		return;
 	}
+	g_skin_menu_first = 0;
 	if (scan_skins_folder(chosen) <= 0) {
 		pthread_mutex_lock(&g_gui_lock);
 		snprintf(g_gui.note, sizeof(g_gui.note), "%s", "No skins in that folder");
@@ -2235,6 +2818,7 @@ static void onAbout(LunaElement *e)
 static void aui_hide_context_menu(void)
 {
 	aui_hide_device_menus();
+	aui_hide_format_skin_menus();
 	if (g_surfaces[AUI_MENU].window && g_surfaces[AUI_MENU].visible)
 		aui_set_surface_visible(AUI_MENU, 0);
 }
@@ -2254,7 +2838,7 @@ static void aui_set_menu_check(int idx, int on, const char *label)
 
 static int g_el_mi_xtc = -1, g_el_mi_xtc_up = -1, g_el_mi_xtc_dn = -1;
 static int g_el_mi_dsd = -1, g_el_mi_sr = -1, g_el_mi_loop = -1;
-static int g_el_mi_skin_rand = -1, g_el_mi_eq = -1, g_el_mi_pl = -1;
+static int g_el_mi_eq = -1, g_el_mi_pl = -1;
 static int g_el_mi_volup = -1, g_el_mi_voldn = -1;
 
 static void aui_refresh_context_menu_labels(void)
@@ -2289,9 +2873,21 @@ static void aui_refresh_context_menu_labels(void)
 	aui_set_menu_check(g_el_mi_dsd, dsd, "DSD (DoP)");
 	aui_set_menu_check(g_el_mi_sr, sr, "Super resolution");
 	aui_set_menu_check(g_el_mi_loop, loop, "Repeat playlist");
-	aui_set_menu_check(g_el_mi_skin_rand, g_skin_random && g_skin_pack_count > 0, "Random skin / track");
-	aui_set_menu_check(g_el_mi_eq, g_surfaces[AUI_EQUALIZER].visible, "Equalizer");
+	aui_set_menu_check(g_el_mi_skin_rand,
+		g_skin_random && g_skin_pack_count > 0,
+		"Random skin / track");
+	{
+		char eq_label[96];
+		snprintf(eq_label, sizeof(eq_label), "Equalizer window · %s",
+			aplay_equalizer_enabled()
+			? (aui_equalizer_is_flat() ? "flat bypass" : "DSP on")
+			: "DSP off");
+		aui_set_menu_check(g_el_mi_eq,
+			g_surfaces[AUI_EQUALIZER].visible, eq_label);
+	}
 	aui_set_menu_check(g_el_mi_pl, g_surfaces[AUI_PLAYLIST].visible, "Playlist editor");
+	aui_refresh_format_menu();
+	aui_refresh_skin_menu();
 	if (g_el_mi_dev >= 0) {
 		pthread_mutex_lock(&g_gui_lock);
 		char cur[80];
@@ -2314,6 +2910,8 @@ static void aui_refresh_context_menu_labels(void)
 static void aui_show_context_menu(AuiSurface *from, double lx, double ly)
 {
 	if (!g_surfaces[AUI_MENU].window) return;
+	aui_hide_device_menus();
+	aui_hide_format_skin_menus();
 	aui_refresh_context_menu_labels();
 	int wx = 0, wy = 0, ww = 0, wh = 0;
 	glfwGetWindowPos(from->window, &wx, &wy);
@@ -2344,6 +2942,12 @@ static void aui_apply_prepared_skin_to_ui(void)
 	 * current text-size class so controls stay clickable and readable. */
 	luna_wire_onclick_handlers();
 	aui_apply_text_scale();
+	aui_refresh_equalizer_ui();
+	aui_refresh_format_menu();
+	aui_refresh_skin_menu();
+	/* A skin switch changes textures and recomputes every style. Ensure all
+	 * surface contexts redraw before accepting the next interaction. */
+	aui_mark_all_surfaces_dirty();
 	pthread_mutex_lock(&g_gui_lock);
 	snprintf(g_gui.note, sizeof(g_gui.note), "Skin: %s", g_skin.source);
 	gui_mark_dirty_locked(GUI_DIRTY_NOTE);
@@ -2381,7 +2985,8 @@ static int g_el_badge_codec = -1, g_el_badge_rate = -1, g_el_badge_state = -1;
 static int g_el_progress_fill = -1, g_el_time_cur = -1, g_el_time_total = -1, g_el_track_count = -1;
 static int g_el_vol_fill = -1, g_el_vol_value = -1, g_el_note = -1;
 static int g_el_surface_main = -1, g_el_surface_equalizer = -1, g_el_surface_playlist = -1;
-static int g_el_surface_menu = -1, g_el_surface_dev_cards = -1, g_el_surface_dev_pcms = -1;
+static int g_el_surface_menu = -1, g_el_surface_formats = -1;
+static int g_el_surface_dev_cards = -1, g_el_surface_dev_pcms = -1;
 static int g_el_surface_about = -1;
 static int g_el_playlist_thumb = -1;
 static int g_el_playlist_rows[13];
@@ -2437,13 +3042,46 @@ static void gui_cache_elements(void)
 	g_el_surface_equalizer = luna_get_element_by_id("surface-equalizer");
 	g_el_surface_playlist = luna_get_element_by_id("surface-playlist");
 	g_el_surface_menu = luna_get_element_by_id("surface-menu");
+	g_el_surface_formats = luna_get_element_by_id("surface-formats");
+	g_el_surface_skins = luna_get_element_by_id("surface-skins");
 	g_el_surface_dev_cards = luna_get_element_by_id("surface-dev-cards");
 	g_el_surface_dev_pcms = luna_get_element_by_id("surface-dev-pcms");
 	g_el_surface_about = luna_get_element_by_id("surface-about");
 	g_el_playlist_thumb = luna_get_element_by_id("playlist-thumb");
 	g_el_pcm_heading = luna_get_element_by_id("pcm-heading");
+	g_el_skins_heading = luna_get_element_by_id("skins-heading");
 	g_el_mi_dev = luna_get_element_by_id("mi-dev-lbl");
+	g_el_mi_fmt = luna_get_element_by_id("mi-fmt-lbl");
+	g_el_mi_skin_next = luna_get_element_by_id("mi-skin-next-lbl");
+
+	/* Cache dynamic format/skin submenu rows during normal DOM setup.
+	 * These IDs must be available before the first menu refresh; previously
+	 * they were cached only after opening the ALSA-device submenu, leaving
+	 * Format filter and Next skin labels blank. */
+	for (int i = 0; i < 9; ++i) {
+		char id[16];
+		snprintf(id, sizeof(id), "fm%d", i);
+		g_el_fm[i] = luna_get_element_by_id(id);
+		snprintf(id, sizeof(id), "fm%d-lbl", i);
+		g_el_fm_label[i] = luna_get_element_by_id(id);
+	}
+	for (int i = 0; i < AUI_MAX_SKIN_MENU; ++i) {
+		char id[16];
+		snprintf(id, sizeof(id), "sk%d", i);
+		g_el_sk[i] = luna_get_element_by_id(id);
+		snprintf(id, sizeof(id), "sk%d-lbl", i);
+		g_el_sk_label[i] = luna_get_element_by_id(id);
+	}
+
 	g_el_app = luna_get_element_by_id("app");
+	g_el_eq_power = luna_get_element_by_id("eq-power");
+	g_el_eq_status = luna_get_element_by_id("eq-status");
+	g_el_surface_equalizer_cached = g_el_surface_equalizer;
+	for (int i = 0; i < APLAY_EQ_BANDS + 1; ++i) {
+		char id[12];
+		snprintf(id, sizeof(id), "eqk%d", i);
+		g_el_eq_knob[i] = luna_get_element_by_id(id);
+	}
 	g_el_mi_text = luna_get_element_by_id("mi-text-lbl");
 	for (int i = 0; i < AUI_MAX_DEV_CARDS; i++) {
 		char id[8];
@@ -2696,6 +3334,69 @@ static void aui_logical_cursor(AuiSurface *surface, double x, double y,
 	*logical_y = wh > 0 ? y * surface->height / wh : y;
 }
 
+/* The classic main-panel controls always occupy the same logical rectangles.
+ * Handle them natively instead of depending solely on Luna's cached hit tree:
+ * luna_reset_css() is used during live skin changes, and a stale press/hit
+ * cache must never make the transport controls stop responding. */
+enum {
+	AUI_MAIN_CTL_NONE = -1,
+	AUI_MAIN_CTL_PREV,
+	AUI_MAIN_CTL_PLAY,
+	AUI_MAIN_CTL_PAUSE,
+	AUI_MAIN_CTL_STOP,
+	AUI_MAIN_CTL_NEXT,
+	AUI_MAIN_CTL_EJECT,
+	AUI_MAIN_CTL_EQ,
+	AUI_MAIN_CTL_PLAYLIST,
+	AUI_MAIN_CTL_CLOSE
+};
+
+static int aui_point_in_rect(double x, double y,
+	double left, double top, double width, double height)
+{
+	return x >= left && x < left + width &&
+	       y >= top && y < top + height;
+}
+
+static int aui_main_control_at(double lx, double ly)
+{
+	if (aui_point_in_rect(lx, ly, 264.0, 3.0, 9.0, 9.0))
+		return AUI_MAIN_CTL_CLOSE;
+	if (aui_point_in_rect(lx, ly, 219.0, 58.0, 22.0, 12.0))
+		return AUI_MAIN_CTL_EQ;
+	if (aui_point_in_rect(lx, ly, 242.0, 58.0, 22.0, 12.0))
+		return AUI_MAIN_CTL_PLAYLIST;
+	if (aui_point_in_rect(lx, ly, 16.0, 88.0, 23.0, 18.0))
+		return AUI_MAIN_CTL_PREV;
+	if (aui_point_in_rect(lx, ly, 39.0, 88.0, 23.0, 18.0))
+		return AUI_MAIN_CTL_PLAY;
+	if (aui_point_in_rect(lx, ly, 62.0, 88.0, 23.0, 18.0))
+		return AUI_MAIN_CTL_PAUSE;
+	if (aui_point_in_rect(lx, ly, 85.0, 88.0, 23.0, 18.0))
+		return AUI_MAIN_CTL_STOP;
+	if (aui_point_in_rect(lx, ly, 108.0, 88.0, 22.0, 18.0))
+		return AUI_MAIN_CTL_NEXT;
+	if (aui_point_in_rect(lx, ly, 136.0, 88.0, 22.0, 18.0))
+		return AUI_MAIN_CTL_EJECT;
+	return AUI_MAIN_CTL_NONE;
+}
+
+static void aui_activate_main_control(int control)
+{
+	switch (control) {
+	case AUI_MAIN_CTL_PREV:     onPrev(NULL); break;
+	case AUI_MAIN_CTL_PLAY:
+	case AUI_MAIN_CTL_PAUSE:    onPlayPause(NULL); break;
+	case AUI_MAIN_CTL_STOP:     onStop(NULL); break;
+	case AUI_MAIN_CTL_NEXT:     onNext(NULL); break;
+	case AUI_MAIN_CTL_EJECT:    onFmt(NULL); break;
+	case AUI_MAIN_CTL_EQ:       onToggleEq(NULL); break;
+	case AUI_MAIN_CTL_PLAYLIST: onTogglePlaylist(NULL); break;
+	case AUI_MAIN_CTL_CLOSE:    onQuit(NULL); break;
+	default: break;
+	}
+}
+
 static int aui_ranges_overlap(int a0, int a1, int b0, int b1)
 {
 	return a0 < b1 + 1 && b0 < a1 + 1;
@@ -2749,12 +3450,64 @@ static void aui_snap_window(AuiSurface *surface, int *x, int *y)
 	}
 }
 
+static int aui_windows_touch_vertically(int upper_kind, int lower_kind)
+{
+	AuiSurface *upper = &g_surfaces[upper_kind];
+	AuiSurface *lower = &g_surfaces[lower_kind];
+	if (!upper->window || !lower->window || !lower->visible) return 0;
+	int ux, uy, uw, uh, lx, ly;
+	glfwGetWindowPos(upper->window, &ux, &uy);
+	glfwGetWindowSize(upper->window, &uw, &uh);
+	glfwGetWindowPos(lower->window, &lx, &ly);
+	(void)uw;
+	return abs(lx - ux) <= 3 && abs(ly - (uy + uh)) <= 3;
+}
+
+static void aui_move_attached_windows(AuiSurface *surface,
+				      int old_x, int old_y, int new_x, int new_y)
+{
+	int dx = new_x - old_x, dy = new_y - old_y;
+	if ((dx == 0 && dy == 0) || !surface) return;
+
+	if (surface->kind == AUI_MAIN) {
+		int eq_attached = aui_windows_touch_vertically(AUI_MAIN, AUI_EQUALIZER);
+		int pl_under_eq = aui_windows_touch_vertically(AUI_EQUALIZER, AUI_PLAYLIST);
+		int pl_under_main = aui_windows_touch_vertically(AUI_MAIN, AUI_PLAYLIST);
+		if (eq_attached) {
+			int x, y;
+			glfwGetWindowPos(g_surfaces[AUI_EQUALIZER].window, &x, &y);
+			glfwSetWindowPos(g_surfaces[AUI_EQUALIZER].window, x + dx, y + dy);
+		}
+		if ((eq_attached && pl_under_eq) || (!eq_attached && pl_under_main)) {
+			int x, y;
+			glfwGetWindowPos(g_surfaces[AUI_PLAYLIST].window, &x, &y);
+			glfwSetWindowPos(g_surfaces[AUI_PLAYLIST].window, x + dx, y + dy);
+		}
+	} else if (surface->kind == AUI_EQUALIZER &&
+		   aui_windows_touch_vertically(AUI_EQUALIZER, AUI_PLAYLIST)) {
+		int x, y;
+		glfwGetWindowPos(g_surfaces[AUI_PLAYLIST].window, &x, &y);
+		glfwSetWindowPos(g_surfaces[AUI_PLAYLIST].window, x + dx, y + dy);
+	}
+}
+
 static void aui_cursor_pos_cb(GLFWwindow *w, double x, double y)
 {
 	AuiSurface *surface = glfwGetWindowUserPointer(w);
 	if (!surface) return;
 	aui_mark_surface_dirty(surface->kind);
 	g_luna_glfw_window = w;
+	if (surface->kind == AUI_EQUALIZER &&
+	    surface->equalizer_drag_control >= 0) {
+		double lx, ly;
+		aui_logical_cursor(surface, x, y, &lx, &ly);
+		aui_equalizer_set_from_y(surface->equalizer_drag_control, ly);
+		if (g_cursor_vresize) {
+			glfwSetCursor(w, g_cursor_vresize);
+			g_current_cursor = -1;
+		}
+		return;
+	}
 	if (surface->resizing) {
 		int wx, wy;
 		glfwGetWindowPos(w, &wx, &wy);
@@ -2777,6 +3530,7 @@ static void aui_cursor_pos_cb(GLFWwindow *w, double x, double y)
 		int nx = (int)lround(wx + x - surface->drag_x);
 		int ny = (int)lround(wy + y - surface->drag_y);
 		aui_snap_window(surface, &nx, &ny);
+		aui_move_attached_windows(surface, wx, wy, nx, ny);
 		glfwSetWindowPos(w, nx, ny);
 		return;
 	}
@@ -2797,6 +3551,11 @@ static void aui_cursor_pos_cb(GLFWwindow *w, double x, double y)
 	 * next non-corner move reapplies pointer/default correctly. */
 	if (g_resize_cursor && x >= ww - 10.0 && y >= wh - 10.0) {
 		glfwSetCursor(w, g_resize_cursor);
+		g_current_cursor = -1;
+	} else if (surface->kind == AUI_EQUALIZER &&
+	           aui_equalizer_control_at(lx, ly) >= 0 &&
+	           g_cursor_vresize) {
+		glfwSetCursor(w, g_cursor_vresize);
 		g_current_cursor = -1;
 	} else if (surface->kind == AUI_PLAYLIST && ly >= 0.0 && ly < 14.0 && lx < 260.0) {
 		/* Title strip is used for window dragging. */
@@ -2821,11 +3580,24 @@ static void aui_mouse_button_cb(GLFWwindow *w, int button, int action, int mods)
 	}
 	if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS &&
 	    !aui_is_popup_surface(surface->kind) &&
-	    (g_surfaces[AUI_MENU].visible || g_surfaces[AUI_DEV_CARDS].visible ||
+	    (g_surfaces[AUI_MENU].visible || g_surfaces[AUI_FORMATS].visible ||
+	     g_surfaces[AUI_SKINS].visible || g_surfaces[AUI_DEV_CARDS].visible ||
 	     g_surfaces[AUI_DEV_PCMS].visible)) {
 		aui_hide_context_menu();
 	}
 	if (button == GLFW_MOUSE_BUTTON_LEFT) {
+		/* Consume both press and release over fixed main-panel controls. The
+		 * action fires on press, while the matching release is intentionally
+		 * kept away from any stale Luna pressed-element state after CSS reload. */
+		if (surface->kind == AUI_MAIN) {
+			int control = aui_main_control_at(lx, ly);
+			if (control != AUI_MAIN_CTL_NONE) {
+				if (action == GLFW_PRESS)
+					aui_activate_main_control(control);
+				return;
+			}
+		}
+
 		int ww, wh;
 		glfwGetWindowSize(w, &ww, &wh);
 		if (action == GLFW_PRESS && !aui_is_popup_surface(surface->kind) &&
@@ -2845,6 +3617,14 @@ static void aui_mouse_button_cb(GLFWwindow *w, int button, int action, int mods)
 			gui_scroll_playlist_to_fraction((ly - 23.0) / 168.0);
 			return;
 		}
+		if (surface->kind == AUI_EQUALIZER && action == GLFW_PRESS) {
+			int control = aui_equalizer_control_at(lx, ly);
+			if (control >= 0) {
+				surface->equalizer_drag_control = control;
+				aui_equalizer_set_from_y(control, ly);
+				return;
+			}
+		}
 		/* Native Winamp title strip: the skin starts at the window's origin
 		 * and is rendered at its original 1x size. */
 		if (action == GLFW_PRESS && !aui_is_popup_surface(surface->kind) &&
@@ -2854,10 +3634,16 @@ static void aui_mouse_button_cb(GLFWwindow *w, int button, int action, int mods)
 			surface->drag_y = y;
 			return;
 		}
-		if (action == GLFW_RELEASE && (surface->dragging || surface->resizing || surface->playlist_thumb_dragging)) {
+		if (action == GLFW_RELEASE &&
+		    (surface->dragging || surface->resizing ||
+		     surface->playlist_thumb_dragging ||
+		     surface->equalizer_drag_control >= 0)) {
 			surface->dragging = 0;
 			surface->resizing = 0;
 			surface->playlist_thumb_dragging = 0;
+			surface->equalizer_drag_control = -1;
+			if (surface->kind == AUI_EQUALIZER)
+				aui_refresh_equalizer_ui();
 			return;
 		}
 		/* Direct file-list hit: bypass luna press-scale click matching. */
@@ -2876,8 +3662,15 @@ static void aui_scroll_cb(GLFWwindow *w, double xo, double yo)
 	AuiSurface *surface = glfwGetWindowUserPointer(w);
 	if (!surface) return;
 	aui_mark_surface_dirty(surface->kind);
-	if (surface->kind == AUI_PLAYLIST && yo != 0.0)
+	if (surface->kind == AUI_PLAYLIST && yo != 0.0) {
 		gui_scroll_playlist(yo > 0.0 ? -3 : 3);
+	} else if (surface->kind == AUI_SKINS && yo != 0.0 &&
+	           g_skin_pack_count > AUI_MAX_SKIN_MENU) {
+		int step = yo > 0.0 ? -AUI_MAX_SKIN_MENU :
+		                         AUI_MAX_SKIN_MENU;
+		g_skin_menu_first += step;
+		aui_refresh_skin_menu();
+	}
 	luna_context_scroll(surface->context, xo, yo);
 }
 static void aui_key_cb(GLFWwindow *w, int key, int sc, int act, int mods)
@@ -2954,7 +3747,8 @@ static void aui_key_cb(GLFWwindow *w, int key, int sc, int act, int mods)
 			aui_hide_about();
 			break;
 		}
-		if (g_surfaces[AUI_MENU].visible || g_surfaces[AUI_DEV_CARDS].visible ||
+		if (g_surfaces[AUI_MENU].visible || g_surfaces[AUI_FORMATS].visible ||
+		    g_surfaces[AUI_SKINS].visible || g_surfaces[AUI_DEV_CARDS].visible ||
 		    g_surfaces[AUI_DEV_PCMS].visible) {
 			aui_hide_context_menu();
 			break;
@@ -2990,6 +3784,11 @@ static void aui_glfw_error_cb(int error, const char *description)   { fprintf(st
 
 static void gui_run(void)
 {
+	/* The classic EQ window is visible at startup, but DSP starts completely
+	 * disabled and flat so all audio routes retain their original fast path. */
+	aplay_equalizer_reset();
+	aplay_equalizer_set_enabled(0);
+
 	if (g_skins_folder_arg && g_skins_folder_arg[0]) {
 		if (scan_skins_folder(g_skins_folder_arg) > 0) {
 			snprintf(g_skins_folder, sizeof(g_skins_folder), "%s", g_skins_folder_arg);
@@ -3039,14 +3838,20 @@ static void gui_run(void)
 	g_surfaces[AUI_EQUALIZER] = (AuiSurface){ .kind=AUI_EQUALIZER, .width=275, .height=116, .origin_x=300, .origin_y=0, .visible=1, .dirty=1 };
 	g_surfaces[AUI_PLAYLIST] = (AuiSurface){ .kind=AUI_PLAYLIST, .width=275, .height=232, .origin_x=600, .origin_y=0, .visible=1, .dirty=1 };
 	g_surfaces[AUI_MENU] = (AuiSurface){ .kind=AUI_MENU, .width=AUI_MENU_W, .height=AUI_MENU_H, .origin_x=0, .origin_y=250, .visible=0, .dirty=1 };
+	g_surfaces[AUI_FORMATS] = (AuiSurface){ .kind=AUI_FORMATS, .width=220, .height=164, .origin_x=302, .origin_y=550, .visible=0, .dirty=1 };
+	g_surfaces[AUI_SKINS] = (AuiSurface){ .kind=AUI_SKINS, .width=300, .height=AUI_SKIN_MENU_MAX_H, .origin_x=532, .origin_y=550, .visible=0, .dirty=1 };
 	g_surfaces[AUI_DEV_CARDS] = (AuiSurface){ .kind=AUI_DEV_CARDS, .width=240, .height=280, .origin_x=302, .origin_y=250, .visible=0, .dirty=1 };
 	g_surfaces[AUI_DEV_PCMS] = (AuiSurface){ .kind=AUI_DEV_PCMS, .width=240, .height=280, .origin_x=552, .origin_y=250, .visible=0, .dirty=1 };
 	g_surfaces[AUI_ABOUT] = (AuiSurface){ .kind=AUI_ABOUT, .width=340, .height=380, .origin_x=520, .origin_y=680, .visible=0, .dirty=1 };
+	for (int i = 0; i < AUI_SURFACE_COUNT; ++i)
+		g_surfaces[i].equalizer_drag_control = -1;
 	const char *titles[AUI_SURFACE_COUNT] = {
 		"aplay+ — player",
 		"aplay+ — equalizer",
 		"aplay+ — playlist",
 		"aplay+ — menu",
+		"aplay+ — format filter",
+		"aplay+ — skins",
 		"aplay+ — sound cards",
 		"aplay+ — devices",
 		"aplay+ — about"
@@ -3067,6 +3872,7 @@ static void gui_run(void)
 	}
 	if (!g_surfaces[AUI_MAIN].window || !g_surfaces[AUI_EQUALIZER].window ||
 	    !g_surfaces[AUI_PLAYLIST].window || !g_surfaces[AUI_MENU].window ||
+	    !g_surfaces[AUI_FORMATS].window || !g_surfaces[AUI_SKINS].window ||
 	    !g_surfaces[AUI_DEV_CARDS].window || !g_surfaces[AUI_DEV_PCMS].window ||
 	    !g_surfaces[AUI_ABOUT].window) {
 		fprintf(stderr, "aplay+ui: glfwCreateWindow() failed, running headless (GUI disabled)\n");
@@ -3133,6 +3939,8 @@ static void gui_run(void)
 	luna_register_js_handler("onTogglePlaylist", onTogglePlaylist);
 	luna_register_js_handler("onHideEq", onHideEq);
 	luna_register_js_handler("onHidePlaylist", onHidePlaylist);
+	luna_register_js_handler("onEqPower", onEqPower);
+	luna_register_js_handler("onEqReset", onEqReset);
 	luna_register_js_handler("onPlaylistItem", onPlaylistItem);
 	luna_register_js_handler("onMenuPlayPause", onMenuPlayPause);
 	luna_register_js_handler("onMenuStop", onMenuStop);
@@ -3151,13 +3959,15 @@ static void gui_run(void)
 	luna_register_js_handler("onMenuSr", onMenuSr);
 	luna_register_js_handler("onMenuLoop", onMenuLoop);
 	luna_register_js_handler("onMenuFmt", onMenuFmt);
+	luna_register_js_handler("onMenuSkins", onMenuSkins);
 	luna_register_js_handler("onMenuDevice", onMenuDevice);
 	luna_register_js_handler("onMenuQuit", onMenuQuit);
 	luna_register_js_handler("onMenuTextSize", onMenuTextSize);
+	luna_register_js_handler("onFmtItem", onFmtItem);
+	luna_register_js_handler("onSkinItem", onSkinItem);
 	luna_register_js_handler("onDevCard", onDevCard);
 	luna_register_js_handler("onDevPcm", onDevPcm);
 	luna_register_js_handler("onSkinRandom", onSkinRandom);
-	luna_register_js_handler("onSkinNext", onSkinNext);
 	luna_register_js_handler("onSkinFolder", onSkinFolder);
 	luna_register_js_handler("onSkinBuiltin", onSkinBuiltin);
 	luna_register_js_handler("onAddFolder", onAddFolder);
@@ -3185,10 +3995,13 @@ static void gui_run(void)
 	luna_wire_onclick_handlers();
 	gui_cache_elements();
 	aui_apply_text_scale();
+	aui_refresh_equalizer_ui();
+	aui_refresh_format_menu();
+	aui_refresh_skin_menu();
 	const int roots[AUI_SURFACE_COUNT] = {
 		g_el_surface_main, g_el_surface_equalizer, g_el_surface_playlist,
-		g_el_surface_menu, g_el_surface_dev_cards, g_el_surface_dev_pcms,
-		g_el_surface_about
+		g_el_surface_menu, g_el_surface_formats, g_el_surface_skins,
+		g_el_surface_dev_cards, g_el_surface_dev_pcms, g_el_surface_about
 	};
 	for (int i = 0; i < AUI_SURFACE_COUNT; i++) {
 		glfwMakeContextCurrent(g_surfaces[i].window);
@@ -3201,14 +4014,12 @@ static void gui_run(void)
 	}
 	if (!g_surfaces[AUI_MAIN].context || !g_surfaces[AUI_EQUALIZER].context ||
 	    !g_surfaces[AUI_PLAYLIST].context || !g_surfaces[AUI_MENU].context ||
+	    !g_surfaces[AUI_FORMATS].context || !g_surfaces[AUI_SKINS].context ||
 	    !g_surfaces[AUI_DEV_CARDS].context || !g_surfaces[AUI_DEV_PCMS].context ||
 	    !g_surfaces[AUI_ABOUT].context) {
 		fprintf(stderr, "aplay+ui: failed to create Luna surface contexts\n");
 		gui_request_close();
 	}
-	glfwSetWindowPos(g_surfaces[AUI_MAIN].window, 100, 100);
-	glfwSetWindowPos(g_surfaces[AUI_EQUALIZER].window, 100, 216);
-	glfwSetWindowPos(g_surfaces[AUI_PLAYLIST].window, 100, 332);
 #ifdef GLFW_RESIZE_NWSE_CURSOR
   g_resize_cursor = glfwCreateStandardCursor(GLFW_RESIZE_NWSE_CURSOR);
 #else
@@ -3223,6 +4034,11 @@ static void gui_run(void)
 		if (aui_is_popup_surface(i)) continue;
 		glfwShowWindow(g_surfaces[i].window);
 	}
+	/* Initial classic stack only. Position after mapping because some window
+	 * managers do not commit pre-map coordinates. Later user moves are untouched. */
+	glfwSetWindowPos(g_surfaces[AUI_MAIN].window, 100, 100);
+	glfwSetWindowPos(g_surfaces[AUI_EQUALIZER].window, 100, 216);
+	glfwSetWindowPos(g_surfaces[AUI_PLAYLIST].window, 100, 332);
 
 	double last_time = glfwGetTime();
 	while (!__atomic_load_n(&g_gui_should_close, __ATOMIC_SEQ_CST)) {

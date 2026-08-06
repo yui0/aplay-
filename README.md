@@ -32,10 +32,11 @@
   </tr>
 </table>
 
-These compact SVG assets wrap PNG captures rendered by the real Luna/OpenGL
-application through the headless screenshot runner in [`tools/screenshots`](tools/screenshots). Its
-minimal GLFW compatibility layer uses surfaceless EGL, so regenerating the
-README images does not require GLFW development packages.
+These compact SVG assets contain optimized raster copies derived from captures
+rendered by the real Luna/OpenGL application through the headless screenshot
+runner in [`tools/screenshots`](tools/screenshots). Its minimal GLFW
+compatibility layer uses surfaceless EGL, so regenerating the raw PNG captures
+does not require GLFW development packages.
 
 ## 💿 Supported File Formats
 aplay+ supports a variety of popular audio formats:

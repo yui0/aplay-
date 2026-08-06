@@ -1,0 +1,63 @@
+name: Capture README screenshots
+
+on:
+  push:
+    branches:
+      - agent/refresh-readme-screenshots
+    paths:
+      - .github/workflows/capture-readme-screenshots.yml
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out screenshot branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/refresh-readme-screenshots
+          fetch-depth: 0
+
+      - name: Render the real application
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          TERM: xterm
+        run: |
+          chmod +x tools/screenshots/*.sh tools/screenshots/*.py
+          tools/screenshots/capture.sh
+
+      - name: Validate captures
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          expected = {
+              "aplay-ember.png",
+              "aplay-sapphire-skin.png",
+              "aplay-context-menu.png",
+          }
+          for name in expected:
+              data = (Path("screenshots") / name).read_bytes()
+              assert data[:8] == b"\x89PNG\r\n\x1a\n", name
+              width, height = struct.unpack(">II", data[16:24])
+              assert (width, height) == (1280, 1120), (name, width, height)
+              print(name, width, height, len(data))
+          PY
+
+      - name: Commit final README assets
+        run: |
+          rm -rf tools/screenshots/.build tools/screenshots/skin
+          rm -f screenshots/aplay-ui-hero.png \
+                screenshots/aplay-ui-about.png \
+                screenshots/aplay-ui-player.png \
+                screenshots/aplay-ui-menu.png \
+                screenshots/aplay-ui-alsa-flyout.png
+          rm -f .github/workflows/capture-readme-screenshots.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A README.md screenshots tools/screenshots .github/workflows
+          git commit -m "Refresh README screenshots"
+          git push origin HEAD:agent/refresh-readme-screenshots

@@ -1,0 +1,47 @@
+name: Capture README screenshots
+
+on:
+  pull_request:
+    branches:
+      - master
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/capture-readme-screenshots.yml
+
+permissions:
+  contents: write
+
+jobs:
+  capture:
+    if: github.event_name == 'push' || github.head_ref == 'agent/readme-screenshots'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out screenshot branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/readme-screenshots
+          fetch-depth: 0
+
+      - name: Repair capture helper typo
+        run: sed -i 's/)nd = ImageDraw.Draw(title)/)\nnd = ImageDraw.Draw(title)/' tools/capture-readme-screenshots.sh
+
+      - name: Build, run, and capture
+        run: bash tools/capture-readme-screenshots.sh
+
+      - name: Remove temporary launcher from master
+        if: always() && github.event_name == 'push'
+        shell: bash
+        run: |
+          git fetch origin master
+          git checkout -B master origin/master
+          rm -f .github/workflows/capture-readme-screenshots.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Remove temporary screenshot workflow"
+            git push origin master
+          fi

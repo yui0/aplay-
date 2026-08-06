@@ -102,7 +102,9 @@ extern volatile int g_device_select_idx;
 
 /* Low-overhead 10-band equalizer. Gains are dB; setters clamp to ±12 dB.
  * Disabled is the default. Disabled or completely flat settings are a true
- * audio-path bypass: no sample copy, conversion, allocation, or biquad work. */
+ * audio-path bypass: no sample copy, conversion, allocation, or biquad work.
+ * The normal PCM route follows the same rule: decoded S16/F32 samples are sent
+ * directly to ALSA, and conversion/DSP occurs only when explicitly required. */
 void  aplay_equalizer_set_enabled(int enabled);
 int   aplay_equalizer_enabled(void);
 void  aplay_equalizer_set_preamp(float db);
@@ -1294,6 +1296,8 @@ static float aplay_clampf(float v)
 static void outr_feed_float(OutRouter *r,
                             const float *pcm, size_t frames)
 {
+	int eq_active;
+
 	if (!r || !pcm || frames == 0) return;
 
 	while (frames > AUDIO_SCRATCH_FRAMES) {
@@ -1305,8 +1309,22 @@ static void outr_feed_float(OutRouter *r,
 
 	if (outr_ensure_open(r) < 0) return;
 
-	/* Disabled or flat EQ returns the original pointer without copying. */
-	pcm = outr_apply_equalizer(r, pcm, frames);
+	eq_active = outr_equalizer_active(r);
+
+	/*
+	 * Transparent float fast path. With EQ, super resolution and DSD all off,
+	 * pass the decoder buffer straight to ALSA without copying, clipping,
+	 * gain adjustment, allocation or format conversion.
+	 */
+	if (!eq_active && !r->use_dsd && !r->use_super_res &&
+	    r->format == SND_PCM_FORMAT_FLOAT_LE) {
+		AUDIO_play(&r->pcm, (char *)pcm, (int)frames);
+		AUDIO_wait(&r->pcm, 100);
+		return;
+	}
+
+	if (eq_active)
+		pcm = outr_apply_equalizer(r, pcm, frames);
 
 	if (r->use_super_res) {
 		if (outr_ensure_super_res(r) != 0) {
@@ -1702,7 +1720,8 @@ void play_wav(char *name, int format, int flag)
 
 	OutRouter router;
 	if (outr_init(&router, dev, wav.sampleRate, wav.channels, format,
-	              (flag & USE_DSD_ENCODE) ? 1 : 0, (flag & USE_SUPER_RES) ? 1 : 0)) {
+	              (flag & USE_DSD_ENCODE) ? 1 : 0,
+	              (flag & USE_SUPER_RES) ? 1 : 0)) {
 		drwav_uninit(&wav);
 		return;
 	}
@@ -1710,8 +1729,9 @@ void play_wav(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, wav.sampleRate, wav.channels);
 
-	float *pcm_buf = (float *)malloc(
-		(size_t)FRAMES * wav.channels * sizeof(float));
+	const int float_output = format == SND_PCM_FORMAT_FLOAT_LE;
+	size_t sample_bytes = float_output ? sizeof(float) : sizeof(int16_t);
+	void *pcm_buf = malloc((size_t)FRAMES * wav.channels * sample_bytes);
 	if (!pcm_buf) {
 		outr_close(&router);
 		drwav_uninit(&wav);
@@ -1726,13 +1746,16 @@ void play_wav(char *name, int format, int flag)
 	char dirbuf[PATH_MAX];
 	get_dirpart(name, dirbuf, sizeof(dirbuf));
 	ts.dir = dirbuf;
-	ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "WAV->DSD(mon)" : "WAV->DSD(DoP)") : (format ? "WAV/F32" : "WAV");
+	ts.codec = router.use_dsd
+		? (router.dsd.monitor_mode ? "WAV->DSD(mon)" : "WAV->DSD(DoP)")
+		: (float_output ? "WAV/F32" : "WAV");
 	ts.rate = outr_output_rate(&router);
-	ts.bits = format ? 32 : 16;
+	ts.bits = float_output ? 32 : 16;
 	ts.channels = wav.channels;
 	ts.device = dev;
 	ts.use_time = 1;
-	ts.total = wav.totalPCMFrameCount > 0 ? (double)wav.totalPCMFrameCount / wav.sampleRate : 0.0;
+	ts.total = wav.totalPCMFrameCount > 0
+		? (double)wav.totalPCMFrameCount / wav.sampleRate : 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
 	ts.format_filter = fmt_filter;
@@ -1748,13 +1771,22 @@ void play_wav(char *name, int format, int flag)
 		tui_close();
 		return;
 	}
-	size_t n;
-	while ((n = drwav_read_pcm_frames_f32(&wav, FRAMES, pcm_buf)) > 0) {
-		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, pcm_buf, (int)n, wav.channels, SND_PCM_FORMAT_FLOAT_LE);
-		}
 
-		outr_feed_float(&router, pcm_buf, n);
+	for (;;) {
+		size_t n = float_output
+			? drwav_read_pcm_frames_f32(&wav, FRAMES, (float *)pcm_buf)
+			: drwav_read_pcm_frames_s16(&wav, FRAMES, (int16_t *)pcm_buf);
+		if (n == 0) break;
+
+		/* Leave decoded samples untouched unless XTC was explicitly enabled. */
+		if (flag & USE_CROSSTALK)
+			apply_crosstalk_cancellation(
+				&xtc, pcm_buf, (int)n, wav.channels, format);
+
+		if (float_output)
+			outr_feed_float(&router, (const float *)pcm_buf, n);
+		else
+			outr_feed_s16(&router, (const int16_t *)pcm_buf, n);
 
 		int k = key(outr_audio(&router), &ts);
 		if (k == 'c') {
@@ -1762,26 +1794,34 @@ void play_wav(char *name, int format, int flag)
 			g_flag_diff ^= USE_CROSSTALK;
 		} else if (k == 's') {
 			outr_toggle_super_res(&router);
-			flag ^= USE_SUPER_RES; g_flag_diff ^= USE_SUPER_RES;
-			ts.note = router.use_super_res ? "Super resolution on" : "Super resolution off";
+			flag ^= USE_SUPER_RES;
+			g_flag_diff ^= USE_SUPER_RES;
+			ts.note = router.use_super_res
+				? "Super resolution on" : "Super resolution off";
 			tui_render(&ts);
 		} else if (k == 'e') {
 			outr_toggle(&router);
-			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE;
-			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "WAV->DSD(mon)" : "WAV->DSD(DoP)") : (format ? "WAV/F32" : "WAV");
+			flag ^= USE_DSD_ENCODE;
+			g_flag_diff ^= USE_DSD_ENCODE;
+			ts.codec = router.use_dsd
+				? (router.dsd.monitor_mode
+				   ? "WAV->DSD(mon)" : "WAV->DSD(DoP)")
+				: (float_output ? "WAV/F32" : "WAV");
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
 			tui_render(&ts);
 		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
-			int64_t delta = (int64_t)SEEK_SECONDS * wav.sampleRate * (k == KEY_RIGHT ? 1 : -1);
+			int64_t delta = (int64_t)SEEK_SECONDS * wav.sampleRate *
+			                (k == KEY_RIGHT ? 1 : -1);
 			int64_t target = (int64_t)c + delta;
 			if (target < 0) target = 0;
-			if (wav.totalPCMFrameCount > 0 && (uint64_t)target > wav.totalPCMFrameCount)
+			if (wav.totalPCMFrameCount > 0 &&
+			    (uint64_t)target > wav.totalPCMFrameCount)
 				target = (int64_t)wav.totalPCMFrameCount;
 			if (drwav_seek_to_pcm_frame(&wav, (drwav_uint64)target)) {
 				c = (uint64_t)target;
 				ts.cur = (double)c / wav.sampleRate;
-				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+				ts.note = k == KEY_RIGHT ? ">> +10s" : "<< -10s";
 				tui_render(&ts);
 			}
 		} else if (k) {
@@ -1901,7 +1941,7 @@ void play_flac(char *name, int format, int flag)
 	fx_flac_t *flac = NULL;
 	int32_t *out_buf = NULL;
 	int32_t *pcm_acc = NULL;
-	float *pcm_f32 = NULL;
+	void *pcm_out = NULL;
 	OutRouter router;
 	CrosstalkCancel xtc;
 	int router_inited = 0;
@@ -1961,8 +2001,6 @@ void play_flac(char *name, int format, int flag)
 			flac, FLAC_KEY_SAMPLE_RATE);
 		uint32_t channels = (uint32_t)fx_flac_get_streaminfo(
 			flac, FLAC_KEY_N_CHANNELS);
-		uint32_t bits = (uint32_t)fx_flac_get_streaminfo(
-			flac, FLAC_KEY_SAMPLE_SIZE);
 		int64_t n_samples = fx_flac_get_streaminfo(
 			flac, FLAC_KEY_N_SAMPLES);
 		size_t frames_ch = (size_t)FRAMES * channels;
@@ -1993,9 +2031,10 @@ void play_flac(char *name, int format, int flag)
 
 		pcm_acc = (int32_t *)malloc(
 			pcm_capacity * sizeof(int32_t));
-		pcm_f32 = (float *)malloc(
-			frames_ch * sizeof(float));
-		if (!pcm_acc || !pcm_f32) goto done;
+		pcm_out = malloc(frames_ch *
+			(format == SND_PCM_FORMAT_FLOAT_LE
+			 ? sizeof(float) : sizeof(int16_t)));
+		if (!pcm_acc || !pcm_out) goto done;
 
 		ts.track_index = track_index;
 		ts.track_total = track_total;
@@ -2006,7 +2045,7 @@ void play_flac(char *name, int format, int flag)
 		ts.codec = router.use_dsd
 			? "FLAC->DSD(DoP)" : "FLAC";
 		ts.rate = outr_output_rate(&router);
-		ts.bits = format ? 32 : (int)bits;
+		ts.bits = format == SND_PCM_FORMAT_FLOAT_LE ? 32 : 16;
 		ts.channels = (int)channels;
 		ts.device = dev;
 		ts.use_time = 1;
@@ -2103,24 +2142,41 @@ void play_flac(char *name, int format, int flag)
 					frames_now = FRAMES;
 				samples_now = frames_now * channels;
 
-				for (size_t i = 0; i < samples_now; ++i)
-					pcm_f32[i] =
-						(float)pcm_acc[acc_pos + i] *
-						(1.0f / 2147483648.0f);
+				if (format == SND_PCM_FORMAT_FLOAT_LE) {
+					float *pcm_f32 = (float *)pcm_out;
+					for (size_t i = 0; i < samples_now; ++i)
+						pcm_f32[i] =
+							(float)pcm_acc[acc_pos + i] *
+							(1.0f / 2147483648.0f);
+
+					if (flag & USE_CROSSTALK)
+						apply_crosstalk_cancellation(
+							&xtc, pcm_f32,
+							(int)frames_now,
+							(int)channels,
+							SND_PCM_FORMAT_FLOAT_LE);
+
+					outr_feed_float(
+						&router, pcm_f32, frames_now);
+				} else {
+					int16_t *pcm_s16 = (int16_t *)pcm_out;
+					for (size_t i = 0; i < samples_now; ++i)
+						pcm_s16[i] = (int16_t)(
+							pcm_acc[acc_pos + i] / 65536);
+
+					if (flag & USE_CROSSTALK)
+						apply_crosstalk_cancellation(
+							&xtc, pcm_s16,
+							(int)frames_now,
+							(int)channels, 0);
+
+					outr_feed_s16(
+						&router, pcm_s16, frames_now);
+				}
 
 				acc_pos += samples_now;
 				if (acc_pos == acc_fill)
 					acc_pos = acc_fill = 0;
-
-				if (flag & USE_CROSSTALK)
-					apply_crosstalk_cancellation(
-						&xtc, pcm_f32,
-						(int)frames_now,
-						(int)channels,
-						SND_PCM_FORMAT_FLOAT_LE);
-
-				outr_feed_float(
-					&router, pcm_f32, frames_now);
 
 				k = key(outr_audio(&router), &ts);
 				if (k == 'c') {
@@ -2197,7 +2253,7 @@ void play_flac(char *name, int format, int flag)
 done:
 	if (tui_is_open) tui_close();
 	free(pcm_acc);
-	free(pcm_f32);
+	free(pcm_out);
 	if (router_inited) outr_close(&router);
 	if (xtc_inited) free_crosstalk_cancellation(&xtc);
 	free(out_buf);
@@ -2217,7 +2273,8 @@ void play_flac(char *name, int format, int flag)
 
 	OutRouter router;
 	if (outr_init(&router, dev, flac->sampleRate, flac->channels, format,
-	              (flag & USE_DSD_ENCODE) ? 1 : 0, (flag & USE_SUPER_RES) ? 1 : 0)) {
+	              (flag & USE_DSD_ENCODE) ? 1 : 0,
+	              (flag & USE_SUPER_RES) ? 1 : 0)) {
 		drflac_close(flac);
 		return;
 	}
@@ -2225,8 +2282,9 @@ void play_flac(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, flac->sampleRate, flac->channels);
 
-	float *pcm_buf = (float *)malloc(
-		(size_t)FRAMES * flac->channels * sizeof(float));
+	const int float_output = format == SND_PCM_FORMAT_FLOAT_LE;
+	size_t sample_bytes = float_output ? sizeof(float) : sizeof(int16_t);
+	void *pcm_buf = malloc((size_t)FRAMES * flac->channels * sample_bytes);
 	if (!pcm_buf) {
 		outr_close(&router);
 		drflac_close(flac);
@@ -2241,13 +2299,16 @@ void play_flac(char *name, int format, int flag)
 	char dirbuf[PATH_MAX];
 	get_dirpart(name, dirbuf, sizeof(dirbuf));
 	ts.dir = dirbuf;
-	ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)") : "FLAC";
+	ts.codec = router.use_dsd
+		? (router.dsd.monitor_mode ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)")
+		: "FLAC";
 	ts.rate = outr_output_rate(&router);
-	ts.bits = format ? 32 : flac->bitsPerSample;
+	ts.bits = float_output ? 32 : 16;
 	ts.channels = flac->channels;
 	ts.device = dev;
 	ts.use_time = 1;
-	ts.total = flac->totalPCMFrameCount > 0 ? (double)flac->totalPCMFrameCount / flac->sampleRate : 0.0;
+	ts.total = flac->totalPCMFrameCount > 0
+		? (double)flac->totalPCMFrameCount / flac->sampleRate : 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
 	ts.format_filter = fmt_filter;
@@ -2263,13 +2324,21 @@ void play_flac(char *name, int format, int flag)
 		tui_close();
 		return;
 	}
-	size_t n;
-	while ((n = drflac_read_pcm_frames_f32(flac, FRAMES, pcm_buf)) > 0) {
-		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, pcm_buf, (int)n, flac->channels, SND_PCM_FORMAT_FLOAT_LE);
-		}
 
-		outr_feed_float(&router, pcm_buf, n);
+	for (;;) {
+		size_t n = float_output
+			? drflac_read_pcm_frames_f32(flac, FRAMES, (float *)pcm_buf)
+			: drflac_read_pcm_frames_s16(flac, FRAMES, (int16_t *)pcm_buf);
+		if (n == 0) break;
+
+		if (flag & USE_CROSSTALK)
+			apply_crosstalk_cancellation(
+				&xtc, pcm_buf, (int)n, flac->channels, format);
+
+		if (float_output)
+			outr_feed_float(&router, (const float *)pcm_buf, n);
+		else
+			outr_feed_s16(&router, (const int16_t *)pcm_buf, n);
 
 		int k = key(outr_audio(&router), &ts);
 		if (k == 'c') {
@@ -2277,26 +2346,34 @@ void play_flac(char *name, int format, int flag)
 			g_flag_diff ^= USE_CROSSTALK;
 		} else if (k == 's') {
 			outr_toggle_super_res(&router);
-			flag ^= USE_SUPER_RES; g_flag_diff ^= USE_SUPER_RES;
-			ts.note = router.use_super_res ? "Super resolution on" : "Super resolution off";
+			flag ^= USE_SUPER_RES;
+			g_flag_diff ^= USE_SUPER_RES;
+			ts.note = router.use_super_res
+				? "Super resolution on" : "Super resolution off";
 			tui_render(&ts);
 		} else if (k == 'e') {
 			outr_toggle(&router);
-			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE;
-			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)") : "FLAC";
+			flag ^= USE_DSD_ENCODE;
+			g_flag_diff ^= USE_DSD_ENCODE;
+			ts.codec = router.use_dsd
+				? (router.dsd.monitor_mode
+				   ? "FLAC->DSD(mon)" : "FLAC->DSD(DoP)")
+				: "FLAC";
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
 			tui_render(&ts);
 		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
-			int64_t delta = (int64_t)SEEK_SECONDS * flac->sampleRate * (k == KEY_RIGHT ? 1 : -1);
+			int64_t delta = (int64_t)SEEK_SECONDS * flac->sampleRate *
+			                (k == KEY_RIGHT ? 1 : -1);
 			int64_t target = (int64_t)c + delta;
 			if (target < 0) target = 0;
-			if (flac->totalPCMFrameCount > 0 && (uint64_t)target > flac->totalPCMFrameCount)
+			if (flac->totalPCMFrameCount > 0 &&
+			    (uint64_t)target > flac->totalPCMFrameCount)
 				target = (int64_t)flac->totalPCMFrameCount;
 			if (drflac_seek_to_pcm_frame(flac, (drflac_uint64)target)) {
 				c = (uint64_t)target;
 				ts.cur = (double)c / flac->sampleRate;
-				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+				ts.note = k == KEY_RIGHT ? ">> +10s" : "<< -10s";
 				tui_render(&ts);
 			}
 		} else if (k) {
@@ -2481,7 +2558,8 @@ int play_mp3(char *name, int format, int flag)
 
 	OutRouter router;
 	if (outr_init(&router, dev, mp3.sampleRate, mp3.channels, format,
-	              (flag & USE_DSD_ENCODE) ? 1 : 0, (flag & USE_SUPER_RES) ? 1 : 0)) {
+	              (flag & USE_DSD_ENCODE) ? 1 : 0,
+	              (flag & USE_SUPER_RES) ? 1 : 0)) {
 		drmp3_uninit(&mp3);
 		return 1;
 	}
@@ -2489,8 +2567,9 @@ int play_mp3(char *name, int format, int flag)
 	CrosstalkCancel xtc;
 	init_crosstalk_cancellation(&xtc, mp3.sampleRate, mp3.channels);
 
-	float *pcm_buf = (float *)malloc(
-		(size_t)FRAMES * mp3.channels * sizeof(float));
+	const int float_output = format == SND_PCM_FORMAT_FLOAT_LE;
+	size_t sample_bytes = float_output ? sizeof(float) : sizeof(int16_t);
+	void *pcm_buf = malloc((size_t)FRAMES * mp3.channels * sample_bytes);
 	drmp3_uint64 totalPCMFrameCount;
 	if (!pcm_buf) {
 		outr_close(&router);
@@ -2507,13 +2586,16 @@ int play_mp3(char *name, int format, int flag)
 	char dirbuf[PATH_MAX];
 	get_dirpart(name, dirbuf, sizeof(dirbuf));
 	ts.dir = dirbuf;
-	ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "MP3->DSD(mon)" : "MP3->DSD(DoP)") : "MP3";
+	ts.codec = router.use_dsd
+		? (router.dsd.monitor_mode ? "MP3->DSD(mon)" : "MP3->DSD(DoP)")
+		: "MP3";
 	ts.rate = outr_output_rate(&router);
-	ts.bits = format ? 32 : 16;
+	ts.bits = float_output ? 32 : 16;
 	ts.channels = mp3.channels;
 	ts.device = dev;
 	ts.use_time = 1;
-	ts.total = totalPCMFrameCount > 0 ? (double)totalPCMFrameCount / mp3.sampleRate : 0.0;
+	ts.total = totalPCMFrameCount > 0
+		? (double)totalPCMFrameCount / mp3.sampleRate : 0.0;
 	ts.volume = volume;
 	ts.loop_mode = loop_mode;
 	ts.format_filter = fmt_filter;
@@ -2529,13 +2611,21 @@ int play_mp3(char *name, int format, int flag)
 		tui_close();
 		return 1;
 	}
-	size_t n;
-	while ((n = drmp3_read_pcm_frames_f32(&mp3, FRAMES, pcm_buf)) > 0) {
-		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, pcm_buf, (int)n, mp3.channels, SND_PCM_FORMAT_FLOAT_LE);
-		}
 
-		outr_feed_float(&router, pcm_buf, n);
+	for (;;) {
+		size_t n = float_output
+			? drmp3_read_pcm_frames_f32(&mp3, FRAMES, (float *)pcm_buf)
+			: drmp3_read_pcm_frames_s16(&mp3, FRAMES, (int16_t *)pcm_buf);
+		if (n == 0) break;
+
+		if (flag & USE_CROSSTALK)
+			apply_crosstalk_cancellation(
+				&xtc, pcm_buf, (int)n, mp3.channels, format);
+
+		if (float_output)
+			outr_feed_float(&router, (const float *)pcm_buf, n);
+		else
+			outr_feed_s16(&router, (const int16_t *)pcm_buf, n);
 
 		int k = key(outr_audio(&router), &ts);
 		if (k == 'c') {
@@ -2543,26 +2633,34 @@ int play_mp3(char *name, int format, int flag)
 			g_flag_diff ^= USE_CROSSTALK;
 		} else if (k == 's') {
 			outr_toggle_super_res(&router);
-			flag ^= USE_SUPER_RES; g_flag_diff ^= USE_SUPER_RES;
-			ts.note = router.use_super_res ? "Super resolution on" : "Super resolution off";
+			flag ^= USE_SUPER_RES;
+			g_flag_diff ^= USE_SUPER_RES;
+			ts.note = router.use_super_res
+				? "Super resolution on" : "Super resolution off";
 			tui_render(&ts);
 		} else if (k == 'e') {
 			outr_toggle(&router);
-			flag ^= USE_DSD_ENCODE; g_flag_diff ^= USE_DSD_ENCODE;
-			ts.codec = router.use_dsd ? (router.dsd.monitor_mode ? "MP3->DSD(mon)" : "MP3->DSD(DoP)") : "MP3";
+			flag ^= USE_DSD_ENCODE;
+			g_flag_diff ^= USE_DSD_ENCODE;
+			ts.codec = router.use_dsd
+				? (router.dsd.monitor_mode
+				   ? "MP3->DSD(mon)" : "MP3->DSD(DoP)")
+				: "MP3";
 			ts.rate = outr_output_rate(&router);
 			ts.note = outr_status_note(&router);
 			tui_render(&ts);
 		} else if (k == KEY_LEFT || k == KEY_RIGHT) {
-			int64_t delta = (int64_t)SEEK_SECONDS * mp3.sampleRate * (k == KEY_RIGHT ? 1 : -1);
+			int64_t delta = (int64_t)SEEK_SECONDS * mp3.sampleRate *
+			                (k == KEY_RIGHT ? 1 : -1);
 			int64_t target = (int64_t)c + delta;
 			if (target < 0) target = 0;
-			if (totalPCMFrameCount > 0 && (uint64_t)target > totalPCMFrameCount)
+			if (totalPCMFrameCount > 0 &&
+			    (uint64_t)target > totalPCMFrameCount)
 				target = (int64_t)totalPCMFrameCount;
 			if (drmp3_seek_to_pcm_frame(&mp3, (drmp3_uint64)target)) {
 				c = (uint64_t)target;
 				ts.cur = (double)c / mp3.sampleRate;
-				ts.note = (k == KEY_RIGHT) ? ">> +10s" : "<< -10s";
+				ts.note = k == KEY_RIGHT ? ">> +10s" : "<< -10s";
 				tui_render(&ts);
 			}
 		} else if (k) {
@@ -2583,6 +2681,7 @@ int play_mp3(char *name, int format, int flag)
 	free_crosstalk_cancellation(&xtc);
 	return 0;
 }
+
 #else
 int play_mp3(char *name, int format, int flag)
 {

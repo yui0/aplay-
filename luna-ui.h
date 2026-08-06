@@ -782,6 +782,7 @@ const char* backdrop_fs =
     "uniform vec2 uBlurTexSize;\n"
     "uniform vec2 uFbSize;\n"
     "uniform vec2 uBlurOrigin;\n"
+    "uniform vec2 uSampleScale;\n"
     "uniform float uSaturate;\n"
     "uniform float uBrightness;\n"
     "float rr_sdf4(vec2 p, vec2 hs, vec4 r) {\n"
@@ -794,8 +795,8 @@ const char* backdrop_fs =
     "    float sdf = rr_sdf4(FragPos - halfSize, halfSize, uRadius4);\n"
     "    float alpha = 1.0 - smoothstep(-1.0, 0.5, sdf);\n"
     "    if(alpha <= 0.0) discard;\n"
-    "    vec2 screenPos = vec2(uBlurOrigin.x + FragPos.x,\n"
-    "                          uBlurOrigin.y + (uSize.y - FragPos.y));\n"
+    "    vec2 screenPos = vec2(uBlurOrigin.x + FragPos.x * uSampleScale.x,\n"
+    "                          uBlurOrigin.y + (uSize.y - FragPos.y) * uSampleScale.y);\n"
     "    vec2 uv = vec2(screenPos.x, uFbSize.y - screenPos.y) / uBlurTexSize;\n"
     "    vec4 tc = texture(uSrc, clamp(uv, vec2(0.0), uFbSize / uBlurTexSize));\n"
     "    float gray = dot(tc.rgb, vec3(0.299, 0.587, 0.114));\n"
@@ -1603,7 +1604,8 @@ static struct {
 } blur_loc;
 static struct {
     GLint uResolution, uPos, uSize, uRadius4;
-    GLint uSrc, uBlurTexSize, uFbSize, uBlurOrigin, uSaturate, uBrightness;
+    GLint uSrc, uBlurTexSize, uFbSize, uBlurOrigin, uSampleScale;
+    GLint uSaturate, uBrightness;
 } backdrop_loc;
 
 // Texture cache — path → GL texture ID (loaded once, reused)
@@ -3510,6 +3512,16 @@ void set_text(int idx, const char* new_text) {
             if (elements[idx].caret > n) elements[idx].caret = n;
         }
         elements[idx].has_custom_text = 1;
+
+        /* Text participates in intrinsic width/height calculation.  Without
+           invalidating layout here, a newly revealed display:none subtree can
+           keep parser-default or previously cached flex dimensions until an
+           unrelated class/resize event happens. */
+        memset(g_intrinsic_width_valid, 0, sizeof(g_intrinsic_width_valid));
+        g_layout_dirty = 1;
+        g_render_order_dirty = 1;
+        g_visual_scan_needed = 1;
+
         if (elements[idx].aria_live == 1 || elements[idx].aria_live == 2) {
             snprintf(g_a11y_live_msg, sizeof(g_a11y_live_msg), "%s", new_text);
             g_a11y_live_assertive = (elements[idx].aria_live == 2);
@@ -5712,14 +5724,20 @@ void update_element_style(LunaElement* e) {
     e->grid_col_count = e->grid_row_count = 0;
     e->grid_col_gap = e->grid_row_gap = 0.0f;
     e->grid_auto_flow = GRID_AUTO_FLOW_ROW;
+    e->has_grid_auto_rows = e->has_grid_auto_columns = 0;
     e->grid_auto_row_track = 1.0f; e->grid_auto_row_type = GRID_TRACK_FR;
+    e->grid_auto_row_min = 0.0f;
     e->grid_auto_col_track = 1.0f; e->grid_auto_col_type = GRID_TRACK_FR;
-    e->scroll_top = e->scroll_left = 0.0f;
-    e->scroll_dest_top = e->scroll_dest_left = 0.0f;
+    e->grid_auto_col_min = 0.0f;
+    e->grid_area_rows = e->grid_area_cols = 0;
+    e->grid_area_rect_count = 0;
+    memset(e->grid_area_cell, 0, sizeof(e->grid_area_cell));
+    /* scroll_top/left, their destinations, and the measured content extent are
+       runtime state, not computed CSS.  Hover/focus/class restyling must not
+       reset them; the layout pass will clamp positions if the content changes. */
     e->scroll_smooth = 0;
     e->scroll_snap_type = 0;
     e->scroll_snap_align = 0;
-    e->scroll_content_h = e->scroll_content_w = 0.0f;
     e->scrollbar_width = 5.0f;
     e->has_scrollbar_width = 0;
     e->has_scrollbar_color = 0;
@@ -5749,6 +5767,8 @@ void update_element_style(LunaElement* e) {
     e->grid_col = e->grid_row = -1;
     e->grid_col_span = e->grid_row_span = 1;
     e->has_grid_col = e->has_grid_row = 0;
+    e->has_grid_area = 0;
+    e->grid_area_name[0] = '\0';
     e->grid_child = 0;
     e->css_positioned = 0;
     e->cursor_type = 0; e->position_fixed = 0;
@@ -6900,6 +6920,162 @@ static float flow_row_item_main(const LunaElement* ch) {
     return size + ch->margin_left + ch->margin_right;
 }
 
+/* Intrinsic block-size for an auto-height grid.  A grid is not a vertical
+ * stack of every child: auto-placed items sharing a row contribute the maximum
+ * row height, not the sum of both cells.  Treating it as a block column made
+ * two-column grids roughly twice as tall and broke centered dialogs. */
+static float intrinsic_grid_content_height(LunaElement* grid,
+                                           const int* kids,
+                                           const float* kid_h,
+                                           int n) {
+    float row_h[MAX_GRID_AREA_ROWS] = {0};
+    unsigned char occupied[MAX_GRID_AREA_ROWS][MAX_GRID_AREA_COLS] = {{0}};
+
+    if (grid->grid_area_rect_count == 0 && grid->grid_area_rows > 0)
+        compile_grid_area_rects(grid);
+
+    int cols = grid->grid_col_count;
+    int rows = grid->grid_row_count;
+    if (cols < 1) cols = grid->grid_area_cols;
+    if (rows < 1) rows = grid->grid_area_rows;
+    if (cols < 1) cols = 1;
+    if (rows < 1) rows = 1;
+    if (cols > MAX_GRID_AREA_COLS) cols = MAX_GRID_AREA_COLS;
+    if (rows > MAX_GRID_AREA_ROWS) rows = MAX_GRID_AREA_ROWS;
+
+    /* Definite row tracks establish an intrinsic minimum.  fr tracks in an
+     * indefinite block axis behave like max-content tracks here. */
+    for (int r = 0; r < rows; r++) {
+        if (r < grid->grid_row_count) {
+            if (grid->grid_row_type[r] == GRID_TRACK_PX)
+                row_h[r] = grid->grid_row_track[r];
+            else if (grid->grid_row_type[r] == GRID_TRACK_MINMAX)
+                row_h[r] = grid->grid_row_min[r];
+        } else if (grid->has_grid_auto_rows) {
+            if (grid->grid_auto_row_type == GRID_TRACK_PX)
+                row_h[r] = grid->grid_auto_row_track;
+            else if (grid->grid_auto_row_type == GRID_TRACK_MINMAX)
+                row_h[r] = grid->grid_auto_row_min;
+        }
+    }
+
+    int col_flow = (grid->grid_auto_flow & GRID_AUTO_FLOW_COLUMN) != 0;
+    int cursor_col = 0, cursor_row = 0;
+    int used_rows = rows;
+    float row_gap = grid->grid_row_gap > 0.0f ? grid->grid_row_gap : grid->flex_gap;
+
+    for (int k = 0; k < n; k++) {
+        LunaElement* ch = &elements[kids[k]];
+        int cspan = ch->grid_col_span > 0 ? ch->grid_col_span : 1;
+        int rspan = ch->grid_row_span > 0 ? ch->grid_row_span : 1;
+        if (cspan > MAX_GRID_AREA_COLS) cspan = MAX_GRID_AREA_COLS;
+        if (rspan > MAX_GRID_AREA_ROWS) rspan = MAX_GRID_AREA_ROWS;
+
+        int gc = ch->has_grid_col ? ch->grid_col : -1;
+        int gr = ch->has_grid_row ? ch->grid_row : -1;
+        if (ch->has_grid_area && ch->grid_area_name[0])
+            grid_area_lookup(grid, ch->grid_area_name, &gc, &gr, &cspan, &rspan);
+
+        if (gc < 0 || gr < 0) {
+            int found = 0;
+            int start = col_flow
+                ? cursor_col * MAX_GRID_AREA_ROWS + cursor_row
+                : cursor_row * cols + cursor_col;
+            int limit = MAX_GRID_AREA_ROWS * MAX_GRID_AREA_COLS;
+            for (int step = 0; step < limit; step++) {
+                int pos = start + step;
+                int tr, tc;
+                if (col_flow) {
+                    tc = pos / MAX_GRID_AREA_ROWS;
+                    tr = pos % MAX_GRID_AREA_ROWS;
+                } else {
+                    tr = pos / cols;
+                    tc = pos % cols;
+                }
+                if (tr < 0 || tc < 0 || tr + rspan > MAX_GRID_AREA_ROWS ||
+                    tc + cspan > MAX_GRID_AREA_COLS) continue;
+                if (!col_flow && tc + cspan > cols) continue;
+                if (ch->has_grid_col && tc != ch->grid_col) continue;
+                if (ch->has_grid_row && tr != ch->grid_row) continue;
+                int free_cell = 1;
+                for (int rr = tr; rr < tr + rspan && free_cell; rr++)
+                    for (int cc = tc; cc < tc + cspan; cc++)
+                        if (occupied[rr][cc]) { free_cell = 0; break; }
+                if (!free_cell) continue;
+                gc = tc; gr = tr; found = 1;
+                break;
+            }
+            if (!found) continue;
+        }
+
+        if (gc < 0) gc = 0;
+        if (gr < 0) gr = 0;
+        if (gc >= MAX_GRID_AREA_COLS || gr >= MAX_GRID_AREA_ROWS) continue;
+        if (gc + cspan > MAX_GRID_AREA_COLS) cspan = MAX_GRID_AREA_COLS - gc;
+        if (gr + rspan > MAX_GRID_AREA_ROWS) rspan = MAX_GRID_AREA_ROWS - gr;
+
+        for (int rr = gr; rr < gr + rspan; rr++)
+            for (int cc = gc; cc < gc + cspan; cc++)
+                occupied[rr][cc] = 1;
+
+        if (col_flow) {
+            cursor_row = gr + rspan;
+            cursor_col = gc;
+            if (cursor_row >= rows) { cursor_row = 0; cursor_col = gc + cspan; }
+        } else {
+            cursor_col = gc + cspan;
+            cursor_row = gr;
+            if (cursor_col >= cols) { cursor_col = 0; cursor_row = gr + rspan; }
+        }
+
+        if (gr + rspan > used_rows) used_rows = gr + rspan;
+        if (used_rows > MAX_GRID_AREA_ROWS) used_rows = MAX_GRID_AREA_ROWS;
+
+        /* Initialize newly-created implicit row tracks. */
+        for (int rr = rows; rr < used_rows; rr++) {
+            if (grid->has_grid_auto_rows) {
+                if (grid->grid_auto_row_type == GRID_TRACK_PX)
+                    row_h[rr] = grid->grid_auto_row_track;
+                else if (grid->grid_auto_row_type == GRID_TRACK_MINMAX)
+                    row_h[rr] = grid->grid_auto_row_min;
+            }
+        }
+        if (used_rows > rows) rows = used_rows;
+
+        float have = row_gap * (float)(rspan > 0 ? rspan - 1 : 0);
+        for (int rr = gr; rr < gr + rspan; rr++) have += row_h[rr];
+        if (kid_h[k] > have) {
+            float extra = kid_h[k] - have;
+            int grow_rows = 0;
+            for (int rr = gr; rr < gr + rspan; rr++) {
+                int fixed = (rr < grid->grid_row_count &&
+                             grid->grid_row_type[rr] == GRID_TRACK_PX) ||
+                            (rr >= grid->grid_row_count && grid->has_grid_auto_rows &&
+                             grid->grid_auto_row_type == GRID_TRACK_PX);
+                if (!fixed) grow_rows++;
+            }
+            if (grow_rows == 0 && rspan == 1) {
+                /* A single fixed track remains fixed; content may overflow it. */
+            } else {
+                if (grow_rows == 0) grow_rows = rspan;
+                float add = extra / (float)grow_rows;
+                for (int rr = gr; rr < gr + rspan; rr++) {
+                    int fixed = (rr < grid->grid_row_count &&
+                                 grid->grid_row_type[rr] == GRID_TRACK_PX) ||
+                                (rr >= grid->grid_row_count && grid->has_grid_auto_rows &&
+                                 grid->grid_auto_row_type == GRID_TRACK_PX);
+                    if (!fixed || grow_rows == rspan) row_h[rr] += add;
+                }
+            }
+        }
+    }
+
+    if (used_rows < 1) used_rows = 1;
+    float total = row_gap * (float)(used_rows > 1 ? used_rows - 1 : 0);
+    for (int r = 0; r < used_rows; r++) total += row_h[r];
+    return total;
+}
+
 static float flow_content_height(LunaElement* e) {
     int idx = (int)(e - elements);
 
@@ -6948,6 +7124,10 @@ static float flow_content_height(LunaElement* e) {
     }
 
     if (n > 0) {
+        if (e->display_mode == DISPLAY_GRID) {
+            float inner = intrinsic_grid_content_height(e, kids, kid_h, n);
+            return inner + e->pad_t + e->pad_b + e->border_width * 2.0f;
+        }
         int row = (e->display_mode == DISPLAY_FLEX && e->flex_direction == FLEX_DIR_ROW);
         int wrap = row && (e->flex_wrap == FLEX_WRAP_WRAP);
         /* A flex container can have both element children and direct text.
@@ -7160,7 +7340,10 @@ static void layout_block_container(int container_idx) {
         if (ch->pct_w) {
             ch->w = inner_w * ch->raw_w;
         } else if (!ch->has_css_width) {
-            ch->w = inner_w;
+            /* width:auto fills the containing block after ordinary margins.
+             * Auto margins resolve to zero when width itself is auto. */
+            ch->w = inner_w - ch->margin_left - ch->margin_right;
+            if (ch->w < 0.0f) ch->w = 0.0f;
         }
 
         if (!ch->has_css_height && !ch->pct_h) {
@@ -7176,8 +7359,21 @@ static void layout_block_container(int container_idx) {
             if (ch->h > max_h) ch->h = max_h;
         }
 
-        ch->rel_x = cont->border_width + cont->pad_l + ch->margin_left;
-        ch->rel_y = y + ch->margin_top;
+        /* Horizontal auto margins center/final-align fixed-width block boxes.
+         * rel_x/rel_y deliberately exclude ordinary margins: the common final
+         * coordinate pass adds margin_left/margin_top exactly once.  The old
+         * code included them here as well, doubling every block margin and
+         * pushing buttons outside cards. */
+        float auto_space = inner_w - ch->w - ch->margin_left - ch->margin_right;
+        if (auto_space < 0.0f) auto_space = 0.0f;
+        float auto_left = 0.0f;
+        if (ch->margin_left_auto && ch->margin_right_auto)
+            auto_left = auto_space * 0.5f;
+        else if (ch->margin_left_auto)
+            auto_left = auto_space;
+
+        ch->rel_x = cont->border_width + cont->pad_l + auto_left;
+        ch->rel_y = y;
         y += ch->margin_top + ch->h + ch->margin_bottom;
     }
 
@@ -7234,12 +7430,18 @@ void update_layout() {
         float cb_ox = 0.0f, cb_oy = 0.0f;
         int use_cb = (e->position_mode == POS_ABSOLUTE && par != -1);
 
-        // body/html root element: always cover full window regardless of CSS sizes
-        if (par == -1 && e->z_index <= -9000 &&
+        /* The document root is the initial containing block.  Do not tie this
+         * invariant to the synthetic backdrop z-index: a real <body> can be
+         * restyled by a host and still must remain window-sized.  When body has
+         * overflow:hidden, a stale parser-default root size clips every
+         * absolutely positioned child to a tiny strip at the top-left. */
+        if (par == -1 &&
             (strcmp(e->type, "body") == 0 || strcmp(e->type, "html") == 0)) {
             e->x = 0.0f; e->y = 0.0f;
             e->w = window_width; e->h = window_height;
             e->rel_x = 0.0f; e->rel_y = 0.0f;
+            e->pct_w = 1; e->raw_w = 1.0f; e->raw_w_off = 0.0f;
+            e->pct_h = 1; e->raw_h = 1.0f; e->raw_h_off = 0.0f;
             continue;
         }
 
@@ -7378,15 +7580,30 @@ static void place_flex_cross(LunaElement* ch, LunaElement* cont, int row_mode,
 
 static float flex_main_size(LunaElement* ch, int row_mode, float available_main) {
     float size;
-    if (ch->has_flex_basis && !ch->flex_basis_auto)
+    if (available_main < 0.0f) available_main = 0.0f;
+
+    if (ch->has_flex_basis && !ch->flex_basis_auto) {
         size = ch->flex_basis;
-    else if (row_mode) {
-        if (ch->has_css_width && !ch->pct_w) size = ch->css_width;
-        else size = flex_content_width(ch);
+    } else if (row_mode) {
+        /* Percentage flex sizes are definite against the flex container's
+         * content box. Falling back to intrinsic width here made width:100%
+         * items ignore their parent and could push sibling controls aside. */
+        if (ch->pct_w)
+            size = available_main * ch->raw_w + ch->raw_w_off;
+        else if (ch->has_css_width)
+            size = css_outer_width(ch, ch->css_width);
+        else
+            size = flex_content_width(ch);
     } else {
-        if (ch->has_css_height && !ch->pct_h) size = ch->css_height;
-        else size = flow_content_height(ch);
+        if (ch->pct_h)
+            size = available_main * ch->raw_h + ch->raw_h_off;
+        else if (ch->has_css_height)
+            size = css_outer_height(ch, ch->css_height);
+        else
+            size = flow_content_height(ch);
     }
+
+    if (size < 0.0f) size = 0.0f;
     if (row_mode) {
         float min_w = css_outer_width(ch, ch->css_min_width);
         float max_w = resolved_max_width(ch, available_main);
@@ -7437,34 +7654,48 @@ static float flex_min_main(LunaElement* ch, int row_mode) {
    doesn't inherit stale/parse-default dimensions. Returns the cross length. */
 static float resolve_flex_cross_len(LunaElement* ch, int row_mode, int align,
                                     float available_cross) {
+    if (available_cross < 0.0f) available_cross = 0.0f;
+
     if (row_mode) {
-        if (align != 3 && !ch->has_css_height && !ch->pct_h && !(ch->css_positioned & 2)) {
-            float hh = flow_content_height(ch);
-            if (available_cross >= 0.0f && hh > available_cross) hh = available_cross;
-            float min_h = css_outer_height(ch, ch->css_min_height);
-            float max_h = resolved_max_height(ch, available_cross);
-            if (ch->has_min_height && hh < min_h) hh = min_h;
-            if (ch->has_max_height && hh > max_h) hh = max_h;
-            ch->h = hh;
+        float hh = ch->h;
+        if (ch->pct_h && !(ch->css_positioned & 2)) {
+            hh = available_cross * ch->raw_h + ch->raw_h_off;
+        } else if (align != 3 && !ch->has_css_height && !ch->pct_h &&
+                   !(ch->css_positioned & 2)) {
+            hh = flow_content_height(ch);
+            if (hh > available_cross) hh = available_cross;
         }
-        return ch->h;
+        if (hh < 0.0f) hh = 0.0f;
+        float min_h = css_outer_height(ch, ch->css_min_height);
+        float max_h = resolved_max_height(ch, available_cross);
+        if (ch->has_min_height && hh < min_h) hh = min_h;
+        if (ch->has_max_height && hh > max_h) hh = max_h;
+        ch->h = hh;
+        return hh;
     }
-    if (align != 3 && !ch->has_css_width && !ch->pct_w && !(ch->css_positioned & 1)) {
-        float ww = flex_content_width(ch);
-        if (available_cross >= 0.0f && ww > available_cross) ww = available_cross;
-        float min_w = css_outer_width(ch, ch->css_min_width);
-        float max_w = resolved_max_width(ch, available_cross);
-        if (ch->has_min_width && ww < min_w) ww = min_w;
-        if (ch->has_max_width && ww > max_w) ww = max_w;
-        ch->w = ww;
+
+    float ww = ch->w;
+    if (ch->pct_w && !(ch->css_positioned & 1)) {
+        ww = available_cross * ch->raw_w + ch->raw_w_off;
+    } else if (align != 3 && !ch->has_css_width && !ch->pct_w &&
+               !(ch->css_positioned & 1)) {
+        ww = flex_content_width(ch);
+        if (ww > available_cross) ww = available_cross;
     }
-    return ch->w;
+    if (ww < 0.0f) ww = 0.0f;
+    float min_w = css_outer_width(ch, ch->css_min_width);
+    float max_w = resolved_max_width(ch, available_cross);
+    if (ch->has_min_width && ww < min_w) ww = min_w;
+    if (ch->has_max_width && ww > max_w) ww = max_w;
+    ch->w = ww;
+    return ww;
 }
 
 static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
                              float pad_main, float pad_cross,
                              float inner_main, float inner_cross, float gap) {
     float main_sz[MAX_ELEMENTS];
+    float shrink_base[MAX_ELEMENTS];
     float fixed_main = 0.0f;
     int grow_n = 0;
     float grow_sum = 0.0f;
@@ -7492,6 +7723,7 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
         float margin_before = row_mode ? ch->margin_left : ch->margin_top;
         float margin_after = row_mode ? ch->margin_right : ch->margin_bottom;
         main_sz[k] = ml;
+        shrink_base[k] = ml;
         /* Sticky stays in-flow even if left/top insets were declared. */
         int positioned = ch->position_sticky ? 0
             : (row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2));
@@ -7514,26 +7746,48 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
                 main_sz[k] += free_main * (ch->flex_grow / grow_sum);
         }
     } else if (free_main < 0.0f) {
+        /* Repeat flex-shrink distribution whenever an item reaches its minimum.
+         * A one-pass clamp leaves unresolved overflow in the line and makes
+         * centered toolbars spill beyond their container at narrow widths. */
         float overflow = -free_main;
-        float shrink_sum = 0.0f;
-        for (int k = 0; k < n; k++) {
-            LunaElement* ch = &elements[kids[k]];
-            int positioned = ch->position_sticky ? 0
-                : (row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2));
-            if (positioned || ch->flex_shrink <= 0) continue;
-            shrink_sum += ch->flex_shrink * main_sz[k];
-        }
-        if (shrink_sum > 0.0f) {
+        unsigned char frozen[MAX_ELEMENTS] = {0};
+
+        for (int pass = 0; pass < n && overflow > 0.01f; pass++) {
+            float shrink_sum = 0.0f;
             for (int k = 0; k < n; k++) {
                 LunaElement* ch = &elements[kids[k]];
                 int positioned = ch->position_sticky ? 0
                     : (row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2));
-                if (positioned || ch->flex_shrink <= 0) continue;
-                float factor = (ch->flex_shrink * main_sz[k]) / shrink_sum;
-                float min_sz = flex_min_main(ch, row_mode);
-                main_sz[k] -= overflow * factor;
-                if (main_sz[k] < min_sz) main_sz[k] = min_sz;
+                if (positioned || frozen[k] || ch->flex_shrink <= 0.0f) continue;
+                shrink_sum += ch->flex_shrink * shrink_base[k];
             }
+            if (shrink_sum <= 0.0f) break;
+
+            float reduced = 0.0f;
+            int clamped = 0;
+            for (int k = 0; k < n; k++) {
+                LunaElement* ch = &elements[kids[k]];
+                int positioned = ch->position_sticky ? 0
+                    : (row_mode ? (ch->css_positioned & 1) : (ch->css_positioned & 2));
+                if (positioned || frozen[k] || ch->flex_shrink <= 0.0f) continue;
+
+                float weight = ch->flex_shrink * shrink_base[k];
+                float wanted = overflow * (weight / shrink_sum);
+                float min_sz = flex_min_main(ch, row_mode);
+                float capacity = main_sz[k] - min_sz;
+                if (capacity < 0.0f) capacity = 0.0f;
+                float actual = wanted < capacity ? wanted : capacity;
+                main_sz[k] -= actual;
+                reduced += actual;
+
+                if (actual + 0.01f < wanted || main_sz[k] <= min_sz + 0.01f) {
+                    frozen[k] = 1;
+                    clamped = 1;
+                }
+            }
+
+            overflow -= reduced;
+            if (reduced <= 0.01f || !clamped) break;
         }
     }
 
@@ -7545,76 +7799,42 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
     }
     total += gap * (float)(n > 1 ? n - 1 : 0);
 
-    float start = pad_main;
-    float use_gap = gap;
-    if (cont->justify_content == FLEX_JUSTIFY_CENTER)
-        start = pad_main + (inner_main - total) * 0.5f;
-    else if (cont->justify_content == FLEX_JUSTIFY_END)
-        start = pad_main + inner_main - total;
-    else if (cont->justify_content == FLEX_JUSTIFY_SPACE_BETWEEN && n > 1) {
-        float content = 0.0f;
-        for (int k = 0; k < n; k++) {
-            LunaElement* ch = &elements[kids[k]];
-            content += main_sz[k] + (row_mode ? ch->margin_left + ch->margin_right
-                                               : ch->margin_top + ch->margin_bottom);
-        }
-        use_gap = (inner_main - content) / (float)(n - 1);
-        if (use_gap < 0.0f) use_gap = 0.0f;
-        start = pad_main;
-    }
-
-    /* Auto-margin: find first item with margin_left_auto (row) or margin_top_auto (col) */
-    /* This item absorbs all free space as its margin, pushing it to the end */
-    int auto_margin_k = -1;
+    /* CSS flex auto margins share the remaining main-axis space across every
+     * auto side.  This supports both the common `margin-left:auto` push and
+     * true centering with `margin-left:auto; margin-right:auto`. */
+    int auto_margin_slots = 0;
     for (int k = 0; k < n; k++) {
         LunaElement* ch = &elements[kids[k]];
-        if (row_mode && ch->margin_left_auto) { auto_margin_k = k; break; }
-        if (!row_mode && ch->margin_top_auto) { auto_margin_k = k; break; }
+        if (row_mode) {
+            auto_margin_slots += ch->margin_left_auto ? 1 : 0;
+            auto_margin_slots += ch->margin_right_auto ? 1 : 0;
+        } else {
+            auto_margin_slots += ch->margin_top_auto ? 1 : 0;
+            auto_margin_slots += ch->margin_bottom_auto ? 1 : 0;
+        }
     }
-    if (auto_margin_k >= 0 && free_main > 0.0f) {
-        float cursor_a = pad_main;
-        for (int k = 0; k < auto_margin_k; k++) {
-            LunaElement* ch = &elements[kids[k]];
-            int align = child_cross_align(ch, cont, row_mode);
-            float cross_len = resolve_flex_cross_len(ch, row_mode, align, inner_cross);
-            if (row_mode) {
-                if (!(ch->css_positioned & 1)) { ch->w = main_sz[k]; ch->rel_x = cursor_a; }
-                place_flex_cross(ch, cont, 1, pad_cross, inner_cross, cross_len, align);
-                if (!(ch->css_positioned & 1))
-                    cursor_a += ch->margin_left + main_sz[k] + ch->margin_right + use_gap;
-            } else {
-                if (!(ch->css_positioned & 2)) { ch->h = main_sz[k]; ch->rel_y = cursor_a; }
-                place_flex_cross(ch, cont, 0, pad_cross, inner_cross, cross_len, align);
-                if (!(ch->css_positioned & 2))
-                    cursor_a += ch->margin_top + main_sz[k] + ch->margin_bottom + use_gap;
+    float remaining_main = inner_main - total;
+    float auto_margin_unit = (auto_margin_slots > 0 && remaining_main > 0.0f)
+        ? remaining_main / (float)auto_margin_slots : 0.0f;
+
+    float start = pad_main;
+    float use_gap = gap;
+    if (auto_margin_slots == 0) {
+        if (cont->justify_content == FLEX_JUSTIFY_CENTER)
+            start = pad_main + (inner_main - total) * 0.5f;
+        else if (cont->justify_content == FLEX_JUSTIFY_END)
+            start = pad_main + inner_main - total;
+        else if (cont->justify_content == FLEX_JUSTIFY_SPACE_BETWEEN && n > 1) {
+            float content = 0.0f;
+            for (int k = 0; k < n; k++) {
+                LunaElement* ch = &elements[kids[k]];
+                content += main_sz[k] + (row_mode ? ch->margin_left + ch->margin_right
+                                                   : ch->margin_top + ch->margin_bottom);
             }
+            use_gap = (inner_main - content) / (float)(n - 1);
+            if (use_gap < 0.0f) use_gap = 0.0f;
+            start = pad_main;
         }
-        float after_total = 0.0f;
-        for (int k = auto_margin_k; k < n; k++) {
-            LunaElement* ch = &elements[kids[k]];
-            after_total += main_sz[k] + (row_mode ? ch->margin_left + ch->margin_right
-                                                  : ch->margin_top + ch->margin_bottom);
-        }
-        after_total += use_gap * (float)(n - auto_margin_k - 1);
-        float cursor_b = pad_main + inner_main - after_total;
-        if (cursor_b < cursor_a) cursor_b = cursor_a;
-        for (int k = auto_margin_k; k < n; k++) {
-            LunaElement* ch = &elements[kids[k]];
-            int align = child_cross_align(ch, cont, row_mode);
-            float cross_len = resolve_flex_cross_len(ch, row_mode, align, inner_cross);
-            if (row_mode) {
-                if (!(ch->css_positioned & 1)) { ch->w = main_sz[k]; ch->rel_x = cursor_b; }
-                place_flex_cross(ch, cont, 1, pad_cross, inner_cross, cross_len, align);
-                if (!(ch->css_positioned & 1))
-                    cursor_b += ch->margin_left + main_sz[k] + ch->margin_right + use_gap;
-            } else {
-                if (!(ch->css_positioned & 2)) { ch->h = main_sz[k]; ch->rel_y = cursor_b; }
-                place_flex_cross(ch, cont, 0, pad_cross, inner_cross, cross_len, align);
-                if (!(ch->css_positioned & 2))
-                    cursor_b += ch->margin_top + main_sz[k] + ch->margin_bottom + use_gap;
-            }
-        }
-        return; /* skip normal placement */
     }
 
     float cursor = start;
@@ -7622,16 +7842,25 @@ static void layout_flex_line(LunaElement* cont, int* kids, int n, int row_mode,
         LunaElement* ch = &elements[kids[k]];
         int align = child_cross_align(ch, cont, row_mode);
         float cross_len = resolve_flex_cross_len(ch, row_mode, align, inner_cross);
+        float auto_before = 0.0f, auto_after = 0.0f;
+        if (row_mode) {
+            if (ch->margin_left_auto) auto_before = auto_margin_unit;
+            if (ch->margin_right_auto) auto_after = auto_margin_unit;
+        } else {
+            if (ch->margin_top_auto) auto_before = auto_margin_unit;
+            if (ch->margin_bottom_auto) auto_after = auto_margin_unit;
+        }
+        cursor += auto_before;
         if (row_mode) {
             if (!(ch->css_positioned & 1)) { ch->w = main_sz[k]; ch->rel_x = cursor; }
             place_flex_cross(ch, cont, 1, pad_cross, inner_cross, cross_len, align);
             if (!(ch->css_positioned & 1))
-                cursor += ch->margin_left + main_sz[k] + ch->margin_right + use_gap;
+                cursor += ch->margin_left + main_sz[k] + ch->margin_right + auto_after + use_gap;
         } else {
             if (!(ch->css_positioned & 2)) { ch->h = main_sz[k]; ch->rel_y = cursor; }
             place_flex_cross(ch, cont, 0, pad_cross, inner_cross, cross_len, align);
             if (!(ch->css_positioned & 2))
-                cursor += ch->margin_top + main_sz[k] + ch->margin_bottom + use_gap;
+                cursor += ch->margin_top + main_sz[k] + ch->margin_bottom + auto_after + use_gap;
         }
     }
 }
@@ -11045,7 +11274,8 @@ static int css_text_vertical_align(const LunaElement* e) {
 // ============================================================
 
 static void focus_element(int idx);
-static void focus_element_ex(int idx, int via_keyboard);
+static void focus_element_pointer(int idx);
+static void focus_element_ex(int idx, int via_keyboard, int scroll_view);
 static int element_is_inert(int idx);
 static int element_aria_hidden(int idx);
 static void input_set_caret_from_x(LunaElement* e, float local_x);
@@ -11367,7 +11597,10 @@ void mouse_button_callback(void* window, int button, int action, int mods) {
             LunaElement* e = &elements[hit];
             if (g_focused_element_idx != -1 && g_focused_element_idx != hit)
                 update_element_style(&elements[g_focused_element_idx]);
-            focus_element(hit);
+            /* A pointer target is necessarily already visible. Scrolling it
+               into view here can move a scroll container between press and
+               release, causing the release to activate a different row. */
+            focus_element_pointer(hit);
             bring_window_ptr_to_front(hit);
             if (e->is_input) {
                 float bx, by, bw, bh;
@@ -11470,10 +11703,14 @@ static int element_is_inert(int idx) {
 }
 
 static void focus_element(int idx) {
-    focus_element_ex(idx, 0);
+    focus_element_ex(idx, 0, 1);
 }
 
-static void focus_element_ex(int idx, int via_keyboard) {
+static void focus_element_pointer(int idx) {
+    focus_element_ex(idx, 0, 0);
+}
+
+static void focus_element_ex(int idx, int via_keyboard, int scroll_view) {
     if (idx != -1 && element_is_inert(idx)) return;
     int old = g_focused_element_idx;
     if (idx == g_focused_element_idx) {
@@ -11486,7 +11723,7 @@ static void focus_element_ex(int idx, int via_keyboard) {
     if (old != -1) update_focus_within_styles(old);
     if (idx != -1) {
         update_focus_within_styles(idx);
-        scroll_into_view(idx);
+        if (scroll_view) scroll_into_view(idx);
     }
 }
 
@@ -11537,7 +11774,7 @@ static void focus_move_tab(int backward) {
     int next;
     if (cur == -1) next = backward ? n - 1 : 0;
     else next = backward ? (cur - 1 + n) % n : (cur + 1) % n;
-    focus_element_ex(order[next], 1);
+    focus_element_ex(order[next], 1, 1);
 }
 
 static void focus_select_option_step(int backward) {
@@ -11557,7 +11794,7 @@ static void focus_select_option_step(int backward) {
     for (int i = 0; i < n; i++)
         if (options[i] == g_focused_element_idx) { cur = i; break; }
     int next = (cur == -1) ? 0 : backward ? (cur - 1 + n) % n : (cur + 1) % n;
-    focus_element_ex(options[next], 1);
+    focus_element_ex(options[next], 1, 1);
 }
 
 
@@ -12015,9 +12252,25 @@ void luna_request_screenshot(const char* p) { strncpy(g_screenshot_path, p, size
 
 void luna_inject_body_background(void) {
     if (elem_count >= MAX_ELEMENTS) return;
-    /* parse_html may already have materialized <body> as a real element */
-    for (int i = 0; i < elem_count; i++)
-        if (strcmp(elements[i].type, "body") == 0) return;
+    /* parse_html may already have materialized <body> as a real element.
+     * Reassert the initial-containing-block fields: update_element_style()
+     * deliberately resets layout fields and a host-side restyle must not turn
+     * overflow:hidden on body into a tiny global clip rectangle. */
+    for (int i = 0; i < elem_count; i++) {
+        if (strcmp(elements[i].type, "body") != 0) continue;
+        LunaElement* body = &elements[i];
+        body->parent_idx = -1;
+        body->z_index = -9999;
+        body->pct_w = 1; body->raw_w = 1.0f; body->raw_w_off = 0.0f;
+        body->pct_h = 1; body->raw_h = 1.0f; body->raw_h_off = 0.0f;
+        body->x = body->y = body->rel_x = body->rel_y = 0.0f;
+        body->w = luna_window_width;
+        body->h = luna_window_height;
+        g_layout_dirty = 1;
+        g_render_order_dirty = 1;
+        g_visual_scan_needed = 1;
+        return;
+    }
     LunaElement body_e;
     memset(&body_e, 0, sizeof(body_e));
     strncpy(body_e.type, "body", 31);
@@ -12135,25 +12388,36 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     ensure_blur_fbos(fbw, fbh);
     if (!g_blur_fbo[0]) return;
 
-    /* fw/fh drive the viewport and the screen→GL y flip; tw/th normalise UVs
-     * into the (possibly larger) capture texture. */
+    /* Geometry is laid out in logical CSS pixels, while framebuffer textures
+     * and glCopyTexSubImage2D use physical pixels.  Keeping those coordinate
+     * systems mixed made a 2x/1.25x scale capture only a fraction of the
+     * toolbar, which could leave the glass surface and its controls looking
+     * clipped or displaced. */
     float fw = (float)fbw, fh = (float)fbh;
     float tw = (float)g_blur_tex_w, th = (float)g_blur_tex_h;
-    float sx = ex - g_render_off_x, sy = ey - g_render_off_y;
+    float res_x = LUNA_RRES_X > 0.0f ? LUNA_RRES_X : fw;
+    float res_y = LUNA_RRES_Y > 0.0f ? LUNA_RRES_Y : fh;
+    float px_scale_x = fw / res_x;
+    float px_scale_y = fh / res_y;
+    float sx = (ex - g_render_off_x) * px_scale_x;
+    float sy = (ey - g_render_off_y) * px_scale_y;
+    float sw = ew * px_scale_x;
+    float sh = eh * px_scale_y;
+    float blur_px_scale = px_scale_x > px_scale_y ? px_scale_x : px_scale_y;
 
     /* Every stage below works on the element rect grown by the blur reach
      * instead of the whole screen.  A menubar with backdrop-filter used to
      * cost a full-framebuffer texture copy plus two full-framebuffer blur
      * passes *per blurred element, per frame*; the visible result is identical
      * because nothing outside this region can influence the element's pixels. */
-    float r   = blur_radius > 0.5f ? blur_radius : 0.5f;
+    float r   = (blur_radius > 0.5f ? blur_radius : 0.5f) * blur_px_scale;
     float pad = r + 2.0f;
 
-    /* Capture region in document coordinates (y grows downward), clipped. */
+    /* Capture region in framebuffer pixels (y grows downward), clipped. */
     int cx0 = (int)floorf(sx - pad);            if (cx0 < 0) cx0 = 0;
-    int cx1 = (int)ceilf(sx + ew + pad);        if (cx1 > fbw) cx1 = fbw;
+    int cx1 = (int)ceilf(sx + sw + pad);        if (cx1 > fbw) cx1 = fbw;
     int cy0 = (int)floorf(sy - pad);            if (cy0 < 0) cy0 = 0;
-    int cy1 = (int)ceilf(sy + eh + pad);        if (cy1 > fbh) cy1 = fbh;
+    int cy1 = (int)ceilf(sy + sh + pad);        if (cy1 > fbh) cy1 = fbh;
     if (cx1 <= cx0 || cy1 <= cy0) return;
 
     /* Step 1: Copy just that region of the default framebuffer into
@@ -12175,18 +12439,18 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
      * element or frame had left in g_blur_tex[1] — visible as a wrong band
      * along the top and bottom edge of every backdrop-filter surface. */
     float hy0 = sy - pad;           if (hy0 < 0.0f)        hy0 = 0.0f;
-    float hy1 = sy + eh + pad;      if (hy1 > (float)fbh)  hy1 = (float)fbh;
+    float hy1 = sy + sh + pad;      if (hy1 > (float)fbh)  hy1 = (float)fbh;
     glBindFramebuffer_(GL_FRAMEBUFFER, g_blur_fbo[1]);
     glViewport(0, 0, fbw, fbh);
     luna_use_program(blur_program);
     glUniform2f(blur_loc.uResolution, fw, fh);
     glUniform2f(blur_loc.uPos,  sx, hy0);
-    glUniform2f(blur_loc.uSize, ew, hy1 - hy0);
+    glUniform2f(blur_loc.uSize, sw, hy1 - hy0);
     if (glActiveTexture_) glActiveTexture_(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, g_blur_tex[0]);
     glUniform1i_(blur_loc.uSrc, 0);
     glUniform2f(blur_loc.uBlurDir, 1.0f / tw, 0.0f);
-    glUniform1f(blur_loc.uBlurRadius, blur_radius);
+    glUniform1f(blur_loc.uBlurRadius, r);
     glUniform2f(blur_loc.uBlurTexSize, tw, th);
     glUniform2f(blur_loc.uFbSize, fw, fh);
     glUniform2f(blur_loc.uBlurOrigin, sx, hy0);
@@ -12198,7 +12462,7 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     glBindFramebuffer_(GL_FRAMEBUFFER, g_blur_fbo[0]);
     glBindTexture(GL_TEXTURE_2D, g_blur_tex[1]);
     glUniform2f(blur_loc.uPos,  sx, sy);
-    glUniform2f(blur_loc.uSize, ew, eh);
+    glUniform2f(blur_loc.uSize, sw, sh);
     glUniform2f(blur_loc.uBlurOrigin, sx, sy);
     glUniform2f(blur_loc.uBlurDir, 0.0f, 1.0f / th);
     glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
@@ -12235,7 +12499,8 @@ static void apply_backdrop_blur(float ex, float ey, float ew, float eh,
     glUniform1i_(backdrop_loc.uSrc, 0);
     glUniform2f(backdrop_loc.uBlurTexSize, tw, th);
     glUniform2f(backdrop_loc.uFbSize, fw, fh);
-    glUniform2f(backdrop_loc.uBlurOrigin, ex - g_render_off_x, ey - g_render_off_y);
+    glUniform2f(backdrop_loc.uBlurOrigin, sx, sy);
+    glUniform2f(backdrop_loc.uSampleScale, px_scale_x, px_scale_y);
     glUniform1f(backdrop_loc.uSaturate, saturate);
     glUniform1f(backdrop_loc.uBrightness, brightness);
     luna_bind_vao(g_rect_vao);
@@ -12801,6 +13066,7 @@ static void cache_uniform_locations(void) {
         backdrop_loc.uBlurTexSize = glGetUniformLocation(backdrop_program, "uBlurTexSize");
         backdrop_loc.uFbSize      = glGetUniformLocation(backdrop_program, "uFbSize");
         backdrop_loc.uBlurOrigin  = glGetUniformLocation(backdrop_program, "uBlurOrigin");
+        backdrop_loc.uSampleScale = glGetUniformLocation(backdrop_program, "uSampleScale");
         backdrop_loc.uSaturate    = glGetUniformLocation(backdrop_program, "uSaturate");
         backdrop_loc.uBrightness  = glGetUniformLocation(backdrop_program, "uBrightness");
     }

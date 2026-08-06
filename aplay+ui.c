@@ -7,7 +7,7 @@
 // clang -Os -o aplay+ui aplay+ui.c -lasound -lglfw -lGL -lpthread -ldl -lm            (dr_flac, default)
 // clang -Os -DUSE_FOXEN_FLAC -o aplay+ui aplay+ui.c -lasound -lglfw -lGL -lpthread -ldl -lm   (foxen-flac)
 //
-// ./aplay+ui -rxfp -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
+// ./aplay+ui -rxp -d hw:7,0 /Music/ -s '^(?!.*nstrumental).*$'
 
 // ---- Step 1: declarations only (engine header included without implementation)
 // This gives us the engine's playback-state type so the GUI can mirror it
@@ -717,6 +717,9 @@ void usage(FILE *fp, int argc, char **argv)
 {
 	fprintf(fp,
 	        "Usage: %s [options] dir\n\n"
+	        "Normal playback uses the engine's direct PCM bypass. Sample conversion\n"
+	        "and DSP run only when explicitly requested (-f, crosstalk, EQ, DSD,\n"
+	        "or super resolution).\n\n"
 	        "A luna-ui player window opens automatically. Playback, seek, volume,\n"
 	        "Crosstalk, DSD, super resolution, format filter, repeat, device, and quit are controlled\n"
 	        "from the right-click menu (and keyboard shortcuts).\n"
@@ -730,7 +733,7 @@ void usage(FILE *fp, int argc, char **argv)
 	        "                   (toggle from the right-click menu)\n"
 	        "--skins <dir>      Same as -R\n"
 	        "-d <device name>   Specify ALSA device [default: first openable hw:N,M]\n"
-	        "-f                 Use 32-bit floating-point playback\n"
+	        "-f                 Force 32-bit float output (may convert source PCM)\n"
 	        "-r                 Recursively search directories\n"
 	        "-x                 Enable random playback\n"
 	        "-s <regexp>        Search files with a regex\n"
@@ -3784,11 +3787,6 @@ static void aui_glfw_error_cb(int error, const char *description)   { fprintf(st
 
 static void gui_run(void)
 {
-	/* The classic EQ window is visible at startup, but DSP starts completely
-	 * disabled and flat so all audio routes retain their original fast path. */
-	aplay_equalizer_reset();
-	aplay_equalizer_set_enabled(0);
-
 	if (g_skins_folder_arg && g_skins_folder_arg[0]) {
 		if (scan_skins_folder(g_skins_folder_arg) > 0) {
 			snprintf(g_skins_folder, sizeof(g_skins_folder), "%s", g_skins_folder_arg);
@@ -4262,6 +4260,11 @@ int main(int argc, char *argv[])
 			printf("DSD raw bitstream will also be written to: %s\n", dsd_file_path);
 		}
 	}
+
+	/* Establish the transparent default before the audio thread starts.
+	 * The EQ window may be visible, but disabled/flat EQ is a true bypass. */
+	aplay_equalizer_reset();
+	aplay_equalizer_set_enabled(0);
 
 	g_start_flag = flag;
 	PlaybackArgs pargs = { .flag = flag, .dir = dir, .type = type, .regexp = regexp };

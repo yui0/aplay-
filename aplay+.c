@@ -132,6 +132,7 @@ void usage(FILE *fp, int argc, char **argv)
 {
 	fprintf(fp,
 	        "Usage: %s [options] dir\n\n"
+	        "Normal playback uses a direct PCM bypass; DSP runs only when enabled.\n\n"
 	        "Options:\n"
 	        "-h                 Print this help message\n"
 	        "-d <device name>   Specify ALSA device [default: first openable hw:N,M]\n"

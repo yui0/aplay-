@@ -11,17 +11,32 @@
 
 ![Logo](logo.jpeg)
 
-<p align="center">
-  <img src="screenshots/aplay-ui-hero.png" alt="aplay+ Ember UI — player, equalizer, and playlist" width="360">
-</p>
-
-<p align="center"><em>Ember Edition — Winamp-classic soul, audiophile controls, ALSA BitPerfect output</em></p>
+## 🖼️ Screenshots
 
 <p align="center">
-  <img src="screenshots/aplay-ui-about.png" alt="aplay+ Ember Edition — About dialog" width="300">
-&nbsp;&nbsp;
-  <img src="screenshots/aplay-ui-player.png" alt="aplay+ player and equalizer windows" width="300">
+  <img src="screenshots/aplay-ember.svg" alt="aplay+ built-in Ember skin — player, equalizer, and playlist" width="720">
 </p>
+
+<p align="center"><em>Built-in Ember — warm charcoal, copper accents, live equalizer, and BitPerfect device status</em></p>
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="screenshots/aplay-sapphire-skin.svg" alt="aplay+ using a custom Sapphire Winamp Classic skin" width="100%"><br>
+      <sub><b>Custom Winamp Classic skin</b> — Sapphire neon theme</sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="screenshots/aplay-context-menu.svg" alt="aplay+ Ember skin with the complete right-click control menu" width="100%"><br>
+      <sub><b>Right-click controls</b> — playback, DSP, devices, skins, and display options</sub>
+    </td>
+  </tr>
+</table>
+
+These compact SVG assets contain optimized raster copies derived from captures
+rendered by the real Luna/OpenGL application through the headless screenshot
+runner in [`tools/screenshots`](tools/screenshots). Its minimal GLFW
+compatibility layer uses surfaceless EGL, so regenerating the raw PNG captures
+does not require GLFW development packages.
 
 ## 💿 Supported File Formats
 aplay+ supports a variety of popular audio formats:
@@ -108,10 +123,6 @@ aplay+-specific XTC, DSD, repeat, and format controls remain available from
 the right-click menu (and keyboard shortcuts). Text size can be cycled with
 `T` / **Text size** in the menu (Compact → Comfortable → Large → Extra large).
 
-<p align="center">
-  <img src="screenshots/aplay-ui-menu.png" alt="aplay+ Ember UI with right-click menu" width="640">
-</p>
-
 ## 🖥️ Graphical player (`aplay+ui`)
 
 `make ui` builds a multi-window Winamp-style shell on top of the same playback
@@ -140,10 +151,6 @@ Output devices are chosen from a cascading submenu so cards stay easy to scan:
 The active card and PCM device are marked with a check. You can still click the
 device label in the playlist footer for the flat picker, or pass `-d` on the
 command line. Without `-d`, aplay+ auto-selects the first openable `hw:N,M`.
-
-<p align="center">
-  <img src="screenshots/aplay-ui-alsa-flyout.png" alt="Hierarchical ALSA device menu: cards then PCM devices" width="720">
-</p>
 
 ## 🌸 How to use
 

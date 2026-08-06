@@ -21,15 +21,17 @@ capture time, so no third-party Winamp artwork is stored in the repository.
 Run from anywhere in the repository:
 
 ```sh
-tools/screenshots/capture.sh
+sh tools/screenshots/capture.sh
 ```
 
-Outputs:
+Raw outputs:
 
 - `screenshots/aplay-ember.png`
 - `screenshots/aplay-sapphire-skin.png`
 - `screenshots/aplay-context-menu.png`
 
-Requirements are a C compiler, Python 3, the runtime `libEGL.so.1`, and a Mesa
-EGL implementation with `EGL_PLATFORM_SURFACELESS_MESA`. GLFW headers and
+The compact SVG files committed for README display contain optimized raster
+copies of these real captures. Requirements for generating the raw captures
+are a C compiler, Python 3, the runtime `libEGL.so.1`, and a Mesa EGL
+implementation with `EGL_PLATFORM_SURFACELESS_MESA`. GLFW headers and
 `libglfw` are intentionally not used.

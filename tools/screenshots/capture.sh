@@ -5,7 +5,7 @@ ROOT=$(CDPATH= cd -- "$HERE/../.." && pwd)
 OUT="$ROOT/screenshots"
 
 python3 "$HERE/generate_sapphire_skin.py"
-"$HERE/build.sh"
+sh "$HERE/build.sh"
 mkdir -p "$OUT"
 cd "$HERE"
 

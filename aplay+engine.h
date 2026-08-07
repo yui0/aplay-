@@ -38,7 +38,23 @@
 #include <sys/select.h>
 #include <sys/stat.h>
 
+/*
+ * AUDIO_release() is used for the GUI/TUI hard-stop path.  The original
+ * helper drains ALSA before closing, which makes Stop wait for all queued
+ * audio.  Keep the original implementation under a private name and expose
+ * a low-latency release that drops queued frames immediately.
+ */
+#define AUDIO_release aplay_audio_release_drain
 #include "alsa.h"
+#undef AUDIO_release
+static inline void AUDIO_release(AUDIO *thiz)
+{
+	if (!thiz || !thiz->handle) return;
+	(void)snd_pcm_drop(thiz->handle);
+	snd_pcm_close(thiz->handle);
+	thiz->handle = NULL;
+}
+
 #include "regexp.h"
 #include "random.h"
 #include "ls.h"
@@ -54,13 +70,15 @@
 
 // ---- Audio render constants ----
 /*
- * Normal PCM blocks are deliberately larger than the fixed DSD encoder block.
- * 512 frames keeps interactive latency low (about 11.6 ms at 44.1 kHz) while
- * greatly reducing decoder, ALSA, key-poll and UI-loop overhead.
+ * Decoder/DSP blocks stay at 512 frames for throughput, while the ALSA period
+ * is smaller.  This separates decode efficiency from device/control latency:
+ * 256 output frames are about 5.8 ms at 44.1 kHz.
  */
-#define FRAMES                 512
+#define FRAMES                 512  /* decoder/DSP block: keep throughput */
+#define AUDIO_PERIOD_FRAMES    256  /* ALSA period: ~5.8 ms @ 44.1 kHz */
 #define DSD_ENC_INPUT_CHUNK     32
 #define AUDIO_SCRATCH_FRAMES  8192
+#define AUDIO_WAIT_MS           20  /* bound control stalls on unusual devices */
 #define UI_REFRESH_INTERVAL_NS 50000000ULL  /* 20 Hz */
 #define MAX_DELAY_SAMPLES       16
 #define SEEK_SECONDS            10
@@ -372,6 +390,27 @@ static void aplay_render_throttled(tui_state_t *ts, uint64_t *last_render_ns)
 	(DSD_ENC_INPUT_CHUNK * DSD_ENC_OSR / 8)
 #define MON_ACCUM_BLOCKS 8
 
+/* Drop queued PCM without waiting for snd_pcm_drain(). */
+static void aplay_audio_abort_close(AUDIO *a)
+{
+	if (!a) return;
+	if (a->handle) {
+		(void)snd_pcm_drop(a->handle);
+		snd_pcm_close(a->handle);
+		a->handle = NULL;
+	}
+	free(a->buffer);
+	a->buffer = NULL;
+}
+
+/* Discard stale queued audio (seek) but keep the device open. */
+static void aplay_audio_discard_queue(AUDIO *a)
+{
+	if (!a || !a->handle) return;
+	(void)snd_pcm_drop(a->handle);
+	(void)snd_pcm_prepare(a->handle);
+}
+
 typedef struct {
 	DSDEncoder *enc;
 	AUDIO a;
@@ -568,7 +607,7 @@ static void dsdsink_write(DsdSink *sink,
 
 			if (room == 0) {
 				AUDIO_play0(&sink->mon_a);
-				AUDIO_wait(&sink->mon_a, 100);
+				AUDIO_wait(&sink->mon_a, AUDIO_WAIT_MS);
 				sink->mon_accum_fill = 0;
 				room = sink->mon_accum_period;
 			}
@@ -585,7 +624,7 @@ static void dsdsink_write(DsdSink *sink,
 			if (sink->mon_accum_fill >=
 			    sink->mon_accum_period) {
 				AUDIO_play0(&sink->mon_a);
-				AUDIO_wait(&sink->mon_a, 100);
+				AUDIO_wait(&sink->mon_a, AUDIO_WAIT_MS);
 				sink->mon_accum_fill = 0;
 			}
 
@@ -605,7 +644,7 @@ static void dsdsink_write(DsdSink *sink,
 			sink->enc, ch_ptrs, even_bytes,
 			(int32_t *)sink->a.buffer, &dop_frames);
 		AUDIO_play0(&sink->a);
-		AUDIO_wait(&sink->a, 100);
+		AUDIO_wait(&sink->a, AUDIO_WAIT_MS);
 	}
 }
 
@@ -625,7 +664,7 @@ static void dsdsink_close(DsdSink *sink)
 		       remain * (size_t)sink->channels *
 		       sizeof(float));
 		AUDIO_play0(&sink->mon_a);
-		AUDIO_wait(&sink->mon_a, 100);
+		AUDIO_wait(&sink->mon_a, AUDIO_WAIT_MS);
 	}
 	if (sink->mon_a.handle) AUDIO_close(&sink->mon_a);
 	if (sink->a.handle) AUDIO_close(&sink->a);
@@ -634,6 +673,19 @@ static void dsdsink_close(DsdSink *sink)
 		dsd_decoder_free(sink->mon_decoder);
 	if (sink->enc)
 		dsd_encoder_free(sink->enc);
+	free(sink->mon_block_buf);
+	free(sink->dsd_buf);
+	memset(sink, 0, sizeof(*sink));
+}
+
+/* Immediate DSD teardown for Stop/Next/device-mode changes. */
+static void dsdsink_abort(DsdSink *sink)
+{
+	if (!sink) return;
+	aplay_audio_abort_close(&sink->mon_a);
+	aplay_audio_abort_close(&sink->a);
+	if (sink->mon_decoder) dsd_decoder_free(sink->mon_decoder);
+	if (sink->enc) dsd_encoder_free(sink->enc);
 	free(sink->mon_block_buf);
 	free(sink->dsd_buf);
 	memset(sink, 0, sizeof(*sink));
@@ -1004,8 +1056,12 @@ static const float *outr_apply_equalizer(OutRouter *r,
 static void outr_close_dsd(OutRouter *r, int flush)
 {
 	if (!r->dsd_open) return;
-	if (flush) dsdaccum_flush(&r->accum, &r->dsd);
-	dsdsink_close(&r->dsd);
+	if (flush) {
+		dsdaccum_flush(&r->accum, &r->dsd);
+		dsdsink_close(&r->dsd);
+	} else {
+		dsdsink_abort(&r->dsd);
+	}
 	r->dsd_open = 0;
 	dsdaccum_reset(&r->accum);
 }
@@ -1013,9 +1069,9 @@ static void outr_close_dsd(OutRouter *r, int flush)
 static void outr_open_pcm(OutRouter *r)
 {
 	if (r->pcm_open) return;
-	if (r->dsd_open) outr_close_dsd(r, 1);
+	if (r->dsd_open) outr_close_dsd(r, 0);
 	if (AUDIO_init(&r->pcm, r->dev_buf, r->sample_rate,
-	               r->channels, FRAMES, 1, r->format) == 0)
+	               r->channels, AUDIO_PERIOD_FRAMES, 1, r->format) == 0)
 		r->pcm_open = 1;
 }
 
@@ -1033,7 +1089,7 @@ static void outr_open_dsd(OutRouter *r)
 	}
 
 	if (r->pcm_open) {
-		AUDIO_close(&r->pcm);
+		aplay_audio_abort_close(&r->pcm);
 		r->pcm_open = 0;
 	}
 
@@ -1236,11 +1292,42 @@ static int outr_output_rate(OutRouter *r)
 	return (int)r->dsd.a.freq;
 }
 
+/* Remove already queued audio after a seek so the new position is audible now. */
+static void outr_discard_queued(OutRouter *r)
+{
+	if (!r) return;
+	if (r->pcm_open) aplay_audio_discard_queue(&r->pcm);
+	if (r->dsd_open) {
+		AUDIO *a = r->dsd.monitor_mode ? &r->dsd.mon_a : &r->dsd.a;
+		aplay_audio_discard_queue(a);
+		r->dsd.mon_accum_fill = 0;
+		dsdaccum_reset(&r->accum);
+	}
+	r->sr_have_prev = 0;
+	if (r->eq_z1 && r->eq_z2) {
+		size_t states = (size_t)APLAY_EQ_BANDS * (size_t)r->channels;
+		memset(r->eq_z1, 0, states * sizeof(float));
+		memset(r->eq_z2, 0, states * sizeof(float));
+	}
+}
+
+/* Transport controls must not wait for the ALSA drain queue. */
+static void outr_abort(OutRouter *r)
+{
+	if (!r) return;
+	if (r->pcm_open || r->pcm.handle || r->pcm.buffer) {
+		aplay_audio_abort_close(&r->pcm);
+		r->pcm_open = 0;
+	}
+	if (r->dsd_open) outr_close_dsd(r, 0);
+	r->sr_have_prev = 0;
+}
+
 static void outr_close(OutRouter *r)
 {
 	if (!r) return;
 	if (g_active_router_ptr == r) g_active_router_ptr = NULL;
-	if (r->pcm_open && r->pcm.handle) AUDIO_close(&r->pcm);
+	if (r->pcm_open || r->pcm.handle || r->pcm.buffer) AUDIO_close(&r->pcm);
 	outr_close_dsd(r, 1);
 	dsdaccum_free(&r->accum);
 	free(r->i16_scratch);
@@ -1264,11 +1351,11 @@ static int outr_set_device(OutRouter *r, const char *name)
 	was_dsd = r->use_dsd;
 	snprintf(r->dev_buf, sizeof(r->dev_buf), "%s", name);
 
-	if (r->pcm_open) {
-		if (r->pcm.handle) AUDIO_close(&r->pcm);
+	if (r->pcm_open || r->pcm.handle || r->pcm.buffer) {
+		aplay_audio_abort_close(&r->pcm);
 		r->pcm_open = 0;
 	}
-	outr_close_dsd(r, 1);
+	outr_close_dsd(r, 0);
 
 	r->use_dsd = was_dsd;
 	if (was_dsd) outr_open_dsd(r);
@@ -1319,7 +1406,7 @@ static void outr_feed_float(OutRouter *r,
 	if (!eq_active && !r->use_dsd && !r->use_super_res &&
 	    r->format == SND_PCM_FORMAT_FLOAT_LE) {
 		AUDIO_play(&r->pcm, (char *)pcm, (int)frames);
-		AUDIO_wait(&r->pcm, 100);
+		AUDIO_wait(&r->pcm, AUDIO_WAIT_MS);
 		return;
 	}
 
@@ -1380,7 +1467,7 @@ static void outr_feed_float(OutRouter *r,
 		AUDIO_play(&r->pcm, (char *)r->i16_scratch,
 		           (int)frames);
 	}
-	AUDIO_wait(&r->pcm, 100);
+	AUDIO_wait(&r->pcm, AUDIO_WAIT_MS);
 }
 
 static void outr_feed_s16(OutRouter *r,
@@ -1406,7 +1493,7 @@ static void outr_feed_s16(OutRouter *r,
 	if (!eq_active && !r->use_dsd && !r->use_super_res &&
 	    r->format != SND_PCM_FORMAT_FLOAT_LE) {
 		AUDIO_play(&r->pcm, (char *)pcm, (int)frames);
-		AUDIO_wait(&r->pcm, 100);
+		AUDIO_wait(&r->pcm, AUDIO_WAIT_MS);
 		return;
 	}
 
@@ -1616,7 +1703,7 @@ void play_test_mode(int format, int flag)
 	ts.device = dev;
 	ts.note = "Device busy — waiting";
 	tui_open();
-	if (audio_wait_init(&a, dev, sample_rate, channels, FRAMES, 1, format, &ts) < 0) {
+	if (audio_wait_init(&a, dev, sample_rate, channels, AUDIO_PERIOD_FRAMES, 1, format, &ts) < 0) {
 		tui_close();
 		return;
 	}
@@ -1638,7 +1725,7 @@ void play_test_mode(int format, int flag)
 	while (1) {
 		int k = key(&a, NULL);
 		if (k) {
-			if (k == 'q' || k == 0x1b) break;
+			if (k == 'q' || k == 0x1b) { aplay_audio_abort_close(&a); break; }
 			if (k == 'c') {
 				flag ^= USE_CROSSTALK;
 				g_flag_diff ^= USE_CROSSTALK;
@@ -1659,7 +1746,7 @@ void play_test_mode(int format, int flag)
 		void *output_buffer = a.buffer;
 		float *buffer_f32 = (float*)a.buffer;
 		int16_t *buffer_s16 = (int16_t*)a.buffer;
-		for (int i = 0; i < FRAMES; i++) {
+		for (int i = 0; i < AUDIO_PERIOD_FRAMES; i++) {
 			double t = (double)(global_sample_index + i) / sample_rate;
 			int current_phase_sample = phase_sample_index + i;
 			double left_amplitude, right_amplitude;
@@ -1689,14 +1776,14 @@ void play_test_mode(int format, int flag)
 		}
 
 		if (flag & USE_CROSSTALK) {
-			apply_crosstalk_cancellation(&xtc, output_buffer, FRAMES, channels, format);
+			apply_crosstalk_cancellation(&xtc, output_buffer, AUDIO_PERIOD_FRAMES, channels, format);
 		}
 
 		AUDIO_play0(&a);
-		AUDIO_wait(&a, 100);
+		AUDIO_wait(&a, AUDIO_WAIT_MS);
 
-		global_sample_index += FRAMES;
-		phase_sample_index  += FRAMES;
+		global_sample_index += AUDIO_PERIOD_FRAMES;
+		phase_sample_index  += AUDIO_PERIOD_FRAMES;
 		if (phase_sample_index >= frames_per_phase) {
 			phase_sample_index = 0;
 			phase = (phase + 1) % total_phases;
@@ -1819,12 +1906,14 @@ void play_wav(char *name, int format, int flag)
 			    (uint64_t)target > wav.totalPCMFrameCount)
 				target = (int64_t)wav.totalPCMFrameCount;
 			if (drwav_seek_to_pcm_frame(&wav, (drwav_uint64)target)) {
+				outr_discard_queued(&router);
 				c = (uint64_t)target;
 				ts.cur = (double)c / wav.sampleRate;
 				ts.note = k == KEY_RIGHT ? ">> +10s" : "<< -10s";
 				tui_render(&ts);
 			}
 		} else if (k) {
+			outr_abort(&router);
 			break;
 		}
 
@@ -2223,6 +2312,7 @@ void play_flac(char *name, int format, int flag)
 						    out_buf, pcm_acc,
 						    pcm_capacity,
 						    &acc_pos, &acc_fill)) {
+						outr_discard_queued(&router);
 						frame_pos =
 							(uint64_t)target;
 						eof = 0;
@@ -2236,6 +2326,7 @@ void play_flac(char *name, int format, int flag)
 						tui_render(&ts);
 					}
 				} else if (k) {
+					outr_abort(&router);
 					break;
 				}
 
@@ -2371,12 +2462,14 @@ void play_flac(char *name, int format, int flag)
 			    (uint64_t)target > flac->totalPCMFrameCount)
 				target = (int64_t)flac->totalPCMFrameCount;
 			if (drflac_seek_to_pcm_frame(flac, (drflac_uint64)target)) {
+				outr_discard_queued(&router);
 				c = (uint64_t)target;
 				ts.cur = (double)c / flac->sampleRate;
 				ts.note = k == KEY_RIGHT ? ">> +10s" : "<< -10s";
 				tui_render(&ts);
 			}
 		} else if (k) {
+			outr_abort(&router);
 			break;
 		}
 
@@ -2526,6 +2619,7 @@ void play_dsf(char *name, int format, int flag)
 				: "seek not supported for DSF";
 			tui_render(&ts);
 		} else if (k) {
+			outr_abort(&router);
 			break;
 		}
 
@@ -2658,12 +2752,14 @@ int play_mp3(char *name, int format, int flag)
 			    (uint64_t)target > totalPCMFrameCount)
 				target = (int64_t)totalPCMFrameCount;
 			if (drmp3_seek_to_pcm_frame(&mp3, (drmp3_uint64)target)) {
+				outr_discard_queued(&router);
 				c = (uint64_t)target;
 				ts.cur = (double)c / mp3.sampleRate;
 				ts.note = k == KEY_RIGHT ? ">> +10s" : "<< -10s";
 				tui_render(&ts);
 			}
 		} else if (k) {
+			outr_abort(&router);
 			break;
 		}
 
@@ -2883,6 +2979,7 @@ void play_ogg(char *name, int flag)
 			int64_t target = (int64_t)c + delta;
 			if (target < 0) target = 0;
 			if (stb_vorbis_seek(v, (unsigned int)target)) {
+				outr_discard_queued(&router);
 				c = (uint64_t)target;
 				ts.cur = (double)c / v->sample_rate;
 				ts.note = k == KEY_RIGHT
@@ -2890,6 +2987,7 @@ void play_ogg(char *name, int flag)
 				tui_render(&ts);
 			}
 		} else if (k) {
+			outr_abort(&router);
 			break;
 		}
 
@@ -3061,6 +3159,7 @@ int play_wma(char *name, int flag)
 			ts.note = "seek not supported for WMA";
 			tui_render(&ts);
 		} else if (k) {
+			outr_abort(&router);
 			break;
 		}
 
@@ -3216,6 +3315,7 @@ int play_aac(char *name, int flag)
             ts.note = "seek not supported for AAC";
             tui_render(&ts);
         } else if (k) {
+            outr_abort(&router);
             break;
         }
 

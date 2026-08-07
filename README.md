@@ -14,7 +14,7 @@
 ## 🖼️ Screenshots
 
 <p align="center">
-  <img src="screenshots/aplay-ember.svg" alt="aplay+ built-in Ember skin — player, equalizer, and playlist" width="720">
+  <img src="screenshots/aplay-ember.png" alt="aplay+ built-in Ember skin — player, equalizer, and playlist" width="720">
 </p>
 
 <p align="center"><em>Built-in Ember — warm charcoal, copper accents, live equalizer, and BitPerfect device status</em></p>
@@ -26,7 +26,7 @@
       <sub><b>Custom Winamp Classic skin</b> — Sapphire neon theme</sub>
     </td>
     <td align="center" width="50%">
-      <img src="screenshots/aplay-context-menu.svg" alt="aplay+ Ember skin with the complete right-click control menu" width="100%"><br>
+      <img src="screenshots/aplay-context-menu.png" alt="aplay+ Ember skin with the complete right-click control menu" width="100%"><br>
       <sub><b>Right-click controls</b> — playback, DSP, devices, skins, and display options</sub>
     </td>
   </tr>

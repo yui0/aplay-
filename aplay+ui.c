@@ -112,6 +112,9 @@ static char g_playlist_names[1024][256];
 static int g_playlist_name_count = 0;
 static int g_playlist_scroll_first = -1;
 static int g_playlist_selected = -1;
+/* The DOM has 13 row slots, but the fixed 168px viewport fits fewer rows
+ * at larger text scales (ts-2 default: 12, ts-3: 11). */
+static int g_playlist_visible_rows = 12;
 /* One-based, like engine track_index; zero means no pending direct selection. */
 static volatile int g_playlist_requested_track = 0;
 static volatile int g_playlist_request_direction = 1;
@@ -148,7 +151,8 @@ static void gui_set_note_locked(const char *note)
 
 static void gui_fill_playlist_rows_locked(int first)
 {
-	int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
+	int rows = g_playlist_visible_rows;
+	int max_first = g_playlist_name_count > rows ? g_playlist_name_count - rows : 0;
 	if (first < 0) first = 0;
 	if (first > max_first) first = max_first;
 	g_gui.playlist_first = first;
@@ -171,7 +175,7 @@ static void gui_fill_device_picker_rows_locked(void)
 	int count = aplay_device_count();
 	int first = g_device_picker_scroll;
 	if (first < 0) first = 0;
-	if (first + 13 > count) first = count - 13;
+	if (first + g_playlist_visible_rows > count) first = count - g_playlist_visible_rows;
 	if (first < 0) first = 0;
 	g_device_picker_scroll = first;
 	g_gui.playlist_first = first;
@@ -280,14 +284,30 @@ static void gui_sync_from_playback_state(tui_state_t *ts)
 		dirty |= GUI_DIRTY_STATE | GUI_DIRTY_PLAYLIST_STYLE;
 	}
 
-	/* Recenter/copy playlist rows only when the active track actually changes.
-	 * A simple time update no longer touches the 13 cached row strings. */
-	if (!picker && track_changed && g_playlist_scroll_first < 0) {
+	/* Keep the active track visible when playback advances.  In automatic mode
+	 * the current track is centered as before.  After the user has manually
+	 * scrolled, preserve that position while the active track remains visible,
+	 * and move only far enough when it leaves the actually visible viewport. */
+	if (!picker && track_changed) {
 		int current = ts->track_index > 0 ? ts->track_index - 1 : 0;
-		int first = current - 6;
-		int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
+		int first = g_gui.playlist_first;
+		int rows = g_playlist_visible_rows;
+		int max_first = g_playlist_name_count > rows ? g_playlist_name_count - rows : 0;
+
+		if (g_playlist_scroll_first < 0) {
+			first = current - rows / 2;
+		} else if (current < first) {
+			first = current;
+		} else if (current >= first + rows) {
+			first = current - rows + 1;
+		}
+
 		if (first < 0) first = 0;
 		if (first > max_first) first = max_first;
+
+		if (g_playlist_scroll_first >= 0)
+			g_playlist_scroll_first = first;
+
 		if (g_gui.playlist_first != first || g_gui.playlist_count != g_playlist_name_count) {
 			gui_fill_playlist_rows_locked(first);
 			dirty |= GUI_DIRTY_PLAYLIST_ROWS | GUI_DIRTY_PLAYLIST_STYLE;
@@ -304,7 +324,8 @@ static void gui_scroll_playlist(int delta)
 	if (__atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST)) {
 		int count = aplay_device_count();
 		int first = g_device_picker_scroll;
-		int max_first = count > 13 ? count - 13 : 0;
+		int rows = g_playlist_visible_rows;
+		int max_first = count > rows ? count - rows : 0;
 		first += delta;
 		if (first < 0) first = 0;
 		if (first > max_first) first = max_first;
@@ -316,7 +337,8 @@ static void gui_scroll_playlist(int delta)
 		return;
 	}
 	int first = g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first;
-	int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
+	int rows = g_playlist_visible_rows;
+	int max_first = g_playlist_name_count > rows ? g_playlist_name_count - rows : 0;
 	first += delta;
 	if (first < 0) first = 0;
 	if (first > max_first) first = max_first;
@@ -338,8 +360,9 @@ static void gui_select_device_item(int item, int apply)
 	g_device_picker_selected = item;
 	int first = g_device_picker_scroll;
 	if (item < first) first = item;
-	if (item >= first + 13) first = item - 12;
-	int max_first = count > 13 ? count - 13 : 0;
+	if (item >= first + g_playlist_visible_rows) first = item - g_playlist_visible_rows + 1;
+	int rows = g_playlist_visible_rows;
+	int max_first = count > rows ? count - rows : 0;
 	if (first > max_first) first = max_first;
 	if (first < 0) first = 0;
 	if (first != g_device_picker_scroll) {
@@ -374,8 +397,9 @@ static void gui_select_playlist_item(int item, int play)
 	g_playlist_selected = item;
 	int first = g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first;
 	if (item < first) first = item;
-	if (item >= first + 13) first = item - 12;
-	int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
+	if (item >= first + g_playlist_visible_rows) first = item - g_playlist_visible_rows + 1;
+	int rows = g_playlist_visible_rows;
+	int max_first = g_playlist_name_count > rows ? g_playlist_name_count - rows : 0;
 	if (first > max_first) first = max_first;
 	if (first < 0) first = 0;
 	if (first != g_gui.playlist_first || g_playlist_scroll_first < 0) {
@@ -402,7 +426,8 @@ static void gui_scroll_playlist_to_fraction(double fraction)
 	if (fraction > 1.0) fraction = 1.0;
 	if (__atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST)) {
 		int count = aplay_device_count();
-		int max_first = count > 13 ? count - 13 : 0;
+		int rows = g_playlist_visible_rows;
+		int max_first = count > rows ? count - rows : 0;
 		int target = (int)lround(fraction * max_first);
 		pthread_mutex_lock(&g_gui_lock);
 		int current = g_device_picker_scroll;
@@ -410,7 +435,8 @@ static void gui_scroll_playlist_to_fraction(double fraction)
 		gui_scroll_playlist(target - current);
 		return;
 	}
-	int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
+	int rows = g_playlist_visible_rows;
+	int max_first = g_playlist_name_count > rows ? g_playlist_name_count - rows : 0;
 	int target = (int)lround(fraction * max_first);
 	pthread_mutex_lock(&g_gui_lock);
 	int current = g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first;
@@ -499,7 +525,7 @@ static void gui_publish_playlist_names(const LS_LIST *list, int num)
 		}
 	}
 	int current = g_gui.track_index > 0 ? g_gui.track_index - 1 : 0;
-	gui_fill_playlist_rows_locked(current - 6);
+	gui_fill_playlist_rows_locked(current - g_playlist_visible_rows / 2);
 	fprintf(stderr, "aplay+ui: playlist contains %d item%s\n",
 		g_playlist_name_count, g_playlist_name_count == 1 ? "" : "s");
 }
@@ -1645,6 +1671,7 @@ static const char *WINAMP_HTML =
     "    <button id=\"mi-skin-folder\" class=\"ctx-item\" onclick=\"onSkinFolder()\"><span class=\"ctx-label\">Skin folder...</span></button>"
     "    <button id=\"mi-skin-builtin\" class=\"ctx-item\" onclick=\"onSkinBuiltin()\"><span class=\"ctx-label\">Built-in Ember skin</span></button>"
     "    <div class=\"ctx-sep\"></div>"
+    "    <button id=\"mi-font\" class=\"ctx-item ctx-has-sub\" onclick=\"onMenuFont()\"><span id=\"mi-font-lbl\" class=\"ctx-label\">Font</span><span class=\"ctx-sub\">\xe2\x96\xb8</span></button>"
     "    <button id=\"mi-text\" class=\"ctx-item\" onclick=\"onMenuTextSize()\"><span id=\"mi-text-lbl\" class=\"ctx-label\">Text size</span><span class=\"ctx-kbd\">T</span></button>"
     "    <button id=\"mi-about\" class=\"ctx-item\" onclick=\"onAbout()\"><span class=\"ctx-label\">About aplay+</span></button>"
     "    <button id=\"mi-exit\" class=\"ctx-item ctx-danger\" onclick=\"onMenuQuit()\"><span class=\"ctx-label\">Exit</span><span class=\"ctx-kbd\">Q</span></button>"
@@ -1660,6 +1687,13 @@ static const char *WINAMP_HTML =
     "    <button id=\"fm6\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm6-lbl\" class=\"ctx-label\"></span></button>"
     "    <button id=\"fm7\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm7-lbl\" class=\"ctx-label\"></span></button>"
     "    <button id=\"fm8\" class=\"ctx-item\" onclick=\"onFmtItem()\"><span id=\"fm8-lbl\" class=\"ctx-label\"></span></button>"
+    "  </div>"
+    "  <div id=\"surface-fonts\" class=\"ctx-menu ctx-submenu ctx-submenu-fonts\">"
+    "    <div class=\"ctx-heading\">Font</div>"
+    "    <button id=\"ft0\" class=\"ctx-item\" onclick=\"onFontItem()\"><span id=\"ft0-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"ft1\" class=\"ctx-item\" onclick=\"onFontItem()\"><span id=\"ft1-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"ft2\" class=\"ctx-item\" onclick=\"onFontItem()\"><span id=\"ft2-lbl\" class=\"ctx-label\"></span></button>"
+    "    <button id=\"ft3\" class=\"ctx-item\" onclick=\"onFontItem()\"><span id=\"ft3-lbl\" class=\"ctx-label\"></span></button>"
     "  </div>"
     "  <div id=\"surface-skins\" class=\"ctx-menu ctx-submenu ctx-submenu-skins\">"
     "    <div id=\"skins-heading\" class=\"ctx-heading\">Next skin</div>"
@@ -1789,7 +1823,7 @@ static const char *WINAMP_CSS =
     ".skin-scroll-track{position:absolute;left:257px;top:23px;width:8px;height:168px;cursor:ns-resize}.skin-scroll-thumb{position:absolute;left:0;top:0;width:8px;min-height:12px;background:var(--skin-main-data);opacity:.72;cursor:ns-resize}"
     ".skin-device,.skin-note{position:absolute;top:217px;height:10px;font-family:var(--skin-font);font-size:6px;font-weight:700;line-height:9px;color:var(--playlist-normal);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
     ".skin-device{left:14px;width:100px;cursor:pointer}.skin-note{left:120px;width:141px;text-align:right;}"
-    ".ctx-menu{position:absolute;left:0;top:250px;width:292px;height:432px;padding:4px 0;box-sizing:border-box;background:#1a1612;border:1px solid #5c3a22;box-shadow:2px 2px 0 rgba(0,0,0,.45);z-index:50;}"
+    ".ctx-menu{position:absolute;left:0;top:250px;width:292px;height:450px;padding:4px 0;box-sizing:border-box;background:#1a1612;border:1px solid #5c3a22;box-shadow:2px 2px 0 rgba(0,0,0,.45);z-index:50;}"
     /* Compact native popup: flex rows with kbd chips on the trailing edge. */
     ".ctx-item{display:flex;flex-direction:row;box-sizing:border-box;align-items:center;justify-content:flex-start;gap:8px;width:100%;height:15px;padding:0 10px;border:0;background:transparent;color:#E4D6C5;font:11px/15px 'DejaVu Sans',sans-serif;text-align:left;cursor:pointer;white-space:nowrap;overflow:hidden;}"
     ".ctx-item:hover{background:#5C3A22;color:#FFE6B8;}"
@@ -1805,6 +1839,7 @@ static const char *WINAMP_CSS =
     ".ctx-sep{height:1px;margin:2px 10px;background:#5c3a22;opacity:.85;}"
     ".ctx-submenu{z-index:55;}"
     ".ctx-submenu-formats{left:302px;top:550px;width:220px;height:164px;}"
+    ".ctx-submenu-fonts{left:302px;top:619px;width:220px;height:86px;}"
     ".ctx-submenu-skins{left:532px;top:550px;width:300px;height:390px;}"
     ".ctx-submenu-cards{left:302px;top:250px;width:240px;height:280px;}"
     ".ctx-submenu-pcms{left:552px;top:250px;width:240px;height:280px;}"
@@ -1844,6 +1879,10 @@ static const char *WINAMP_CSS =
     ".about-spec-v{color:#FFE6B8;font:600 11px/1 'DejaVu Sans',sans-serif;}"
     ".about-ok{width:100%;height:34px;margin:12px 0 0;flex:0 0 34px;border:1px solid #7a4a28;border-radius:8px;background:linear-gradient(180deg,#5c3a22,#3a2416);color:#FFE6B8;font:700 12px/34px 'DejaVu Sans',sans-serif;cursor:pointer;}"
     ".about-ok:hover{background:linear-gradient(180deg,#6d4528,#4a2e1a);}"
+    /* Runtime font selection: keep shortcut key caps monospaced, switch all other UI text. */
+    "#app.font-mono .skin-state,#app.font-mono .skin-track-count,#app.font-mono .skin-time,#app.font-mono .skin-time-total,#app.font-mono .skin-title,#app.font-mono .skin-subtitle,#app.font-mono .skin-codec,#app.font-mono .skin-rate,#app.font-mono .skin-volume-value,#app.font-mono .eq-mini,#app.font-mono .eq-status,#app.font-mono .skin-list-row,#app.font-mono .skin-device,#app.font-mono .skin-note,#app.font-mono .ctx-item,#app.font-mono .ctx-sub,#app.font-mono .ctx-heading,#app.font-mono .about-close,#app.font-mono .about-mark,#app.font-mono .about-brand,#app.font-mono .about-tag,#app.font-mono .about-body,#app.font-mono .about-spec-k,#app.font-mono .about-spec-v,#app.font-mono .about-ok{font-family:'DejaVu Sans Mono',monospace;}"
+    "#app.font-sans .skin-state,#app.font-sans .skin-track-count,#app.font-sans .skin-time,#app.font-sans .skin-time-total,#app.font-sans .skin-title,#app.font-sans .skin-subtitle,#app.font-sans .skin-codec,#app.font-sans .skin-rate,#app.font-sans .skin-volume-value,#app.font-sans .eq-mini,#app.font-sans .eq-status,#app.font-sans .skin-list-row,#app.font-sans .skin-device,#app.font-sans .skin-note,#app.font-sans .ctx-item,#app.font-sans .ctx-sub,#app.font-sans .ctx-heading,#app.font-sans .about-close,#app.font-sans .about-mark,#app.font-sans .about-brand,#app.font-sans .about-tag,#app.font-sans .about-body,#app.font-sans .about-spec-k,#app.font-sans .about-spec-v,#app.font-sans .about-ok{font-family:'DejaVu Sans',sans-serif;}"
+    "#app.font-serif .skin-state,#app.font-serif .skin-track-count,#app.font-serif .skin-time,#app.font-serif .skin-time-total,#app.font-serif .skin-title,#app.font-serif .skin-subtitle,#app.font-serif .skin-codec,#app.font-serif .skin-rate,#app.font-serif .skin-volume-value,#app.font-serif .eq-mini,#app.font-serif .eq-status,#app.font-serif .skin-list-row,#app.font-serif .skin-device,#app.font-serif .skin-note,#app.font-serif .ctx-item,#app.font-serif .ctx-sub,#app.font-serif .ctx-heading,#app.font-serif .about-close,#app.font-serif .about-mark,#app.font-serif .about-brand,#app.font-serif .about-tag,#app.font-serif .about-body,#app.font-serif .about-spec-k,#app.font-serif .about-spec-v,#app.font-serif .about-ok{font-family:'DejaVu Serif',serif;}"
     "@media(prefers-reduced-motion:reduce){.skin-btn,.ctx-item,.about-ok{transition:none;}}";
 
 static void build_winamp_image_css(char *out, size_t out_n)
@@ -1929,7 +1968,7 @@ static void onPlaylistItem(LunaElement *e)
 
 enum {
 	AUI_MAIN, AUI_EQUALIZER, AUI_PLAYLIST, AUI_MENU,
-	AUI_FORMATS, AUI_SKINS, AUI_DEV_CARDS, AUI_DEV_PCMS,
+	AUI_FORMATS, AUI_FONTS, AUI_SKINS, AUI_DEV_CARDS, AUI_DEV_PCMS,
 	AUI_ABOUT, AUI_SURFACE_COUNT
 };
 #define AUI_MAX_DEV_CARDS 16
@@ -1942,9 +1981,11 @@ enum {
 #define AUI_FMT_ITEM_Y   270
 #define AUI_DEV_ITEM_Y   285
 #define AUI_SKIN_ITEM_Y  315
+#define AUI_FONT_ITEM_Y  369
 #define AUI_MENU_W 292
-#define AUI_MENU_H 432
+#define AUI_MENU_H 450
 #define AUI_TEXT_SCALE_COUNT 4
+#define AUI_FONT_COUNT 4
 typedef struct {
 	GLFWwindow *window;
 	LunaContext *context;
@@ -1978,6 +2019,8 @@ static int g_el_dc[AUI_MAX_DEV_CARDS];
 static int g_el_dp[AUI_MAX_DEV_PCMS];
 static int g_el_fm[9];
 static int g_el_fm_label[9];
+static int g_el_ft[AUI_FONT_COUNT];
+static int g_el_ft_label[AUI_FONT_COUNT];
 static int g_el_sk[AUI_MAX_SKIN_MENU];
 static int g_el_sk_label[AUI_MAX_SKIN_MENU];
 static int g_el_surface_skins = -1;
@@ -1986,6 +2029,7 @@ static int g_el_skins_heading = -1;
 static int g_el_mi_dev = -1;
 static int g_el_mi_fmt = -1;
 static int g_el_mi_skin_next = -1;
+static int g_el_mi_font = -1;
 static int g_el_app = -1;
 static int g_el_mi_text = -1;
 static int g_skin_menu_first = 0;
@@ -2000,6 +2044,13 @@ static const char *const g_text_scale_names[AUI_TEXT_SCALE_COUNT] = {
 static const char *const g_text_scale_classes[AUI_TEXT_SCALE_COUNT] = {
 	"ts-0", "ts-1", "ts-2", "ts-3"
 };
+static int g_font_index = 0; /* Keep the original skin/menu typography by default. */
+static const char *const g_font_names[AUI_FONT_COUNT] = {
+	"Skin default", "DejaVu Sans Mono", "DejaVu Sans", "DejaVu Serif"
+};
+static const char *const g_font_classes[AUI_FONT_COUNT] = {
+	"font-default", "font-mono", "font-sans", "font-serif"
+};
 
 static void aui_hide_context_menu(void);
 static void aui_set_menu_check(int idx, int on, const char *label);
@@ -2007,13 +2058,16 @@ static void aui_hide_device_menus(void);
 static void aui_hide_format_skin_menus(void);
 static void aui_refresh_context_menu_labels(void);
 static void aui_refresh_format_menu(void);
+static void aui_refresh_font_menu(void);
 static void aui_refresh_skin_menu(void);
 static void aui_show_format_menu(void);
+static void aui_show_font_menu(void);
 static void aui_show_skin_menu(void);
 static void aui_show_device_card_menu(void);
 static void aui_show_device_pcm_menu(int card);
 static void aui_apply_prepared_skin_to_ui(void);
 static void aui_apply_text_scale(void);
+static void aui_apply_font(void);
 static int aui_load_skin_path(const char *path, int is_builtin);
 static int aui_is_popup_surface(int kind);
 
@@ -2205,6 +2259,11 @@ static void onMenuSkins(LunaElement *e)
 	(void)e;
 	aui_show_skin_menu();
 }
+static void onMenuFont(LunaElement *e)
+{
+	(void)e;
+	aui_show_font_menu();
+}
 static void onMenuDevice(LunaElement *e)
 {
 	(void)e;
@@ -2215,6 +2274,7 @@ static void onMenuQuit(LunaElement *e)      { aui_menu_run(onQuit, e); }
 
 static void aui_apply_text_scale(void)
 {
+	static const int playlist_rows[AUI_TEXT_SCALE_COUNT] = { 13, 12, 12, 11 };
 	if (g_el_app < 0) g_el_app = luna_get_element_by_id("app");
 	if (g_el_app < 0) return;
 	if (g_text_scale < 0) g_text_scale = 0;
@@ -2222,6 +2282,47 @@ static void aui_apply_text_scale(void)
 	for (int i = 0; i < AUI_TEXT_SCALE_COUNT; i++)
 		luna_remove_class(g_el_app, g_text_scale_classes[i]);
 	luna_add_class(g_el_app, g_text_scale_classes[g_text_scale]);
+
+	/* CSS row heights are 12/13/14/15px in a fixed 168px viewport.
+	 * Use the real visible capacity so the current track never lands in
+	 * one of the clipped DOM row slots. */
+	int rows = playlist_rows[g_text_scale];
+	if (rows != g_playlist_visible_rows) {
+		pthread_mutex_lock(&g_gui_lock);
+		g_playlist_visible_rows = rows;
+		int picker = __atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST);
+		int first = picker ? g_device_picker_scroll :
+			(g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first);
+		int count = picker ? aplay_device_count() : g_playlist_name_count;
+		int max_first = count > rows ? count - rows : 0;
+		if (!picker && g_gui.track_index > 0) {
+			int current = g_gui.track_index - 1;
+			if (current < first) first = current;
+			else if (current >= first + rows) first = current - rows + 1;
+		}
+		if (first < 0) first = 0;
+		if (first > max_first) first = max_first;
+		if (picker) {
+			g_device_picker_scroll = first;
+			gui_fill_device_picker_rows_locked();
+		} else {
+			if (g_playlist_scroll_first >= 0) g_playlist_scroll_first = first;
+			gui_fill_playlist_rows_locked(first);
+		}
+		pthread_mutex_unlock(&g_gui_lock);
+	}
+	aui_mark_all_surfaces_dirty();
+}
+
+static void aui_apply_font(void)
+{
+	if (g_el_app < 0) g_el_app = luna_get_element_by_id("app");
+	if (g_el_app < 0) return;
+	if (g_font_index < 0) g_font_index = 0;
+	if (g_font_index >= AUI_FONT_COUNT) g_font_index = AUI_FONT_COUNT - 1;
+	for (int i = 0; i < AUI_FONT_COUNT; i++)
+		luna_remove_class(g_el_app, g_font_classes[i]);
+	luna_add_class(g_el_app, g_font_classes[g_font_index]);
 	aui_mark_all_surfaces_dirty();
 }
 
@@ -2240,7 +2341,7 @@ static void onMenuTextSize(LunaElement *e)
 
 static int aui_is_popup_surface(int kind)
 {
-	return kind == AUI_MENU || kind == AUI_FORMATS ||
+	return kind == AUI_MENU || kind == AUI_FORMATS || kind == AUI_FONTS ||
 	       kind == AUI_SKINS || kind == AUI_DEV_CARDS ||
 	       kind == AUI_DEV_PCMS || kind == AUI_ABOUT;
 }
@@ -2258,6 +2359,8 @@ static void aui_hide_format_skin_menus(void)
 {
 	if (g_surfaces[AUI_FORMATS].window && g_surfaces[AUI_FORMATS].visible)
 		aui_set_surface_visible(AUI_FORMATS, 0);
+	if (g_surfaces[AUI_FONTS].window && g_surfaces[AUI_FONTS].visible)
+		aui_set_surface_visible(AUI_FONTS, 0);
 	if (g_surfaces[AUI_SKINS].window && g_surfaces[AUI_SKINS].visible)
 		aui_set_surface_visible(AUI_SKINS, 0);
 }
@@ -2347,6 +2450,27 @@ static void aui_refresh_format_menu(void)
 	aui_mark_surface_dirty(AUI_FORMATS);
 }
 
+static void aui_refresh_font_menu(void)
+{
+	if (g_font_index < 0 || g_font_index >= AUI_FONT_COUNT) g_font_index = 0;
+	for (int i = 0; i < AUI_FONT_COUNT; i++) {
+		if (g_el_ft[i] < 0) continue;
+		char shown[64];
+		snprintf(shown, sizeof(shown), "%s%s",
+		         i == g_font_index ? "\xE2\x9C\x93 " : "  ", g_font_names[i]);
+		if (g_el_ft_label[i] >= 0) luna_set_text(g_el_ft_label[i], shown);
+		if (i == g_font_index) luna_add_class(g_el_ft[i], "checked");
+		else luna_remove_class(g_el_ft[i], "checked");
+	}
+	if (g_el_mi_font >= 0) {
+		char parent[96];
+		snprintf(parent, sizeof(parent), "Font · %s", g_font_names[g_font_index]);
+		luna_set_text(g_el_mi_font, parent);
+	}
+	aui_mark_surface_dirty(AUI_MENU);
+	aui_mark_surface_dirty(AUI_FONTS);
+}
+
 static const char *aui_skin_short_name(const char *path)
 {
 	const char *base;
@@ -2429,10 +2553,27 @@ static void aui_show_format_menu(void)
 	aui_hide_device_menus();
 	if (g_surfaces[AUI_SKINS].visible)
 		aui_set_surface_visible(AUI_SKINS, 0);
+	if (g_surfaces[AUI_FONTS].visible)
+		aui_set_surface_visible(AUI_FONTS, 0);
 	aui_refresh_format_menu();
 	aui_position_flyout(AUI_FORMATS, AUI_MENU, AUI_FMT_ITEM_Y);
 	aui_set_surface_visible(AUI_FORMATS, 1);
 	glfwFocusWindow(g_surfaces[AUI_FORMATS].window);
+}
+
+static void aui_show_font_menu(void)
+{
+	if (g_surfaces[AUI_FONTS].visible) {
+		aui_set_surface_visible(AUI_FONTS, 0);
+		return;
+	}
+	aui_hide_device_menus();
+	if (g_surfaces[AUI_FORMATS].visible) aui_set_surface_visible(AUI_FORMATS, 0);
+	if (g_surfaces[AUI_SKINS].visible) aui_set_surface_visible(AUI_SKINS, 0);
+	aui_refresh_font_menu();
+	aui_position_flyout(AUI_FONTS, AUI_MENU, AUI_FONT_ITEM_Y);
+	aui_set_surface_visible(AUI_FONTS, 1);
+	glfwFocusWindow(g_surfaces[AUI_FONTS].window);
 }
 
 static void aui_show_skin_menu(void)
@@ -2444,6 +2585,8 @@ static void aui_show_skin_menu(void)
 	aui_hide_device_menus();
 	if (g_surfaces[AUI_FORMATS].visible)
 		aui_set_surface_visible(AUI_FORMATS, 0);
+	if (g_surfaces[AUI_FONTS].visible)
+		aui_set_surface_visible(AUI_FONTS, 0);
 	aui_refresh_skin_menu();
 	aui_position_flyout(AUI_SKINS, AUI_MENU, AUI_SKIN_ITEM_Y);
 	aui_set_surface_visible(AUI_SKINS, 1);
@@ -2628,6 +2771,21 @@ static void onFmtItem(LunaElement *e)
 	aui_hide_context_menu();
 }
 
+static void onFontItem(LunaElement *e)
+{
+	if (!e || strncmp(e->id, "ft", 2) != 0) return;
+	char *end = NULL;
+	long row = strtol(e->id + 2, &end, 10);
+	if (!end || *end || row < 0 || row >= AUI_FONT_COUNT) return;
+	g_font_index = (int)row;
+	aui_apply_font();
+	pthread_mutex_lock(&g_gui_lock);
+	snprintf(g_gui.note, sizeof(g_gui.note), "Font · %s", g_font_names[g_font_index]);
+	gui_mark_dirty_locked(GUI_DIRTY_NOTE);
+	pthread_mutex_unlock(&g_gui_lock);
+	aui_hide_context_menu();
+}
+
 static void onSkinItem(LunaElement *e)
 {
 	if (!e || strncmp(e->id, "sk", 2) != 0) return;
@@ -2780,7 +2938,8 @@ static void onAddFolder(LunaElement *e)
 		free(part);
 	}
 	int first = g_playlist_scroll_first >= 0 ? g_playlist_scroll_first : g_gui.playlist_first;
-	int max_first = g_playlist_name_count > 13 ? g_playlist_name_count - 13 : 0;
+	int rows = g_playlist_visible_rows;
+	int max_first = g_playlist_name_count > rows ? g_playlist_name_count - rows : 0;
 	if (first > max_first) first = max_first;
 	if (first < 0) first = 0;
 	g_playlist_scroll_first = first;
@@ -2890,6 +3049,7 @@ static void aui_refresh_context_menu_labels(void)
 	}
 	aui_set_menu_check(g_el_mi_pl, g_surfaces[AUI_PLAYLIST].visible, "Playlist editor");
 	aui_refresh_format_menu();
+	aui_refresh_font_menu();
 	aui_refresh_skin_menu();
 	if (g_el_mi_dev >= 0) {
 		pthread_mutex_lock(&g_gui_lock);
@@ -2945,8 +3105,10 @@ static void aui_apply_prepared_skin_to_ui(void)
 	 * current text-size class so controls stay clickable and readable. */
 	luna_wire_onclick_handlers();
 	aui_apply_text_scale();
+	aui_apply_font();
 	aui_refresh_equalizer_ui();
 	aui_refresh_format_menu();
+	aui_refresh_font_menu();
 	aui_refresh_skin_menu();
 	/* A skin switch changes textures and recomputes every style. Ensure all
 	 * surface contexts redraw before accepting the next interaction. */
@@ -2988,7 +3150,7 @@ static int g_el_badge_codec = -1, g_el_badge_rate = -1, g_el_badge_state = -1;
 static int g_el_progress_fill = -1, g_el_time_cur = -1, g_el_time_total = -1, g_el_track_count = -1;
 static int g_el_vol_fill = -1, g_el_vol_value = -1, g_el_note = -1;
 static int g_el_surface_main = -1, g_el_surface_equalizer = -1, g_el_surface_playlist = -1;
-static int g_el_surface_menu = -1, g_el_surface_formats = -1;
+static int g_el_surface_menu = -1, g_el_surface_formats = -1, g_el_surface_fonts = -1;
 static int g_el_surface_dev_cards = -1, g_el_surface_dev_pcms = -1;
 static int g_el_surface_about = -1;
 static int g_el_playlist_thumb = -1;
@@ -3046,6 +3208,7 @@ static void gui_cache_elements(void)
 	g_el_surface_playlist = luna_get_element_by_id("surface-playlist");
 	g_el_surface_menu = luna_get_element_by_id("surface-menu");
 	g_el_surface_formats = luna_get_element_by_id("surface-formats");
+	g_el_surface_fonts = luna_get_element_by_id("surface-fonts");
 	g_el_surface_skins = luna_get_element_by_id("surface-skins");
 	g_el_surface_dev_cards = luna_get_element_by_id("surface-dev-cards");
 	g_el_surface_dev_pcms = luna_get_element_by_id("surface-dev-pcms");
@@ -3055,6 +3218,7 @@ static void gui_cache_elements(void)
 	g_el_skins_heading = luna_get_element_by_id("skins-heading");
 	g_el_mi_dev = luna_get_element_by_id("mi-dev-lbl");
 	g_el_mi_fmt = luna_get_element_by_id("mi-fmt-lbl");
+	g_el_mi_font = luna_get_element_by_id("mi-font-lbl");
 	g_el_mi_skin_next = luna_get_element_by_id("mi-skin-next-lbl");
 
 	/* Cache dynamic format/skin submenu rows during normal DOM setup.
@@ -3067,6 +3231,13 @@ static void gui_cache_elements(void)
 		g_el_fm[i] = luna_get_element_by_id(id);
 		snprintf(id, sizeof(id), "fm%d-lbl", i);
 		g_el_fm_label[i] = luna_get_element_by_id(id);
+	}
+	for (int i = 0; i < AUI_FONT_COUNT; ++i) {
+		char id[16];
+		snprintf(id, sizeof(id), "ft%d", i);
+		g_el_ft[i] = luna_get_element_by_id(id);
+		snprintf(id, sizeof(id), "ft%d-lbl", i);
+		g_el_ft_label[i] = luna_get_element_by_id(id);
 	}
 	for (int i = 0; i < AUI_MAX_SKIN_MENU; ++i) {
 		char id[16];
@@ -3282,10 +3453,12 @@ static void gui_apply_state(void)
 			}
 		}
 		if (g_el_playlist_thumb >= 0) {
-			int thumb_h = playlist_count > 0 ? (168 * 13) / playlist_count : 168;
+			int thumb_h = playlist_count > 0 ?
+				(168 * g_playlist_visible_rows) / playlist_count : 168;
 			if (thumb_h < 12) thumb_h = 12;
 			if (thumb_h > 168) thumb_h = 168;
-			int max_first = playlist_count > 13 ? playlist_count - 13 : 0;
+			int max_first = playlist_count > g_playlist_visible_rows ?
+				playlist_count - g_playlist_visible_rows : 0;
 			int thumb_y = max_first > 0 ? (168 - thumb_h) * playlist_first / max_first : 0;
 			LunaElement *thumb = luna_element_at(g_el_playlist_thumb);
 			if (thumb) {
@@ -3697,8 +3870,8 @@ static void aui_key_cb(GLFWwindow *w, int key, int sc, int act, int mods)
 		switch (key) {
 		case GLFW_KEY_UP:        gui_select_playlist_item(current - 1, 0); return;
 		case GLFW_KEY_DOWN:      gui_select_playlist_item(current + 1, 0); return;
-		case GLFW_KEY_PAGE_UP:   gui_select_playlist_item(current - 13, 0); return;
-		case GLFW_KEY_PAGE_DOWN: gui_select_playlist_item(current + 13, 0); return;
+		case GLFW_KEY_PAGE_UP:   gui_select_playlist_item(current - g_playlist_visible_rows, 0); return;
+		case GLFW_KEY_PAGE_DOWN: gui_select_playlist_item(current + g_playlist_visible_rows, 0); return;
 		case GLFW_KEY_HOME:      gui_select_playlist_item(0, 0); return;
 		case GLFW_KEY_END:       gui_select_playlist_item(last, 0); return;
 		case GLFW_KEY_ENTER:
@@ -3751,7 +3924,8 @@ static void aui_key_cb(GLFWwindow *w, int key, int sc, int act, int mods)
 			break;
 		}
 		if (g_surfaces[AUI_MENU].visible || g_surfaces[AUI_FORMATS].visible ||
-		    g_surfaces[AUI_SKINS].visible || g_surfaces[AUI_DEV_CARDS].visible ||
+		    g_surfaces[AUI_FONTS].visible || g_surfaces[AUI_SKINS].visible ||
+		    g_surfaces[AUI_DEV_CARDS].visible ||
 		    g_surfaces[AUI_DEV_PCMS].visible) {
 			aui_hide_context_menu();
 			break;
@@ -3837,6 +4011,7 @@ static void gui_run(void)
 	g_surfaces[AUI_PLAYLIST] = (AuiSurface){ .kind=AUI_PLAYLIST, .width=275, .height=232, .origin_x=600, .origin_y=0, .visible=1, .dirty=1 };
 	g_surfaces[AUI_MENU] = (AuiSurface){ .kind=AUI_MENU, .width=AUI_MENU_W, .height=AUI_MENU_H, .origin_x=0, .origin_y=250, .visible=0, .dirty=1 };
 	g_surfaces[AUI_FORMATS] = (AuiSurface){ .kind=AUI_FORMATS, .width=220, .height=164, .origin_x=302, .origin_y=550, .visible=0, .dirty=1 };
+	g_surfaces[AUI_FONTS] = (AuiSurface){ .kind=AUI_FONTS, .width=220, .height=86, .origin_x=302, .origin_y=619, .visible=0, .dirty=1 };
 	g_surfaces[AUI_SKINS] = (AuiSurface){ .kind=AUI_SKINS, .width=300, .height=AUI_SKIN_MENU_MAX_H, .origin_x=532, .origin_y=550, .visible=0, .dirty=1 };
 	g_surfaces[AUI_DEV_CARDS] = (AuiSurface){ .kind=AUI_DEV_CARDS, .width=240, .height=280, .origin_x=302, .origin_y=250, .visible=0, .dirty=1 };
 	g_surfaces[AUI_DEV_PCMS] = (AuiSurface){ .kind=AUI_DEV_PCMS, .width=240, .height=280, .origin_x=552, .origin_y=250, .visible=0, .dirty=1 };
@@ -3849,6 +4024,7 @@ static void gui_run(void)
 		"aplay+ — playlist",
 		"aplay+ — menu",
 		"aplay+ — format filter",
+		"aplay+ — fonts",
 		"aplay+ — skins",
 		"aplay+ — sound cards",
 		"aplay+ — devices",
@@ -3870,8 +4046,8 @@ static void gui_run(void)
 	}
 	if (!g_surfaces[AUI_MAIN].window || !g_surfaces[AUI_EQUALIZER].window ||
 	    !g_surfaces[AUI_PLAYLIST].window || !g_surfaces[AUI_MENU].window ||
-	    !g_surfaces[AUI_FORMATS].window || !g_surfaces[AUI_SKINS].window ||
-	    !g_surfaces[AUI_DEV_CARDS].window || !g_surfaces[AUI_DEV_PCMS].window ||
+	    !g_surfaces[AUI_FORMATS].window || !g_surfaces[AUI_FONTS].window ||
+	    !g_surfaces[AUI_SKINS].window || !g_surfaces[AUI_DEV_CARDS].window || !g_surfaces[AUI_DEV_PCMS].window ||
 	    !g_surfaces[AUI_ABOUT].window) {
 		fprintf(stderr, "aplay+ui: glfwCreateWindow() failed, running headless (GUI disabled)\n");
 		for (int i = AUI_SURFACE_COUNT - 1; i >= 0; i--)
@@ -3958,10 +4134,12 @@ static void gui_run(void)
 	luna_register_js_handler("onMenuLoop", onMenuLoop);
 	luna_register_js_handler("onMenuFmt", onMenuFmt);
 	luna_register_js_handler("onMenuSkins", onMenuSkins);
+	luna_register_js_handler("onMenuFont", onMenuFont);
 	luna_register_js_handler("onMenuDevice", onMenuDevice);
 	luna_register_js_handler("onMenuQuit", onMenuQuit);
 	luna_register_js_handler("onMenuTextSize", onMenuTextSize);
 	luna_register_js_handler("onFmtItem", onFmtItem);
+	luna_register_js_handler("onFontItem", onFontItem);
 	luna_register_js_handler("onSkinItem", onSkinItem);
 	luna_register_js_handler("onDevCard", onDevCard);
 	luna_register_js_handler("onDevPcm", onDevPcm);
@@ -3993,12 +4171,14 @@ static void gui_run(void)
 	luna_wire_onclick_handlers();
 	gui_cache_elements();
 	aui_apply_text_scale();
+	aui_apply_font();
 	aui_refresh_equalizer_ui();
 	aui_refresh_format_menu();
+	aui_refresh_font_menu();
 	aui_refresh_skin_menu();
 	const int roots[AUI_SURFACE_COUNT] = {
 		g_el_surface_main, g_el_surface_equalizer, g_el_surface_playlist,
-		g_el_surface_menu, g_el_surface_formats, g_el_surface_skins,
+		g_el_surface_menu, g_el_surface_formats, g_el_surface_fonts, g_el_surface_skins,
 		g_el_surface_dev_cards, g_el_surface_dev_pcms, g_el_surface_about
 	};
 	for (int i = 0; i < AUI_SURFACE_COUNT; i++) {
@@ -4012,8 +4192,8 @@ static void gui_run(void)
 	}
 	if (!g_surfaces[AUI_MAIN].context || !g_surfaces[AUI_EQUALIZER].context ||
 	    !g_surfaces[AUI_PLAYLIST].context || !g_surfaces[AUI_MENU].context ||
-	    !g_surfaces[AUI_FORMATS].context || !g_surfaces[AUI_SKINS].context ||
-	    !g_surfaces[AUI_DEV_CARDS].context || !g_surfaces[AUI_DEV_PCMS].context ||
+	    !g_surfaces[AUI_FORMATS].context || !g_surfaces[AUI_FONTS].context ||
+	    !g_surfaces[AUI_SKINS].context || !g_surfaces[AUI_DEV_CARDS].context || !g_surfaces[AUI_DEV_PCMS].context ||
 	    !g_surfaces[AUI_ABOUT].context) {
 		fprintf(stderr, "aplay+ui: failed to create Luna surface contexts\n");
 		gui_request_close();

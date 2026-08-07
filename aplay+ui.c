@@ -827,6 +827,7 @@ typedef struct {
 typedef struct {
 	int enabled;
 	int owns_extract_dir;
+	int playlist_controls;
 	char source[PATH_MAX];
 	char work_dir[PATH_MAX];
 	char root_dir[PATH_MAX];
@@ -1388,6 +1389,7 @@ static void read_playlist_colors(const char *path)
 static int write_skin_playlist(const unsigned char *pledit, int pw, int ph)
 {
 	const int w = 275, h = 232, top_h = 20, bottom_h = 38, bottom_y = 194;
+	g_skin.playlist_controls = pledit && pw >= 276 && ph >= 110;
 	unsigned char *out = calloc((size_t)w * h, 4);
 	if (!out) return 0;
 	unsigned char r, g, b;
@@ -3730,6 +3732,62 @@ static int aui_equalizer_button_at(double lx, double ly)
 	return -1;
 }
 
+/* PLEDIT.BMP paints the playlist transport controls directly into the
+ * 275x232 background, so there are no Luna elements to receive their clicks.
+ * write_skin_playlist() maps source (126,72) to destination (125,194);
+ * these are therefore the exact classic Winamp destination rectangles. */
+enum {
+	AUI_PLAYLIST_CTL_NONE = -1,
+	AUI_PLAYLIST_CTL_PREV = 0,
+	AUI_PLAYLIST_CTL_PLAY,
+	AUI_PLAYLIST_CTL_PAUSE,
+	AUI_PLAYLIST_CTL_STOP,
+	AUI_PLAYLIST_CTL_NEXT,
+	AUI_PLAYLIST_CTL_OPEN
+};
+
+static int aui_playlist_control_at(double lx, double ly)
+{
+	if (!g_skin.playlist_controls) return AUI_PLAYLIST_CTL_NONE;
+	if (aui_point_in_rect(lx, ly, 131.0, 216.0, 7.0, 8.0))
+		return AUI_PLAYLIST_CTL_PREV;
+	if (aui_point_in_rect(lx, ly, 139.0, 216.0, 8.0, 8.0))
+		return AUI_PLAYLIST_CTL_PLAY;
+	if (aui_point_in_rect(lx, ly, 148.0, 216.0, 9.0, 8.0))
+		return AUI_PLAYLIST_CTL_PAUSE;
+	if (aui_point_in_rect(lx, ly, 158.0, 216.0, 9.0, 8.0))
+		return AUI_PLAYLIST_CTL_STOP;
+	if (aui_point_in_rect(lx, ly, 168.0, 216.0, 7.0, 8.0))
+		return AUI_PLAYLIST_CTL_NEXT;
+	if (aui_point_in_rect(lx, ly, 176.0, 216.0, 9.0, 8.0))
+		return AUI_PLAYLIST_CTL_OPEN;
+	return AUI_PLAYLIST_CTL_NONE;
+}
+
+static void aui_playlist_set_paused(int paused)
+{
+	int current;
+	pthread_mutex_lock(&g_gui_lock);
+	current = g_gui.paused;
+	pthread_mutex_unlock(&g_gui_lock);
+	if (!!current != !!paused) onPlayPause(NULL);
+}
+
+static void aui_activate_playlist_control(int control)
+{
+	switch (control) {
+	case AUI_PLAYLIST_CTL_PREV:  onPrev(NULL); break;
+	case AUI_PLAYLIST_CTL_PLAY:  aui_playlist_set_paused(0); break;
+	case AUI_PLAYLIST_CTL_PAUSE: aui_playlist_set_paused(1); break;
+	case AUI_PLAYLIST_CTL_STOP:  onStop(NULL); break;
+	case AUI_PLAYLIST_CTL_NEXT:  onNext(NULL); break;
+	/* The playlist's classic Open button maps naturally to this player's
+	 * folder-based library model. */
+	case AUI_PLAYLIST_CTL_OPEN:  onAddFolder(NULL); break;
+	default: break;
+	}
+}
+
 static void aui_activate_main_control(int control)
 {
 	switch (control) {
@@ -3960,10 +4018,19 @@ static void aui_mouse_button_cb(GLFWwindow *w, int button, int action, int mods)
 				}
 				return;
 			}
-		} else if (surface->kind == AUI_PLAYLIST &&
-		           aui_point_in_rect(lx, ly, 264.0, 3.0, 9.0, 9.0)) {
-			if (action == GLFW_PRESS) onHidePlaylist(NULL);
-			return;
+		} else if (surface->kind == AUI_PLAYLIST) {
+			/* The playlist transport is part of PLEDIT.BMP itself, not DOM.
+			 * Handle it natively just like the main/EQ classic controls. */
+			int control = aui_playlist_control_at(lx, ly);
+			if (control != AUI_PLAYLIST_CTL_NONE) {
+				if (action == GLFW_PRESS)
+					aui_activate_playlist_control(control);
+				return;
+			}
+			if (aui_point_in_rect(lx, ly, 264.0, 3.0, 9.0, 9.0)) {
+				if (action == GLFW_PRESS) onHidePlaylist(NULL);
+				return;
+			}
 		}
 
 		int ww, wh;

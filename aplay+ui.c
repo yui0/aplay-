@@ -1513,6 +1513,10 @@ static int prepare_builtin_skin(void)
 	         write_skin_playlist(NULL, 0, 0);
 	free(main_rgba);
 	free(buttons_rgba);
+	/* write_skin_sprites() sets enabled before the EQ/playlist images are
+	 * generated.  Publish the final result so gui_run() never accepts a
+	 * partially generated built-in skin. */
+	g_skin.enabled = ok;
 	if (!ok) fprintf(stderr, "aplay+ui: failed to generate the built-in MIT skin\n");
 	return ok;
 }
@@ -1618,8 +1622,8 @@ static const char *WINAMP_HTML =
     "    <button class=\"skin-btn skin-stop\" aria-label=\"Stop\" onclick=\"onStop()\"></button>"
     "    <button class=\"skin-btn skin-next\" aria-label=\"Next track\" onclick=\"onNext()\"></button>"
     "    <button class=\"skin-btn skin-eject\" aria-label=\"Cycle format filter\" onclick=\"onFmt()\"></button>"
-    "    <button class=\"skin-panel-toggle skin-toggle-eq\" aria-label=\"Show or hide equalizer\" onclick=\"onToggleEq()\">EQ</button>"
-    "    <button class=\"skin-panel-toggle skin-toggle-pl\" aria-label=\"Show or hide playlist\" onclick=\"onTogglePlaylist()\">PL</button>"
+    "    <button id=\"toggle-eq\" class=\"skin-panel-toggle skin-toggle-eq on\" aria-label=\"Show or hide equalizer\" onclick=\"onToggleEq()\">EQ</button>"
+    "    <button id=\"toggle-pl\" class=\"skin-panel-toggle skin-toggle-pl on\" aria-label=\"Show or hide playlist\" onclick=\"onTogglePlaylist()\">PL</button>"
     "    <button class=\"skin-window-close\" aria-label=\"Quit player\" onclick=\"onQuit()\"></button>"
     "  </div>"
     "  <div id=\"surface-equalizer\" class=\"skin-surface skin-equalizer eq-bypass\">"
@@ -1819,7 +1823,7 @@ static const char *WINAMP_CSS =
     ".skin-volume-value{left:180px;top:55px;width:28px;font-size:6px;}"
     ".skin-btn{position:absolute;top:88px;height:18px;padding:0;border:0;border-radius:0;background-color:transparent;background-size:100% 100%;cursor:pointer;}"
     ".skin-prev{left:16px;width:23px}.skin-play{left:39px;width:23px}.skin-pause{left:62px;width:23px}.skin-stop{left:85px;width:23px}.skin-next{left:108px;width:22px}.skin-eject{left:136px;width:22px}"
-    ".skin-panel-toggle{position:absolute;top:58px;width:22px;height:12px;padding:0;border:0;background:transparent;color:transparent;font-size:1px;cursor:pointer}.skin-toggle-eq{left:219px}.skin-toggle-pl{left:242px}"
+    ".skin-panel-toggle{position:absolute;top:58px;width:22px;height:12px;padding:0;border:0;background:transparent;color:transparent;font-size:1px;cursor:pointer}.skin-toggle-eq{left:219px}.skin-toggle-pl{left:242px}.skin-panel-toggle.on{box-shadow:inset 0 -2px 0 var(--skin-main-data);}"
     ".skin-window-close{position:absolute;z-index:5;left:264px;top:3px;width:9px;height:9px;padding:0;border:0;background:transparent;cursor:pointer;}"
     ".skin-btn:focus-visible,.skin-panel-toggle:focus-visible,.skin-window-close:focus-visible,.ctx-item:focus-visible,.about-ok:focus-visible,.about-close:focus-visible{outline:1px solid var(--skin-focus);outline-offset:0;}"
     ".skin-equalizer{left:300px;top:0;height:116px;background-size:275px 116px;}"
@@ -2052,6 +2056,7 @@ static int g_el_mi_text = -1;
 static int g_skin_menu_first = 0;
 static int g_el_mi_skin_rand = -1;
 static int g_el_eq_power = -1, g_el_eq_status = -1;
+static int g_el_toggle_eq = -1, g_el_toggle_playlist = -1;
 static int g_el_eq_knob[APLAY_EQ_BANDS + 1];
 static int g_el_surface_equalizer_cached = -1;
 static int g_text_scale = 2; /* 0 Classic .. 3 Extra; default Large */
@@ -2088,9 +2093,23 @@ static void aui_apply_font(void);
 static int aui_load_skin_path(const char *path, int is_builtin);
 static int aui_is_popup_surface(int kind);
 
+static void aui_refresh_panel_toggle_ui(void)
+{
+	if (g_el_toggle_eq >= 0) {
+		if (g_surfaces[AUI_EQUALIZER].visible) luna_add_class(g_el_toggle_eq, "on");
+		else luna_remove_class(g_el_toggle_eq, "on");
+	}
+	if (g_el_toggle_playlist >= 0) {
+		if (g_surfaces[AUI_PLAYLIST].visible) luna_add_class(g_el_toggle_playlist, "on");
+		else luna_remove_class(g_el_toggle_playlist, "on");
+	}
+	aui_mark_surface_dirty(AUI_MAIN);
+}
+
 static void aui_set_surface_visible(int kind, int visible)
 {
 	if (kind < 0 || kind >= AUI_SURFACE_COUNT || !g_surfaces[kind].window) return;
+	visible = visible ? 1 : 0;
 	g_surfaces[kind].visible = visible;
 	if (visible) {
 		aui_mark_surface_dirty(kind);
@@ -2099,6 +2118,8 @@ static void aui_set_surface_visible(int kind, int visible)
 	} else {
 		glfwHideWindow(g_surfaces[kind].window);
 	}
+	if (kind == AUI_EQUALIZER || kind == AUI_PLAYLIST)
+		aui_refresh_panel_toggle_ui();
 }
 static void onToggleEq(LunaElement *e)       { (void)e; aui_set_surface_visible(AUI_EQUALIZER, !g_surfaces[AUI_EQUALIZER].visible); }
 static void onTogglePlaylist(LunaElement *e) { (void)e; aui_set_surface_visible(AUI_PLAYLIST, !g_surfaces[AUI_PLAYLIST].visible); }
@@ -3123,6 +3144,7 @@ static void aui_apply_prepared_skin_to_ui(void)
 	luna_wire_onclick_handlers();
 	aui_apply_text_scale();
 	aui_apply_font();
+	aui_refresh_panel_toggle_ui();
 	aui_refresh_equalizer_ui();
 	aui_refresh_format_menu();
 	aui_refresh_font_menu();
@@ -3387,6 +3409,8 @@ static void gui_cache_elements(void)
 	}
 
 	g_el_app = luna_get_element_by_id("app");
+	g_el_toggle_eq = luna_get_element_by_id("toggle-eq");
+	g_el_toggle_playlist = luna_get_element_by_id("toggle-pl");
 	g_el_eq_power = luna_get_element_by_id("eq-power");
 	g_el_eq_status = luna_get_element_by_id("eq-status");
 	g_el_surface_equalizer_cached = g_el_surface_equalizer;
@@ -3682,19 +3706,28 @@ static int aui_main_control_at(double lx, double ly)
 		return AUI_MAIN_CTL_EQ;
 	if (aui_point_in_rect(lx, ly, 242.0, 58.0, 22.0, 12.0))
 		return AUI_MAIN_CTL_PLAYLIST;
-	if (aui_point_in_rect(lx, ly, 16.0, 88.0, 23.0, 18.0))
-		return AUI_MAIN_CTL_PREV;
-	if (aui_point_in_rect(lx, ly, 39.0, 88.0, 23.0, 18.0))
-		return AUI_MAIN_CTL_PLAY;
-	if (aui_point_in_rect(lx, ly, 62.0, 88.0, 23.0, 18.0))
-		return AUI_MAIN_CTL_PAUSE;
-	if (aui_point_in_rect(lx, ly, 85.0, 88.0, 23.0, 18.0))
-		return AUI_MAIN_CTL_STOP;
-	if (aui_point_in_rect(lx, ly, 108.0, 88.0, 22.0, 18.0))
-		return AUI_MAIN_CTL_NEXT;
-	if (aui_point_in_rect(lx, ly, 136.0, 88.0, 22.0, 18.0))
-		return AUI_MAIN_CTL_EJECT;
+
+	/* Transport sprites can move in non-standard Winamp skins.  Hit-test the
+	 * same detected rectangles that are used to draw them instead of the old
+	 * fixed Ember coordinates. */
+	static const int control_for_button[WINAMP_BTN_COUNT] = {
+		AUI_MAIN_CTL_PREV, AUI_MAIN_CTL_PLAY, AUI_MAIN_CTL_PAUSE,
+		AUI_MAIN_CTL_STOP, AUI_MAIN_CTL_NEXT, AUI_MAIN_CTL_EJECT
+	};
+	for (int i = 0; i < WINAMP_BTN_COUNT; ++i) {
+		const WinampButtonLayout *b = &g_skin.button[i];
+		if (aui_point_in_rect(lx, ly, b->x, b->y, b->w, b->h))
+			return control_for_button[i];
+	}
 	return AUI_MAIN_CTL_NONE;
+}
+
+static int aui_equalizer_button_at(double lx, double ly)
+{
+	if (aui_point_in_rect(lx, ly, 264.0, 3.0, 9.0, 9.0)) return 0;
+	if (aui_point_in_rect(lx, ly, 14.0, 18.0, 24.0, 10.0)) return 1;
+	if (aui_point_in_rect(lx, ly, 42.0, 18.0, 31.0, 10.0)) return 2;
+	return -1;
 }
 
 static void aui_activate_main_control(int control)
@@ -3914,6 +3947,23 @@ static void aui_mouse_button_cb(GLFWwindow *w, int button, int action, int mods)
 					aui_activate_main_control(control);
 				return;
 			}
+		} else if (surface->kind == AUI_EQUALIZER) {
+			/* Do not depend on Luna's cached click tree for the small classic
+			 * ON/FLAT/close targets.  This also prevents a skin CSS reload from
+			 * making the EQ controls temporarily unresponsive. */
+			int control = aui_equalizer_button_at(lx, ly);
+			if (control >= 0) {
+				if (action == GLFW_PRESS) {
+					if (control == 0) onHideEq(NULL);
+					else if (control == 1) onEqPower(NULL);
+					else onEqReset(NULL);
+				}
+				return;
+			}
+		} else if (surface->kind == AUI_PLAYLIST &&
+		           aui_point_in_rect(lx, ly, 264.0, 3.0, 9.0, 9.0)) {
+			if (action == GLFW_PRESS) onHidePlaylist(NULL);
+			return;
 		}
 
 		int ww, wh;
@@ -4315,6 +4365,7 @@ static void gui_run(void)
 	gui_cache_elements();
 	aui_apply_text_scale();
 	aui_apply_font();
+	aui_refresh_panel_toggle_ui();
 	aui_refresh_equalizer_ui();
 	aui_refresh_format_menu();
 	aui_refresh_font_menu();
@@ -4351,8 +4402,23 @@ static void gui_run(void)
 	g_cursor_crosshair = glfwCreateStandardCursor(GLFW_CROSSHAIR_CURSOR);
 	g_cursor_hresize = glfwCreateStandardCursor(GLFW_HRESIZE_CURSOR);
 	g_cursor_vresize = glfwCreateStandardCursor(GLFW_VRESIZE_CURSOR);
+	/* Paint the first frame while the windows are still hidden.  Mapping an
+	 * unpainted frameless GL window can otherwise expose a black/transparent
+	 * buffer until the first timed event-loop redraw. */
 	for (int i = 0; i < AUI_SURFACE_COUNT; i++) {
-		if (aui_is_popup_surface(i)) continue;
+		AuiSurface *surface = &g_surfaces[i];
+		if (aui_is_popup_surface(i) || !surface->visible || !surface->context) continue;
+		g_luna_glfw_window = surface->window;
+		glfwMakeContextCurrent(surface->window);
+		int fbw, fbh;
+		glfwGetFramebufferSize(surface->window, &fbw, &fbh);
+		glViewport(0, 0, fbw, fbh);
+		luna_context_render(surface->context, fbw, fbh);
+		glfwSwapBuffers(surface->window);
+		surface->dirty = 0;
+	}
+	for (int i = 0; i < AUI_SURFACE_COUNT; i++) {
+		if (aui_is_popup_surface(i) || !g_surfaces[i].visible) continue;
 		glfwShowWindow(g_surfaces[i].window);
 	}
 	/* Initial classic stack only. Position after mapping because some window

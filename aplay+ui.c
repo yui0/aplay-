@@ -109,6 +109,9 @@ static pthread_mutex_t g_gui_lock = PTHREAD_MUTEX_INITIALIZER;
 static GuiState g_gui = { .dirty = GUI_DIRTY_ALL };
 static volatile int g_gui_should_close = 0;
 static char g_playlist_names[1024][256];
+/* Full paths are kept only for lazy hover details.  strdup() avoids a fixed
+ * 4 MiB PATH_MAX table while preserving the engine's exact playlist order. */
+static char *g_playlist_paths[1024];
 static int g_playlist_name_count = 0;
 static int g_playlist_scroll_first = -1;
 static int g_playlist_selected = -1;
@@ -511,6 +514,10 @@ static int ls_list_has_path(const LS_LIST *ls, int n, const char *path)
 
 static void gui_publish_playlist_names(const LS_LIST *list, int num)
 {
+	for (int i = 0; i < g_playlist_name_count; i++) {
+		free(g_playlist_paths[i]);
+		g_playlist_paths[i] = NULL;
+	}
 	g_playlist_name_count = 0;
 	g_playlist_selected = -1;
 	g_playlist_scroll_first = -1;
@@ -518,9 +525,11 @@ static void gui_publish_playlist_names(const LS_LIST *list, int num)
 		int count = num < 1024 ? num : 1024;
 		for (int i = 0; i < count; i++) {
 			if (!list[i].d_name[0]) continue;
+			int slot = g_playlist_name_count;
 			const char *base = strrchr(list[i].d_name, '/');
 			base = base ? base + 1 : list[i].d_name;
-			snprintf(g_playlist_names[g_playlist_name_count], sizeof(g_playlist_names[0]), "%s", base);
+			snprintf(g_playlist_names[slot], sizeof(g_playlist_names[0]), "%s", base);
+			g_playlist_paths[slot] = strdup(list[i].d_name);
 			g_playlist_name_count++;
 		}
 	}
@@ -799,6 +808,7 @@ void usage(FILE *fp, int argc, char **argv)
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 
 enum {
 	WINAMP_BTN_PREV = 0,
@@ -1640,6 +1650,11 @@ static const char *WINAMP_HTML =
     "      <div id=\"pl10\" class=\"skin-list-row\"></div><div id=\"pl11\" class=\"skin-list-row\"></div>"
     "      <div id=\"pl12\" class=\"skin-list-row\"></div>"
     "    </div>"
+    "    <div id=\"file-tip\" class=\"file-tip file-tip-hidden\">"
+    "      <div id=\"file-tip-name\" class=\"file-tip-name\"></div>"
+    "      <div id=\"file-tip-meta\" class=\"file-tip-meta\"></div>"
+    "      <div id=\"file-tip-path\" class=\"file-tip-path\"></div>"
+    "    </div>"
     "    <div class=\"skin-scroll-track\"><div id=\"playlist-thumb\" class=\"skin-scroll-thumb\"></div></div>"
     "    <span id=\"device\" class=\"skin-device\" onclick=\"onDevicePicker()\">-</span><span id=\"note\" class=\"skin-note\">Ready</span>"
     "  </div>"
@@ -1820,6 +1835,8 @@ static const char *WINAMP_CSS =
     ".skin-list-row.selected{background-color:var(--playlist-selected-bg);color:var(--playlist-current);}"
     ".skin-list-row.current{color:var(--playlist-current);box-shadow:inset 2px 0 0 var(--skin-main-data);}"
     ".skin-list-row.current.selected{background-color:var(--playlist-selected-bg);}"
+    ".file-tip{position:absolute;z-index:20;width:218px;height:46px;padding:5px 6px;border:1px solid var(--skin-main-data);border-radius:3px;background:rgba(12,10,9,.96);box-shadow:0 3px 10px rgba(0,0,0,.55);color:var(--playlist-normal);font-family:var(--skin-font);pointer-events:none;}"
+    ".file-tip-hidden{display:none}.file-tip-name{height:13px;font-size:10px;font-weight:700;line-height:13px;color:var(--playlist-current);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.file-tip-meta{height:12px;font-size:8px;font-weight:700;line-height:12px;color:var(--skin-main-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.file-tip-path{height:18px;font-size:7px;line-height:9px;color:var(--playlist-normal);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}"
     ".skin-scroll-track{position:absolute;left:257px;top:23px;width:8px;height:168px;cursor:ns-resize}.skin-scroll-thumb{position:absolute;left:0;top:0;width:8px;min-height:12px;background:var(--skin-main-data);opacity:.72;cursor:ns-resize}"
     ".skin-device,.skin-note{position:absolute;top:217px;height:10px;font-family:var(--skin-font);font-size:6px;font-weight:700;line-height:9px;color:var(--playlist-normal);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}"
     ".skin-device{left:14px;width:100px;cursor:pointer}.skin-note{left:120px;width:141px;text-align:right;}"
@@ -3155,6 +3172,9 @@ static int g_el_surface_dev_cards = -1, g_el_surface_dev_pcms = -1;
 static int g_el_surface_about = -1;
 static int g_el_playlist_thumb = -1;
 static int g_el_playlist_rows[13];
+static int g_el_file_tip = -1, g_el_file_tip_name = -1;
+static int g_el_file_tip_meta = -1, g_el_file_tip_path = -1;
+static int g_playlist_hover_item = -1;
 
 /* Playlist row heights follow #app.ts-* CSS (12/13/14/15px). Prefer live
  * layout boxes so text-size changes cannot desync click mapping. */
@@ -3196,6 +3216,121 @@ static int gui_playlist_row_at(double lx, double ly)
 	return (row >= 0 && row < 13) ? row : -1;
 }
 
+static void aui_hide_file_tip(void)
+{
+	if (g_playlist_hover_item < 0) return;
+	g_playlist_hover_item = -1;
+	if (g_el_file_tip >= 0) luna_add_class(g_el_file_tip, "file-tip-hidden");
+	aui_mark_surface_dirty(AUI_PLAYLIST);
+}
+
+static void aui_format_file_size(char *out, size_t n, off_t bytes)
+{
+	static const char *unit[] = { "B", "KB", "MB", "GB", "TB" };
+	double value = bytes < 0 ? 0.0 : (double)bytes;
+	int u = 0;
+	while (value >= 1024.0 && u < 4) { value /= 1024.0; u++; }
+	if (u == 0) snprintf(out, n, "%.0f %s", value, unit[u]);
+	else if (value >= 100.0) snprintf(out, n, "%.0f %s", value, unit[u]);
+	else if (value >= 10.0) snprintf(out, n, "%.1f %s", value, unit[u]);
+	else snprintf(out, n, "%.2f %s", value, unit[u]);
+}
+
+static void aui_file_type_label(const char *path, char *out, size_t n)
+{
+	const char *base = path ? strrchr(path, '/') : NULL;
+	base = base ? base + 1 : path;
+	const char *dot = base ? strrchr(base, '.') : NULL;
+	if (!dot || !dot[1]) {
+		snprintf(out, n, "FILE");
+		return;
+	}
+	size_t j = 0;
+	for (const char *p = dot + 1; *p && j + 1 < n && j < 12; p++) {
+		char c = *p;
+		if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+		out[j++] = c;
+	}
+	out[j] = '\0';
+}
+
+static void aui_position_file_tip(double lx, double ly)
+{
+	if (g_el_file_tip < 0) return;
+	const int tip_w = 232, tip_h = 58;
+	int left = (int)lround(lx + 9.0);
+	int top = (int)lround(ly + 9.0);
+	if (left + tip_w > 271) left = 271 - tip_w;
+	if (left < 4) left = 4;
+	if (top + tip_h > 211) top = (int)lround(ly) - tip_h - 5;
+	if (top < 15) top = 15;
+
+	LunaElement *e = luna_element_at(g_el_file_tip);
+	if (!e) return;
+	char style[64];
+	snprintf(style, sizeof(style), "left:%dpx;top:%dpx;", left, top);
+	if (e->has_inline_style && !strcmp(e->inline_style, style)) return;
+	snprintf(e->inline_style, sizeof(e->inline_style), "%s", style);
+	e->has_inline_style = 1;
+	luna_update_element_style(g_el_file_tip);
+}
+
+static void aui_update_file_tip(double lx, double ly)
+{
+	if (__atomic_load_n(&g_device_picker_mode, __ATOMIC_SEQ_CST)) {
+		aui_hide_file_tip();
+		return;
+	}
+
+	int row = gui_playlist_row_at(lx, ly);
+	if (row < 0) {
+		aui_hide_file_tip();
+		return;
+	}
+
+	char path[PATH_MAX] = "", name[256] = "";
+	int item;
+	pthread_mutex_lock(&g_gui_lock);
+	item = g_gui.playlist_first + row;
+	if (item < 0 || item >= g_playlist_name_count ||
+	    !g_playlist_paths[item] || !g_playlist_paths[item][0]) {
+		item = -1;
+	} else if (item != g_playlist_hover_item) {
+		/* Copy only when changing rows; normal pointer motion stays very cheap. */
+		snprintf(path, sizeof(path), "%s", g_playlist_paths[item]);
+		snprintf(name, sizeof(name), "%s", g_playlist_names[item]);
+	}
+	pthread_mutex_unlock(&g_gui_lock);
+
+	if (item < 0) {
+		aui_hide_file_tip();
+		return;
+	}
+
+	if (item == g_playlist_hover_item) return;
+	g_playlist_hover_item = item;
+	aui_position_file_tip(lx, ly);
+
+	char type[16], size[32], meta[128];
+	aui_file_type_label(path, type, sizeof(type));
+	struct stat st;
+	if (stat(path, &st) == 0) {
+		aui_format_file_size(size, sizeof(size), st.st_size);
+		char changed[32] = "";
+		struct tm *tmv = localtime(&st.st_mtime);
+		if (tmv) strftime(changed, sizeof(changed), "%Y-%m-%d %H:%M", tmv);
+		snprintf(meta, sizeof(meta), "%s  ·  %s%s%s", type, size,
+			changed[0] ? "  ·  " : "", changed);
+	} else {
+		snprintf(meta, sizeof(meta), "%s  ·  details unavailable", type);
+	}
+	if (g_el_file_tip_name >= 0) luna_set_text(g_el_file_tip_name, name);
+	if (g_el_file_tip_meta >= 0) luna_set_text(g_el_file_tip_meta, meta);
+	if (g_el_file_tip_path >= 0) luna_set_text(g_el_file_tip_path, path);
+	if (g_el_file_tip >= 0) luna_remove_class(g_el_file_tip, "file-tip-hidden");
+	aui_mark_surface_dirty(AUI_PLAYLIST);
+}
+
 /* GLFW removes the native title bar for this window, so retain the familiar
  * Winamp behaviour: the 14 px skin title bar (rendered at 2x) drags the OS
  * window.  Cursor coordinates are window-relative; combining them with the
@@ -3214,6 +3349,10 @@ static void gui_cache_elements(void)
 	g_el_surface_dev_pcms = luna_get_element_by_id("surface-dev-pcms");
 	g_el_surface_about = luna_get_element_by_id("surface-about");
 	g_el_playlist_thumb = luna_get_element_by_id("playlist-thumb");
+	g_el_file_tip = luna_get_element_by_id("file-tip");
+	g_el_file_tip_name = luna_get_element_by_id("file-tip-name");
+	g_el_file_tip_meta = luna_get_element_by_id("file-tip-meta");
+	g_el_file_tip_path = luna_get_element_by_id("file-tip-path");
 	g_el_pcm_heading = luna_get_element_by_id("pcm-heading");
 	g_el_skins_heading = luna_get_element_by_id("skins-heading");
 	g_el_mi_dev = luna_get_element_by_id("mi-dev-lbl");
@@ -3443,6 +3582,7 @@ static void gui_apply_state(void)
 	}
 
 	if (dirty & GUI_DIRTY_PLAYLIST_ROWS) {
+		aui_hide_file_tip();
 		for (int i = 0; i < 13; i++) {
 			int absolute = playlist_first + i;
 			if (playlist_lines[i][0]) {
@@ -3714,6 +3854,8 @@ static void aui_cursor_pos_cb(GLFWwindow *w, double x, double y)
 	glfwGetWindowSize(w, &ww, &wh);
 	double lx, ly;
 	aui_logical_cursor(surface, x, y, &lx, &ly);
+	if (surface->kind == AUI_PLAYLIST && !surface->playlist_thumb_dragging)
+		aui_update_file_tip(lx, ly);
 	if (surface->playlist_thumb_dragging) {
 		gui_scroll_playlist_to_fraction((ly - 23.0) / 168.0);
 		if (g_cursor_vresize) {
@@ -3839,6 +3981,7 @@ static void aui_scroll_cb(GLFWwindow *w, double xo, double yo)
 	if (!surface) return;
 	aui_mark_surface_dirty(surface->kind);
 	if (surface->kind == AUI_PLAYLIST && yo != 0.0) {
+		aui_hide_file_tip();
 		gui_scroll_playlist(yo > 0.0 ? -3 : 3);
 	} else if (surface->kind == AUI_SKINS && yo != 0.0 &&
 	           g_skin_pack_count > AUI_MAX_SKIN_MENU) {
